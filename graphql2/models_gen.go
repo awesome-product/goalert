@@ -3,17 +3,22 @@
 package graphql2
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"strconv"
 	"time"
 
+	ast1 "github.com/expr-lang/expr/ast"
 	"github.com/target/goalert/alert"
-	alertlog "github.com/target/goalert/alert/log"
+	"github.com/target/goalert/alert/alertlog"
 	"github.com/target/goalert/assignment"
 	"github.com/target/goalert/escalation"
+	"github.com/target/goalert/gadb"
+	"github.com/target/goalert/integrationkey"
 	"github.com/target/goalert/label"
 	"github.com/target/goalert/limit"
+	"github.com/target/goalert/notification"
 	"github.com/target/goalert/notification/slack"
 	"github.com/target/goalert/override"
 	"github.com/target/goalert/schedule"
@@ -21,13 +26,21 @@ import (
 	"github.com/target/goalert/schedule/rule"
 	"github.com/target/goalert/service"
 	"github.com/target/goalert/user"
-	"github.com/target/goalert/user/contactmethod"
 	"github.com/target/goalert/util/timeutil"
 )
+
+type InlineDisplayInfo interface {
+	IsInlineDisplayInfo()
+}
 
 type AlertConnection struct {
 	Nodes    []alert.Alert `json:"nodes"`
 	PageInfo *PageInfo     `json:"pageInfo"`
+}
+
+type AlertDataPoint struct {
+	Timestamp  time.Time `json:"timestamp"`
+	AlertCount int       `json:"alertCount"`
 }
 
 type AlertLogEntryConnection struct {
@@ -35,23 +48,59 @@ type AlertLogEntryConnection struct {
 	PageInfo *PageInfo        `json:"pageInfo"`
 }
 
+type AlertMetadata struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type AlertMetadataInput struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type AlertMetricsOptions struct {
+	RInterval         timeutil.ISORInterval `json:"rInterval"`
+	FilterByServiceID []string              `json:"filterByServiceID,omitempty"`
+}
+
+type AlertPendingNotification struct {
+	Destination string `json:"destination"`
+}
+
 type AlertRecentEventsOptions struct {
-	Limit *int    `json:"limit"`
-	After *string `json:"after"`
+	Limit *int       `json:"limit,omitempty"`
+	After *string    `json:"after,omitempty"`
+	Since *time.Time `json:"since,omitempty"`
 }
 
 type AlertSearchOptions struct {
-	FilterByStatus    []AlertStatus    `json:"filterByStatus"`
-	FilterByServiceID []string         `json:"filterByServiceID"`
-	Search            *string          `json:"search"`
-	First             *int             `json:"first"`
-	After             *string          `json:"after"`
-	FavoritesOnly     *bool            `json:"favoritesOnly"`
-	IncludeNotified   *bool            `json:"includeNotified"`
-	Omit              []int            `json:"omit"`
-	Sort              *AlertSearchSort `json:"sort"`
-	CreatedBefore     *time.Time       `json:"createdBefore"`
-	NotCreatedBefore  *time.Time       `json:"notCreatedBefore"`
+	FilterByStatus    []AlertStatus    `json:"filterByStatus,omitempty"`
+	FilterByServiceID []string         `json:"filterByServiceID,omitempty"`
+	Search            *string          `json:"search,omitempty"`
+	First             *int             `json:"first,omitempty"`
+	After             *string          `json:"after,omitempty"`
+	FavoritesOnly     *bool            `json:"favoritesOnly,omitempty"`
+	IncludeNotified   *bool            `json:"includeNotified,omitempty"`
+	Omit              []int            `json:"omit,omitempty"`
+	Sort              *AlertSearchSort `json:"sort,omitempty"`
+	CreatedBefore     *time.Time       `json:"createdBefore,omitempty"`
+	NotCreatedBefore  *time.Time       `json:"notCreatedBefore,omitempty"`
+	ClosedBefore      *time.Time       `json:"closedBefore,omitempty"`
+	NotClosedBefore   *time.Time       `json:"notClosedBefore,omitempty"`
+}
+
+// AlertStats returns aggregated statistics about alerts.
+type AlertStats struct {
+	AvgAckSec      []TimeSeriesBucket `json:"avgAckSec"`
+	AvgCloseSec    []TimeSeriesBucket `json:"avgCloseSec"`
+	AlertCount     []TimeSeriesBucket `json:"alertCount"`
+	EscalatedCount []TimeSeriesBucket `json:"escalatedCount"`
+}
+
+type AlertsByStatus struct {
+	Acked   int `json:"acked"`
+	Unacked int `json:"unacked"`
+	Closed  int `json:"closed"`
 }
 
 type AuthSubjectConnection struct {
@@ -60,17 +109,60 @@ type AuthSubjectConnection struct {
 }
 
 type CalcRotationHandoffTimesInput struct {
-	Handoff          time.Time  `json:"handoff"`
-	From             *time.Time `json:"from"`
-	TimeZone         string     `json:"timeZone"`
-	ShiftLengthHours int        `json:"shiftLengthHours"`
-	Count            int        `json:"count"`
+	Handoff  time.Time  `json:"handoff"`
+	From     *time.Time `json:"from,omitempty"`
+	TimeZone string     `json:"timeZone"`
+	// Only accurate for hourly-type rotations. Use shiftLength instead.
+	ShiftLengthHours *int                  `json:"shiftLengthHours,omitempty"`
+	ShiftLength      *timeutil.ISODuration `json:"shiftLength,omitempty"`
+	Count            int                   `json:"count"`
+}
+
+type Clause struct {
+	Field    ast1.Node `json:"field"`
+	Operator string    `json:"operator"`
+	// Value is a constant value that the field should be compared against.
+	Value ast1.Node `json:"value"`
+	// Negate indicates whether the clause should be negated (e.g., not contains vs. contains).
+	Negate bool `json:"negate"`
+}
+
+type ClauseInput struct {
+	Field    ast1.Node `json:"field"`
+	Operator string    `json:"operator"`
+	// Value is a constant value that the field should be compared against.
+	Value ast1.Node `json:"value"`
+	// Negate indicates whether the clause should be negated (e.g., not contains vs. contains).
+	Negate bool `json:"negate"`
 }
 
 type ClearTemporarySchedulesInput struct {
 	ScheduleID string    `json:"scheduleID"`
 	Start      time.Time `json:"start"`
 	End        time.Time `json:"end"`
+}
+
+type CloseMatchingAlertInput struct {
+	ServiceID string `json:"serviceID"`
+	// Summary (and details) will match an alert with the same values.
+	//
+	// They can be omitted if the dedup field is provided.
+	Summary *string `json:"summary,omitempty"`
+	Details *string `json:"details,omitempty"`
+	// Preferred over providing the summary & details.
+	Dedup *string `json:"dedup,omitempty"`
+}
+
+type Condition struct {
+	Clauses []Clause `json:"clauses"`
+}
+
+type ConditionInput struct {
+	Clauses []ClauseInput `json:"clauses"`
+}
+
+type ConditionToExprInput struct {
+	Condition *ConditionInput `json:"condition"`
 }
 
 type ConfigHint struct {
@@ -84,6 +176,7 @@ type ConfigValue struct {
 	Value       string     `json:"value"`
 	Type        ConfigType `json:"type"`
 	Password    bool       `json:"password"`
+	Deprecated  string     `json:"deprecated"`
 }
 
 type ConfigValueInput struct {
@@ -93,114 +186,195 @@ type ConfigValueInput struct {
 
 type CreateAlertInput struct {
 	Summary   string  `json:"summary"`
-	Details   *string `json:"details"`
+	Details   *string `json:"details,omitempty"`
 	ServiceID string  `json:"serviceID"`
-	Sanitize  *bool   `json:"sanitize"`
+	// If true, summary and details will be automatically sanitized and truncated (if necessary).
+	Sanitize *bool `json:"sanitize,omitempty"`
+	// Dedup allows setting a unique value to de-duplicate multiple alerts.
+	//
+	// It can also be used to close an alert using closeMatchingAlert mutation.
+	Dedup *string              `json:"dedup,omitempty"`
+	Meta  []AlertMetadataInput `json:"meta,omitempty"`
+}
+
+type CreateBasicAuthInput struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	UserID   string `json:"userID"`
 }
 
 type CreateEscalationPolicyInput struct {
 	Name        string                            `json:"name"`
-	Description *string                           `json:"description"`
-	Repeat      *int                              `json:"repeat"`
-	Favorite    *bool                             `json:"favorite"`
-	Steps       []CreateEscalationPolicyStepInput `json:"steps"`
+	Description *string                           `json:"description,omitempty"`
+	Repeat      *int                              `json:"repeat,omitempty"`
+	Favorite    *bool                             `json:"favorite,omitempty"`
+	Steps       []CreateEscalationPolicyStepInput `json:"steps,omitempty"`
+	Labels      []SetLabelInput                   `json:"labels,omitempty"`
 }
 
 type CreateEscalationPolicyStepInput struct {
-	EscalationPolicyID *string                `json:"escalationPolicyID"`
+	EscalationPolicyID *string                `json:"escalationPolicyID,omitempty"`
 	DelayMinutes       int                    `json:"delayMinutes"`
-	Targets            []assignment.RawTarget `json:"targets"`
-	NewRotation        *CreateRotationInput   `json:"newRotation"`
-	NewSchedule        *CreateScheduleInput   `json:"newSchedule"`
+	Targets            []assignment.RawTarget `json:"targets,omitempty"`
+	NewRotation        *CreateRotationInput   `json:"newRotation,omitempty"`
+	NewSchedule        *CreateScheduleInput   `json:"newSchedule,omitempty"`
+	Actions            []gadb.DestV1          `json:"actions,omitempty"`
+	MultiAck           *bool                  `json:"multiAck,omitempty"`
+}
+
+type CreateGQLAPIKeyInput struct {
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	ExpiresAt   time.Time `json:"expiresAt"`
+	Role        UserRole  `json:"role"`
+	Query       string    `json:"query"`
 }
 
 type CreateHeartbeatMonitorInput struct {
-	ServiceID      string `json:"serviceID"`
-	Name           string `json:"name"`
-	TimeoutMinutes int    `json:"timeoutMinutes"`
+	ServiceID         *string `json:"serviceID,omitempty"`
+	Name              string  `json:"name"`
+	TimeoutMinutes    int     `json:"timeoutMinutes"`
+	AdditionalDetails *string `json:"additionalDetails,omitempty"`
+	// If non-empty, the monitor will be muted with this reason.
+	//
+	// Muting a monitor will prevent it from triggering new alerts, but existing
+	// alerts will remain active until closed or the monitor is healthy again.
+	Muted *string `json:"muted,omitempty"`
 }
 
 type CreateIntegrationKeyInput struct {
-	ServiceID *string            `json:"serviceID"`
+	ServiceID *string            `json:"serviceID,omitempty"`
 	Type      IntegrationKeyType `json:"type"`
 	Name      string             `json:"name"`
+	// Name of the external system this key is managed by.
+	ExternalSystemName *string `json:"externalSystemName,omitempty"`
 }
 
 type CreateRotationInput struct {
-	Name        string        `json:"name"`
-	Description *string       `json:"description"`
-	TimeZone    string        `json:"timeZone"`
-	Start       time.Time     `json:"start"`
-	Favorite    *bool         `json:"favorite"`
-	Type        rotation.Type `json:"type"`
-	ShiftLength *int          `json:"shiftLength"`
-	UserIDs     []string      `json:"userIDs"`
+	Name        string          `json:"name"`
+	Description *string         `json:"description,omitempty"`
+	TimeZone    string          `json:"timeZone"`
+	Start       time.Time       `json:"start"`
+	Favorite    *bool           `json:"favorite,omitempty"`
+	Type        rotation.Type   `json:"type"`
+	ShiftLength *int            `json:"shiftLength,omitempty"`
+	UserIDs     []string        `json:"userIDs,omitempty"`
+	Labels      []SetLabelInput `json:"labels,omitempty"`
 }
 
 type CreateScheduleInput struct {
 	Name             string                    `json:"name"`
-	Description      *string                   `json:"description"`
+	Description      *string                   `json:"description,omitempty"`
 	TimeZone         string                    `json:"timeZone"`
-	Favorite         *bool                     `json:"favorite"`
-	Targets          []ScheduleTargetInput     `json:"targets"`
-	NewUserOverrides []CreateUserOverrideInput `json:"newUserOverrides"`
+	Favorite         *bool                     `json:"favorite,omitempty"`
+	Targets          []ScheduleTargetInput     `json:"targets,omitempty"`
+	NewUserOverrides []CreateUserOverrideInput `json:"newUserOverrides,omitempty"`
+	Labels           []SetLabelInput           `json:"labels,omitempty"`
 }
 
 type CreateServiceInput struct {
 	Name                 string                        `json:"name"`
-	Description          *string                       `json:"description"`
-	Favorite             *bool                         `json:"favorite"`
-	EscalationPolicyID   *string                       `json:"escalationPolicyID"`
-	NewEscalationPolicy  *CreateEscalationPolicyInput  `json:"newEscalationPolicy"`
-	NewIntegrationKeys   []CreateIntegrationKeyInput   `json:"newIntegrationKeys"`
-	Labels               []SetLabelInput               `json:"labels"`
-	NewHeartbeatMonitors []CreateHeartbeatMonitorInput `json:"newHeartbeatMonitors"`
+	Description          *string                       `json:"description,omitempty"`
+	Favorite             *bool                         `json:"favorite,omitempty"`
+	EscalationPolicyID   *string                       `json:"escalationPolicyID,omitempty"`
+	NewEscalationPolicy  *CreateEscalationPolicyInput  `json:"newEscalationPolicy,omitempty"`
+	NewIntegrationKeys   []CreateIntegrationKeyInput   `json:"newIntegrationKeys,omitempty"`
+	Labels               []SetLabelInput               `json:"labels,omitempty"`
+	NewHeartbeatMonitors []CreateHeartbeatMonitorInput `json:"newHeartbeatMonitors,omitempty"`
 }
 
 type CreateUserCalendarSubscriptionInput struct {
 	Name            string `json:"name"`
-	ReminderMinutes []int  `json:"reminderMinutes"`
+	ReminderMinutes []int  `json:"reminderMinutes,omitempty"`
 	ScheduleID      string `json:"scheduleID"`
-	Disabled        *bool  `json:"disabled"`
+	Disabled        *bool  `json:"disabled,omitempty"`
+	FullSchedule    *bool  `json:"fullSchedule,omitempty"`
 }
 
 type CreateUserContactMethodInput struct {
-	UserID                  string                           `json:"userID"`
-	Type                    contactmethod.Type               `json:"type"`
-	Name                    string                           `json:"name"`
-	Value                   string                           `json:"value"`
-	NewUserNotificationRule *CreateUserNotificationRuleInput `json:"newUserNotificationRule"`
+	UserID string             `json:"userID"`
+	Type   *ContactMethodType `json:"type,omitempty"`
+	Dest   *gadb.DestV1       `json:"dest,omitempty"`
+	Name   string             `json:"name"`
+	// Only value or dest should be used at a time, never both.
+	Value                   *string                          `json:"value,omitempty"`
+	NewUserNotificationRule *CreateUserNotificationRuleInput `json:"newUserNotificationRule,omitempty"`
+	// If true, this contact method will receive status updates.
+	//
+	// Note: Some contact method types, like Slack, will always receive status updates and this value is ignored.
+	EnableStatusUpdates *bool `json:"enableStatusUpdates,omitempty"`
+	// If true, this contact method will be private and only visible to the user.
+	Private *bool `json:"private,omitempty"`
 }
 
 type CreateUserInput struct {
 	Username string    `json:"username"`
 	Password string    `json:"password"`
-	Name     *string   `json:"name"`
-	Email    *string   `json:"email"`
-	Role     *UserRole `json:"role"`
+	Name     *string   `json:"name,omitempty"`
+	Email    *string   `json:"email,omitempty"`
+	Role     *UserRole `json:"role,omitempty"`
+	Favorite *bool     `json:"favorite,omitempty"`
 }
 
 type CreateUserNotificationRuleInput struct {
-	UserID          *string `json:"userID"`
-	ContactMethodID *string `json:"contactMethodID"`
+	UserID          *string `json:"userID,omitempty"`
+	ContactMethodID *string `json:"contactMethodID,omitempty"`
 	DelayMinutes    int     `json:"delayMinutes"`
 }
 
 type CreateUserOverrideInput struct {
-	ScheduleID   *string   `json:"scheduleID"`
+	ScheduleID   *string   `json:"scheduleID,omitempty"`
 	Start        time.Time `json:"start"`
 	End          time.Time `json:"end"`
-	AddUserID    *string   `json:"addUserID"`
-	RemoveUserID *string   `json:"removeUserID"`
+	AddUserID    *string   `json:"addUserID,omitempty"`
+	RemoveUserID *string   `json:"removeUserID,omitempty"`
+}
+
+type CreatedGQLAPIKey struct {
+	ID    string `json:"id"`
+	Token string `json:"token"`
 }
 
 type DebugCarrierInfoInput struct {
 	Number string `json:"number"`
 }
 
+type DebugMessage struct {
+	ID          string     `json:"id"`
+	CreatedAt   time.Time  `json:"createdAt"`
+	UpdatedAt   time.Time  `json:"updatedAt"`
+	Type        string     `json:"type"`
+	Status      string     `json:"status"`
+	UserID      *string    `json:"userID,omitempty"`
+	UserName    *string    `json:"userName,omitempty"`
+	Source      *string    `json:"source,omitempty"`
+	Destination string     `json:"destination"`
+	ServiceID   *string    `json:"serviceID,omitempty"`
+	ServiceName *string    `json:"serviceName,omitempty"`
+	AlertID     *int       `json:"alertID,omitempty"`
+	ProviderID  *string    `json:"providerID,omitempty"`
+	SentAt      *time.Time `json:"sentAt,omitempty"`
+	RetryCount  int        `json:"retryCount"`
+}
+
+type DebugMessageStatusInfo struct {
+	State *NotificationState `json:"state"`
+}
+
+type DebugMessageStatusInput struct {
+	ProviderMessageID string `json:"providerMessageID"`
+}
+
+type DebugMessagesInput struct {
+	First         *int       `json:"first,omitempty"`
+	CreatedBefore *time.Time `json:"createdBefore,omitempty"`
+	CreatedAfter  *time.Time `json:"createdAfter,omitempty"`
+}
+
 type DebugSendSMSInfo struct {
 	ID          string `json:"id"`
 	ProviderURL string `json:"providerURL"`
+	FromNumber  string `json:"fromNumber"`
 }
 
 type DebugSendSMSInput struct {
@@ -209,18 +383,135 @@ type DebugSendSMSInput struct {
 	Body string `json:"body"`
 }
 
+type DestinationDisplayInfoError struct {
+	// error message to display when the display info cannot be retrieved
+	Error string `json:"error"`
+}
+
+func (DestinationDisplayInfoError) IsInlineDisplayInfo() {}
+
+type DestinationFieldSearchInput struct {
+	// the type of destination to search for
+	DestType string `json:"destType"`
+	// the ID of the input field to search for
+	FieldID string `json:"fieldID"`
+	// search string to match against
+	Search *string `json:"search,omitempty"`
+	// values/ids to omit from results
+	Omit []string `json:"omit,omitempty"`
+	// cursor to start search from
+	After *string `json:"after,omitempty"`
+	// number of results to return
+	First *int `json:"first,omitempty"`
+}
+
+type DestinationFieldValidateInput struct {
+	// the type of destination to validate
+	DestType string `json:"destType"`
+	// the ID of the input field to validate
+	FieldID string `json:"fieldID"`
+	// the value to validate
+	Value string `json:"value"`
+}
+
 type EscalationPolicyConnection struct {
 	Nodes    []escalation.Policy `json:"nodes"`
 	PageInfo *PageInfo           `json:"pageInfo"`
 }
 
 type EscalationPolicySearchOptions struct {
-	First          *int     `json:"first"`
-	After          *string  `json:"after"`
-	Search         *string  `json:"search"`
-	Omit           []string `json:"omit"`
-	FavoritesOnly  *bool    `json:"favoritesOnly"`
-	FavoritesFirst *bool    `json:"favoritesFirst"`
+	First  *int     `json:"first,omitempty"`
+	After  *string  `json:"after,omitempty"`
+	Search *string  `json:"search,omitempty"`
+	Omit   []string `json:"omit,omitempty"`
+	// Include only favorited escalation policies in the results.
+	FavoritesOnly *bool `json:"favoritesOnly,omitempty"`
+	// Sort favorite escalation policies first.
+	FavoritesFirst *bool `json:"favoritesFirst,omitempty"`
+}
+
+// Expr contains helpers for working with Expr expressions.
+type Expr struct {
+	// exprToCondition converts an Expr expression to a Condition.
+	ExprToCondition *Condition `json:"exprToCondition"`
+	// conditionToExpr converts a Condition to an Expr expression.
+	ConditionToExpr string `json:"conditionToExpr"`
+}
+
+type ExprToConditionInput struct {
+	Expr string `json:"expr"`
+}
+
+// FieldSearchConnection is a connection to a list of FieldSearchResult.
+type FieldSearchConnection struct {
+	Nodes    []FieldSearchResult `json:"nodes"`
+	PageInfo *PageInfo           `json:"pageInfo"`
+}
+
+type FieldSearchResult struct {
+	// The ID of the input field that this value is for.
+	FieldID string `json:"fieldID"`
+	// The value of the input field.
+	Value string `json:"value"`
+	// The user-friendly text for this value of the input field (e.g., if the value is a user ID, label would be the user's name).
+	Label string `json:"label"`
+	// if true, this value is a favorite for the user, only set for search results
+	IsFavorite bool `json:"isFavorite"`
+}
+
+type FieldValueInput struct {
+	// The ID of the input field that this value is for.
+	FieldID string `json:"fieldID"`
+	Value   string `json:"value"`
+}
+
+type FieldValuePair struct {
+	// The ID of the input field that this value is for.
+	FieldID string `json:"fieldID"`
+	// The value of the input field.
+	Value string `json:"value"`
+}
+
+type GQLAPIKey struct {
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	CreatedAt   time.Time       `json:"createdAt"`
+	CreatedBy   *user.User      `json:"createdBy,omitempty"`
+	UpdatedAt   time.Time       `json:"updatedAt"`
+	UpdatedBy   *user.User      `json:"updatedBy,omitempty"`
+	LastUsed    *GQLAPIKeyUsage `json:"lastUsed,omitempty"`
+	ExpiresAt   time.Time       `json:"expiresAt"`
+	Query       string          `json:"query"`
+	Role        UserRole        `json:"role"`
+}
+
+type GQLAPIKeyUsage struct {
+	Time time.Time `json:"time"`
+	Ua   string    `json:"ua"`
+	IP   string    `json:"ip"`
+}
+
+type IntegrationKeyConnection struct {
+	Nodes    []integrationkey.IntegrationKey `json:"nodes"`
+	PageInfo *PageInfo                       `json:"pageInfo"`
+}
+
+type IntegrationKeySearchOptions struct {
+	First  *int     `json:"first,omitempty"`
+	After  *string  `json:"after,omitempty"`
+	Search *string  `json:"search,omitempty"`
+	Omit   []string `json:"omit,omitempty"`
+}
+
+type IntegrationKeyTypeInfo struct {
+	ID string `json:"id"`
+	// User-displayable name of the integration key type.
+	Name string `json:"name"`
+	// User-displayable description of the integration key value (i.e., copy/paste instructions).
+	Label string `json:"label"`
+	// Indicates if the type is currently enabled.
+	Enabled bool `json:"enabled"`
 }
 
 type LabelConnection struct {
@@ -229,35 +520,80 @@ type LabelConnection struct {
 }
 
 type LabelKeySearchOptions struct {
-	First  *int     `json:"first"`
-	After  *string  `json:"after"`
-	Search *string  `json:"search"`
-	Omit   []string `json:"omit"`
+	First  *int     `json:"first,omitempty"`
+	After  *string  `json:"after,omitempty"`
+	Search *string  `json:"search,omitempty"`
+	Omit   []string `json:"omit,omitempty"`
 }
 
 type LabelSearchOptions struct {
-	First      *int     `json:"first"`
-	After      *string  `json:"after"`
-	Search     *string  `json:"search"`
-	UniqueKeys *bool    `json:"uniqueKeys"`
-	Omit       []string `json:"omit"`
+	First      *int     `json:"first,omitempty"`
+	After      *string  `json:"after,omitempty"`
+	Search     *string  `json:"search,omitempty"`
+	UniqueKeys *bool    `json:"uniqueKeys,omitempty"`
+	Omit       []string `json:"omit,omitempty"`
 }
 
 type LabelValueSearchOptions struct {
 	Key    string   `json:"key"`
-	First  *int     `json:"first"`
-	After  *string  `json:"after"`
-	Search *string  `json:"search"`
-	Omit   []string `json:"omit"`
+	First  *int     `json:"first,omitempty"`
+	After  *string  `json:"after,omitempty"`
+	Search *string  `json:"search,omitempty"`
+	Omit   []string `json:"omit,omitempty"`
+}
+
+type LinkAccountInfo struct {
+	UserDetails    string       `json:"userDetails"`
+	AlertID        *int         `json:"alertID,omitempty"`
+	AlertNewStatus *AlertStatus `json:"alertNewStatus,omitempty"`
+}
+
+type MessageLogConnection struct {
+	Nodes    []DebugMessage              `json:"nodes"`
+	PageInfo *PageInfo                   `json:"pageInfo"`
+	Stats    *notification.SearchOptions `json:"stats"`
+}
+
+type MessageLogSearchOptions struct {
+	First         *int       `json:"first,omitempty"`
+	After         *string    `json:"after,omitempty"`
+	CreatedBefore *time.Time `json:"createdBefore,omitempty"`
+	CreatedAfter  *time.Time `json:"createdAfter,omitempty"`
+	Search        *string    `json:"search,omitempty"`
+	Omit          []string   `json:"omit,omitempty"`
+}
+
+type MessageStatusHistory struct {
+	Status    string    `json:"status"`
+	Details   string    `json:"details"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+type Mutation struct {
 }
 
 type NotificationState struct {
-	Details string              `json:"details"`
-	Status  *NotificationStatus `json:"status"`
+	Details           string              `json:"details"`
+	Status            *NotificationStatus `json:"status,omitempty"`
+	FormattedSrcValue string              `json:"formattedSrcValue"`
+}
+
+type OnCallOverview struct {
+	ServiceCount       int                       `json:"serviceCount"`
+	ServiceAssignments []OnCallServiceAssignment `json:"serviceAssignments"`
+}
+
+type OnCallServiceAssignment struct {
+	// Step number is the escalation step this assignment is from (beginning with 0).
+	StepNumber           int    `json:"stepNumber"`
+	EscalationPolicyID   string `json:"escalationPolicyID"`
+	EscalationPolicyName string `json:"escalationPolicyName"`
+	ServiceID            string `json:"serviceID"`
+	ServiceName          string `json:"serviceName"`
 }
 
 type PageInfo struct {
-	EndCursor   *string `json:"endCursor"`
+	EndCursor   *string `json:"endCursor,omitempty"`
 	HasNextPage bool    `json:"hasNextPage"`
 }
 
@@ -270,18 +606,51 @@ type PhoneNumberInfo struct {
 	Error       string `json:"error"`
 }
 
+type Query struct {
+}
+
 type RotationConnection struct {
 	Nodes    []rotation.Rotation `json:"nodes"`
 	PageInfo *PageInfo           `json:"pageInfo"`
 }
 
 type RotationSearchOptions struct {
-	First          *int     `json:"first"`
-	After          *string  `json:"after"`
-	Search         *string  `json:"search"`
-	Omit           []string `json:"omit"`
-	FavoritesOnly  *bool    `json:"favoritesOnly"`
-	FavoritesFirst *bool    `json:"favoritesFirst"`
+	First  *int     `json:"first,omitempty"`
+	After  *string  `json:"after,omitempty"`
+	Search *string  `json:"search,omitempty"`
+	Omit   []string `json:"omit,omitempty"`
+	Only   []string `json:"only,omitempty"`
+	// Include only favorited rotations in the results.
+	FavoritesOnly *bool `json:"favoritesOnly,omitempty"`
+	// Sort favorite rotations first.
+	FavoritesFirst *bool `json:"favoritesFirst,omitempty"`
+}
+
+type SWOConnection struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Type    string `json:"type"`
+	IsNext  bool   `json:"isNext"`
+	Count   int    `json:"count"`
+}
+
+type SWONode struct {
+	ID       string `json:"id"`
+	CanExec  bool   `json:"canExec"`
+	IsLeader bool   `json:"isLeader"`
+	// The uptime of the node in seconds. Empty if the node/connection is *not* a GoAlert instance in SWO mode.
+	Uptime      string          `json:"uptime"`
+	ConfigError string          `json:"configError"`
+	Connections []SWOConnection `json:"connections,omitempty"`
+}
+
+type SWOStatus struct {
+	State         SWOState  `json:"state"`
+	LastStatus    string    `json:"lastStatus"`
+	LastError     string    `json:"lastError"`
+	Nodes         []SWONode `json:"nodes"`
+	MainDBVersion string    `json:"mainDBVersion"`
+	NextDBVersion string    `json:"nextDBVersion"`
 }
 
 type ScheduleConnection struct {
@@ -290,19 +659,23 @@ type ScheduleConnection struct {
 }
 
 type ScheduleRuleInput struct {
-	ID            *string                 `json:"id"`
-	Start         *timeutil.Clock         `json:"start"`
-	End           *timeutil.Clock         `json:"end"`
-	WeekdayFilter *timeutil.WeekdayFilter `json:"weekdayFilter"`
+	ID    *string         `json:"id,omitempty"`
+	Start *timeutil.Clock `json:"start,omitempty"`
+	End   *timeutil.Clock `json:"end,omitempty"`
+	// Weekday filter is a 7-item array that indicates if the rule is active on each weekday, starting with Sunday.
+	WeekdayFilter *timeutil.WeekdayFilter `json:"weekdayFilter,omitempty"`
 }
 
 type ScheduleSearchOptions struct {
-	First          *int     `json:"first"`
-	After          *string  `json:"after"`
-	Search         *string  `json:"search"`
-	Omit           []string `json:"omit"`
-	FavoritesOnly  *bool    `json:"favoritesOnly"`
-	FavoritesFirst *bool    `json:"favoritesFirst"`
+	First  *int     `json:"first,omitempty"`
+	After  *string  `json:"after,omitempty"`
+	Search *string  `json:"search,omitempty"`
+	Omit   []string `json:"omit,omitempty"`
+	Only   []string `json:"only,omitempty"`
+	// Include only favorited services in the results.
+	FavoritesOnly *bool `json:"favoritesOnly,omitempty"`
+	// Sort favorite services first.
+	FavoritesFirst *bool `json:"favoritesFirst,omitempty"`
 }
 
 type ScheduleTarget struct {
@@ -312,14 +685,26 @@ type ScheduleTarget struct {
 }
 
 type ScheduleTargetInput struct {
-	ScheduleID  *string               `json:"scheduleID"`
-	Target      *assignment.RawTarget `json:"target"`
-	NewRotation *CreateRotationInput  `json:"newRotation"`
+	ScheduleID  *string               `json:"scheduleID,omitempty"`
+	Target      *assignment.RawTarget `json:"target,omitempty"`
+	NewRotation *CreateRotationInput  `json:"newRotation,omitempty"`
 	Rules       []ScheduleRuleInput   `json:"rules"`
 }
 
 type SendContactMethodVerificationInput struct {
 	ContactMethodID string `json:"contactMethodID"`
+}
+
+type SendSignalInput struct {
+	Dest      *gadb.DestV1      `json:"dest"`
+	ServiceID string            `json:"serviceID"`
+	Params    map[string]string `json:"params,omitempty"`
+}
+
+type ServiceAlertStatsOptions struct {
+	Start     *time.Time         `json:"start,omitempty"`
+	End       *time.Time         `json:"end,omitempty"`
+	TsOptions *TimeSeriesOptions `json:"tsOptions,omitempty"`
 }
 
 type ServiceConnection struct {
@@ -328,12 +713,20 @@ type ServiceConnection struct {
 }
 
 type ServiceSearchOptions struct {
-	First          *int     `json:"first"`
-	After          *string  `json:"after"`
-	Search         *string  `json:"search"`
-	Omit           []string `json:"omit"`
-	FavoritesOnly  *bool    `json:"favoritesOnly"`
-	FavoritesFirst *bool    `json:"favoritesFirst"`
+	First  *int     `json:"first,omitempty"`
+	After  *string  `json:"after,omitempty"`
+	Search *string  `json:"search,omitempty"`
+	Omit   []string `json:"omit,omitempty"`
+	Only   []string `json:"only,omitempty"`
+	// Include only favorited services in the results.
+	FavoritesOnly *bool `json:"favoritesOnly,omitempty"`
+	// Sort favorite services first.
+	FavoritesFirst *bool `json:"favoritesFirst,omitempty"`
+}
+
+type SetAlertNoiseReasonInput struct {
+	AlertID     int    `json:"alertID"`
+	NoiseReason string `json:"noiseReason"`
 }
 
 type SetFavoriteInput struct {
@@ -342,9 +735,10 @@ type SetFavoriteInput struct {
 }
 
 type SetLabelInput struct {
-	Target *assignment.RawTarget `json:"target"`
+	Target *assignment.RawTarget `json:"target,omitempty"`
 	Key    string                `json:"key"`
-	Value  string                `json:"value"`
+	// If value is empty, the label is removed.
+	Value string `json:"value"`
 }
 
 type SetScheduleOnCallNotificationRulesInput struct {
@@ -354,6 +748,8 @@ type SetScheduleOnCallNotificationRulesInput struct {
 
 type SetTemporaryScheduleInput struct {
 	ScheduleID string                `json:"scheduleID"`
+	ClearStart *time.Time            `json:"clearStart,omitempty"`
+	ClearEnd   *time.Time            `json:"clearEnd,omitempty"`
 	Start      time.Time             `json:"start"`
 	End        time.Time             `json:"end"`
 	Shifts     []schedule.FixedShift `json:"shifts"`
@@ -365,10 +761,22 @@ type SlackChannelConnection struct {
 }
 
 type SlackChannelSearchOptions struct {
-	First  *int     `json:"first"`
-	After  *string  `json:"after"`
-	Search *string  `json:"search"`
-	Omit   []string `json:"omit"`
+	First  *int     `json:"first,omitempty"`
+	After  *string  `json:"after,omitempty"`
+	Search *string  `json:"search,omitempty"`
+	Omit   []string `json:"omit,omitempty"`
+}
+
+type SlackUserGroupConnection struct {
+	Nodes    []slack.UserGroup `json:"nodes"`
+	PageInfo *PageInfo         `json:"pageInfo"`
+}
+
+type SlackUserGroupSearchOptions struct {
+	First  *int     `json:"first,omitempty"`
+	After  *string  `json:"after,omitempty"`
+	Search *string  `json:"search,omitempty"`
+	Omit   []string `json:"omit,omitempty"`
 }
 
 type StringConnection struct {
@@ -387,6 +795,18 @@ type SystemLimitInput struct {
 	Value int      `json:"value"`
 }
 
+type TimeSeriesBucket struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+	Count int       `json:"count"`
+	Value float64   `json:"value"`
+}
+
+type TimeSeriesOptions struct {
+	BucketDuration timeutil.ISODuration `json:"bucketDuration"`
+	BucketOrigin   *time.Time           `json:"bucketOrigin,omitempty"`
+}
+
 type TimeZone struct {
 	ID string `json:"id"`
 }
@@ -397,10 +817,17 @@ type TimeZoneConnection struct {
 }
 
 type TimeZoneSearchOptions struct {
-	First  *int     `json:"first"`
-	After  *string  `json:"after"`
-	Search *string  `json:"search"`
-	Omit   []string `json:"omit"`
+	First  *int     `json:"first,omitempty"`
+	After  *string  `json:"after,omitempty"`
+	Search *string  `json:"search,omitempty"`
+	Omit   []string `json:"omit,omitempty"`
+}
+
+type TokenInfo struct {
+	// primaryHint is a hint for the primary token. It is empty if the primary token is not set.
+	PrimaryHint string `json:"primaryHint"`
+	// secondaryHint is a hint for the secondary token. It is empty if the secondary token is not set.
+	SecondaryHint string `json:"secondaryHint"`
 }
 
 type UpdateAlertsByServiceInput struct {
@@ -409,83 +836,129 @@ type UpdateAlertsByServiceInput struct {
 }
 
 type UpdateAlertsInput struct {
-	AlertIDs  []int       `json:"alertIDs"`
-	NewStatus AlertStatus `json:"newStatus"`
+	// List of alert IDs.
+	AlertIDs    []int        `json:"alertIDs"`
+	NewStatus   *AlertStatus `json:"newStatus,omitempty"`
+	NoiseReason *string      `json:"noiseReason,omitempty"`
+}
+
+type UpdateBasicAuthInput struct {
+	Password    string  `json:"password"`
+	OldPassword *string `json:"oldPassword,omitempty"`
+	UserID      string  `json:"userID"`
 }
 
 type UpdateEscalationPolicyInput struct {
 	ID          string   `json:"id"`
-	Name        *string  `json:"name"`
-	Description *string  `json:"description"`
-	Repeat      *int     `json:"repeat"`
-	StepIDs     []string `json:"stepIDs"`
+	Name        *string  `json:"name,omitempty"`
+	Description *string  `json:"description,omitempty"`
+	Repeat      *int     `json:"repeat,omitempty"`
+	StepIDs     []string `json:"stepIDs,omitempty"`
 }
 
 type UpdateEscalationPolicyStepInput struct {
 	ID           string                 `json:"id"`
-	DelayMinutes *int                   `json:"delayMinutes"`
-	Targets      []assignment.RawTarget `json:"targets"`
+	DelayMinutes *int                   `json:"delayMinutes,omitempty"`
+	Targets      []assignment.RawTarget `json:"targets,omitempty"`
+	Actions      []gadb.DestV1          `json:"actions,omitempty"`
+	MultiAck     *bool                  `json:"multiAck,omitempty"`
+}
+
+type UpdateGQLAPIKeyInput struct {
+	ID          string  `json:"id"`
+	Name        *string `json:"name,omitempty"`
+	Description *string `json:"description,omitempty"`
 }
 
 type UpdateHeartbeatMonitorInput struct {
-	ID             string  `json:"id"`
-	Name           *string `json:"name"`
-	TimeoutMinutes *int    `json:"timeoutMinutes"`
+	ID                string  `json:"id"`
+	Name              *string `json:"name,omitempty"`
+	TimeoutMinutes    *int    `json:"timeoutMinutes,omitempty"`
+	AdditionalDetails *string `json:"additionalDetails,omitempty"`
+	// If non-empty, the monitor will be muted with this reason.
+	//
+	// Muting a monitor will prevent it from triggering new alerts, but existing
+	// alerts will remain active until closed or the monitor is healthy again.
+	Muted *string `json:"muted,omitempty"`
+}
+
+type UpdateKeyConfigInput struct {
+	KeyID string           `json:"keyID"`
+	Rules []gadb.UIKRuleV1 `json:"rules,omitempty"`
+	// setRule allows you to set a single rule. If ID is provided, the rule with that ID will be updated. If ID is not provided, a new rule will be created and appended to the list of rules.
+	SetRule *gadb.UIKRuleV1 `json:"setRule,omitempty"`
+	// setRuleActions allows you to set the actions for a single rule by ID.
+	SetRuleActions *gadb.UIKRuleV1 `json:"setRuleActions,omitempty"`
+	// setRuleOrder allows you to reorder rules by ID.
+	SetRuleOrder []string `json:"setRuleOrder,omitempty"`
+	// deleteRule allows you to delete a single rule by ID.
+	DeleteRule *string `json:"deleteRule,omitempty"`
+	// defaultAction is the action to take if no rules match the request.
+	DefaultActions []gadb.UIKActionV1 `json:"defaultActions,omitempty"`
 }
 
 type UpdateRotationInput struct {
-	ID              string         `json:"id"`
-	Name            *string        `json:"name"`
-	Description     *string        `json:"description"`
-	TimeZone        *string        `json:"timeZone"`
-	Start           *time.Time     `json:"start"`
-	Type            *rotation.Type `json:"type"`
-	ShiftLength     *int           `json:"shiftLength"`
-	ActiveUserIndex *int           `json:"activeUserIndex"`
-	UserIDs         []string       `json:"userIDs"`
+	ID          string         `json:"id"`
+	Name        *string        `json:"name,omitempty"`
+	Description *string        `json:"description,omitempty"`
+	TimeZone    *string        `json:"timeZone,omitempty"`
+	Start       *time.Time     `json:"start,omitempty"`
+	Type        *rotation.Type `json:"type,omitempty"`
+	ShiftLength *int           `json:"shiftLength,omitempty"`
+	UserIDs     []string       `json:"userIDs,omitempty"`
+	// The index of the user in `userIDs` to set as the active user. If not provided, the existing active user index will be used.
+	ActiveUserIndex *int `json:"activeUserIndex,omitempty"`
 }
 
 type UpdateScheduleInput struct {
 	ID          string  `json:"id"`
-	Name        *string `json:"name"`
-	Description *string `json:"description"`
-	TimeZone    *string `json:"timeZone"`
+	Name        *string `json:"name,omitempty"`
+	Description *string `json:"description,omitempty"`
+	TimeZone    *string `json:"timeZone,omitempty"`
 }
 
 type UpdateServiceInput struct {
-	ID                 string  `json:"id"`
-	Name               *string `json:"name"`
-	Description        *string `json:"description"`
-	EscalationPolicyID *string `json:"escalationPolicyID"`
+	ID                   string     `json:"id"`
+	Name                 *string    `json:"name,omitempty"`
+	Description          *string    `json:"description,omitempty"`
+	EscalationPolicyID   *string    `json:"escalationPolicyID,omitempty"`
+	MaintenanceExpiresAt *time.Time `json:"maintenanceExpiresAt,omitempty"`
 }
 
 type UpdateUserCalendarSubscriptionInput struct {
 	ID              string  `json:"id"`
-	Name            *string `json:"name"`
-	ReminderMinutes []int   `json:"reminderMinutes"`
-	Disabled        *bool   `json:"disabled"`
+	Name            *string `json:"name,omitempty"`
+	ReminderMinutes []int   `json:"reminderMinutes,omitempty"`
+	Disabled        *bool   `json:"disabled,omitempty"`
+	FullSchedule    *bool   `json:"fullSchedule,omitempty"`
 }
 
 type UpdateUserContactMethodInput struct {
 	ID    string  `json:"id"`
-	Name  *string `json:"name"`
-	Value *string `json:"value"`
+	Name  *string `json:"name,omitempty"`
+	Value *string `json:"value,omitempty"`
+	// If true, this contact method will receive status updates.
+	//
+	// Note: Some contact method types, like Slack, will always receive status updates and this value is ignored.
+	EnableStatusUpdates *bool `json:"enableStatusUpdates,omitempty"`
+	// If true, this contact method will be private and only visible to the user.
+	Private *bool `json:"private,omitempty"`
 }
 
 type UpdateUserInput struct {
 	ID                          string    `json:"id"`
-	Name                        *string   `json:"name"`
-	Email                       *string   `json:"email"`
-	Role                        *UserRole `json:"role"`
-	StatusUpdateContactMethodID *string   `json:"statusUpdateContactMethodID"`
+	Name                        *string   `json:"name,omitempty"`
+	Email                       *string   `json:"email,omitempty"`
+	Role                        *UserRole `json:"role,omitempty"`
+	StatusUpdateContactMethodID *string   `json:"statusUpdateContactMethodID,omitempty"`
 }
 
 type UpdateUserOverrideInput struct {
 	ID           string     `json:"id"`
-	Start        *time.Time `json:"start"`
-	End          *time.Time `json:"end"`
-	AddUserID    *string    `json:"addUserID"`
-	RemoveUserID *string    `json:"removeUserID"`
+	Start        *time.Time `json:"start,omitempty"`
+	End          *time.Time `json:"end,omitempty"`
+	AddUserID    *string    `json:"addUserID,omitempty"`
+	RemoveUserID *string    `json:"removeUserID,omitempty"`
 }
 
 type UserConnection struct {
@@ -499,24 +972,44 @@ type UserOverrideConnection struct {
 }
 
 type UserOverrideSearchOptions struct {
-	First              *int       `json:"first"`
-	After              *string    `json:"after"`
-	Omit               []string   `json:"omit"`
-	ScheduleID         *string    `json:"scheduleID"`
-	FilterAddUserID    []string   `json:"filterAddUserID"`
-	FilterRemoveUserID []string   `json:"filterRemoveUserID"`
-	FilterAnyUserID    []string   `json:"filterAnyUserID"`
-	Start              *time.Time `json:"start"`
-	End                *time.Time `json:"end"`
+	First *int     `json:"first,omitempty"`
+	After *string  `json:"after,omitempty"`
+	Omit  []string `json:"omit,omitempty"`
+	// Limit search to a single schedule
+	ScheduleID *string `json:"scheduleID,omitempty"`
+	// Only return overrides where the provided users have been added to a schedule (add or replace types).
+	FilterAddUserID []string `json:"filterAddUserID,omitempty"`
+	// Only return overrides where the provided users have been removed from a schedule (remove or replace types).
+	FilterRemoveUserID []string `json:"filterRemoveUserID,omitempty"`
+	// Only return overrides that add/remove/replace at least one of the provided user IDs.
+	FilterAnyUserID []string `json:"filterAnyUserID,omitempty"`
+	// Start of the window to search for.
+	Start *time.Time `json:"start,omitempty"`
+	// End of the window to search for.
+	End *time.Time `json:"end,omitempty"`
 }
 
 type UserSearchOptions struct {
-	First   *int                `json:"first"`
-	After   *string             `json:"after"`
-	Search  *string             `json:"search"`
-	Omit    []string            `json:"omit"`
-	CMValue *string             `json:"CMValue"`
-	CMType  *contactmethod.Type `json:"CMType"`
+	First   *int               `json:"first,omitempty"`
+	After   *string            `json:"after,omitempty"`
+	Search  *string            `json:"search,omitempty"`
+	Omit    []string           `json:"omit,omitempty"`
+	Only    []string           `json:"only,omitempty"`
+	CMValue *string            `json:"CMValue,omitempty"`
+	CMType  *ContactMethodType `json:"CMType,omitempty"`
+	Dest    *gadb.DestV1       `json:"dest,omitempty"`
+	// Include only favorited services in the results.
+	FavoritesOnly *bool `json:"favoritesOnly,omitempty"`
+	// Sort favorite services first.
+	FavoritesFirst *bool `json:"favoritesFirst,omitempty"`
+}
+
+type UserSession struct {
+	ID           string    `json:"id"`
+	Current      bool      `json:"current"`
+	UserAgent    string    `json:"userAgent"`
+	CreatedAt    time.Time `json:"createdAt"`
+	LastAccessAt time.Time `json:"lastAccessAt"`
 }
 
 type VerifyContactMethodInput struct {
@@ -550,7 +1043,7 @@ func (e AlertSearchSort) String() string {
 	return string(e)
 }
 
-func (e *AlertSearchSort) UnmarshalGQL(v interface{}) error {
+func (e *AlertSearchSort) UnmarshalGQL(v any) error {
 	str, ok := v.(string)
 	if !ok {
 		return fmt.Errorf("enums must be strings")
@@ -565,6 +1058,20 @@ func (e *AlertSearchSort) UnmarshalGQL(v interface{}) error {
 
 func (e AlertSearchSort) MarshalGQL(w io.Writer) {
 	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *AlertSearchSort) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e AlertSearchSort) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
 }
 
 type AlertStatus string
@@ -593,7 +1100,7 @@ func (e AlertStatus) String() string {
 	return string(e)
 }
 
-func (e *AlertStatus) UnmarshalGQL(v interface{}) error {
+func (e *AlertStatus) UnmarshalGQL(v any) error {
 	str, ok := v.(string)
 	if !ok {
 		return fmt.Errorf("enums must be strings")
@@ -608,6 +1115,20 @@ func (e *AlertStatus) UnmarshalGQL(v interface{}) error {
 
 func (e AlertStatus) MarshalGQL(w io.Writer) {
 	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *AlertStatus) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e AlertStatus) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
 }
 
 type ConfigType string
@@ -638,7 +1159,7 @@ func (e ConfigType) String() string {
 	return string(e)
 }
 
-func (e *ConfigType) UnmarshalGQL(v interface{}) error {
+func (e *ConfigType) UnmarshalGQL(v any) error {
 	str, ok := v.(string)
 	if !ok {
 		return fmt.Errorf("enums must be strings")
@@ -655,6 +1176,157 @@ func (e ConfigType) MarshalGQL(w io.Writer) {
 	fmt.Fprint(w, strconv.Quote(e.String()))
 }
 
+func (e *ConfigType) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e ConfigType) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
+}
+
+type ContactMethodType string
+
+const (
+	ContactMethodTypeSms     ContactMethodType = "SMS"
+	ContactMethodTypeVoice   ContactMethodType = "VOICE"
+	ContactMethodTypeEmail   ContactMethodType = "EMAIL"
+	ContactMethodTypeWebhook ContactMethodType = "WEBHOOK"
+	ContactMethodTypeSLACkDm ContactMethodType = "SLACK_DM"
+)
+
+var AllContactMethodType = []ContactMethodType{
+	ContactMethodTypeSms,
+	ContactMethodTypeVoice,
+	ContactMethodTypeEmail,
+	ContactMethodTypeWebhook,
+	ContactMethodTypeSLACkDm,
+}
+
+func (e ContactMethodType) IsValid() bool {
+	switch e {
+	case ContactMethodTypeSms, ContactMethodTypeVoice, ContactMethodTypeEmail, ContactMethodTypeWebhook, ContactMethodTypeSLACkDm:
+		return true
+	}
+	return false
+}
+
+func (e ContactMethodType) String() string {
+	return string(e)
+}
+
+func (e *ContactMethodType) UnmarshalGQL(v any) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("enums must be strings")
+	}
+
+	*e = ContactMethodType(str)
+	if !e.IsValid() {
+		return fmt.Errorf("%s is not a valid ContactMethodType", str)
+	}
+	return nil
+}
+
+func (e ContactMethodType) MarshalGQL(w io.Writer) {
+	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *ContactMethodType) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e ContactMethodType) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
+}
+
+// Known error codes that the server can return.
+//
+// These values will be returned in the `extensions.code` field of the error response.
+type ErrorCode string
+
+const (
+	// The input value is invalid, the `path` field will contain the exact path to the invalid input.
+	//
+	// A separate error will be returned for each invalid field.
+	ErrorCodeInvalidInputValue ErrorCode = "INVALID_INPUT_VALUE"
+	// The `path` field contains the exact path to the DestinationInput that is invalid.
+	//
+	// The `extensions.fieldID` field contains the ID of the input field that is invalid.
+	//
+	// A separate error will be returned for each invalid field.
+	ErrorCodeInvalidDestFieldValue ErrorCode = "INVALID_DEST_FIELD_VALUE"
+	// The `path` field contains the exact path to the map that is invalid.
+	//
+	// The `extensions.key` field contains the key of the value that is invalid.
+	//
+	// A separate error will be returned for each invalid value.
+	ErrorCodeInvalidMapFieldValue ErrorCode = "INVALID_MAP_FIELD_VALUE"
+	// The expr expression is too complex to be converted to a Condition.
+	ErrorCodeExprTooComplex ErrorCode = "EXPR_TOO_COMPLEX"
+)
+
+var AllErrorCode = []ErrorCode{
+	ErrorCodeInvalidInputValue,
+	ErrorCodeInvalidDestFieldValue,
+	ErrorCodeInvalidMapFieldValue,
+	ErrorCodeExprTooComplex,
+}
+
+func (e ErrorCode) IsValid() bool {
+	switch e {
+	case ErrorCodeInvalidInputValue, ErrorCodeInvalidDestFieldValue, ErrorCodeInvalidMapFieldValue, ErrorCodeExprTooComplex:
+		return true
+	}
+	return false
+}
+
+func (e ErrorCode) String() string {
+	return string(e)
+}
+
+func (e *ErrorCode) UnmarshalGQL(v any) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("enums must be strings")
+	}
+
+	*e = ErrorCode(str)
+	if !e.IsValid() {
+		return fmt.Errorf("%s is not a valid ErrorCode", str)
+	}
+	return nil
+}
+
+func (e ErrorCode) MarshalGQL(w io.Writer) {
+	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *ErrorCode) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e ErrorCode) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
+}
+
 type IntegrationKeyType string
 
 const (
@@ -663,6 +1335,7 @@ const (
 	IntegrationKeyTypeSite24x7               IntegrationKeyType = "site24x7"
 	IntegrationKeyTypePrometheusAlertmanager IntegrationKeyType = "prometheusAlertmanager"
 	IntegrationKeyTypeEmail                  IntegrationKeyType = "email"
+	IntegrationKeyTypeUniversal              IntegrationKeyType = "universal"
 )
 
 var AllIntegrationKeyType = []IntegrationKeyType{
@@ -671,11 +1344,12 @@ var AllIntegrationKeyType = []IntegrationKeyType{
 	IntegrationKeyTypeSite24x7,
 	IntegrationKeyTypePrometheusAlertmanager,
 	IntegrationKeyTypeEmail,
+	IntegrationKeyTypeUniversal,
 }
 
 func (e IntegrationKeyType) IsValid() bool {
 	switch e {
-	case IntegrationKeyTypeGeneric, IntegrationKeyTypeGrafana, IntegrationKeyTypeSite24x7, IntegrationKeyTypePrometheusAlertmanager, IntegrationKeyTypeEmail:
+	case IntegrationKeyTypeGeneric, IntegrationKeyTypeGrafana, IntegrationKeyTypeSite24x7, IntegrationKeyTypePrometheusAlertmanager, IntegrationKeyTypeEmail, IntegrationKeyTypeUniversal:
 		return true
 	}
 	return false
@@ -685,7 +1359,7 @@ func (e IntegrationKeyType) String() string {
 	return string(e)
 }
 
-func (e *IntegrationKeyType) UnmarshalGQL(v interface{}) error {
+func (e *IntegrationKeyType) UnmarshalGQL(v any) error {
 	str, ok := v.(string)
 	if !ok {
 		return fmt.Errorf("enums must be strings")
@@ -700,6 +1374,20 @@ func (e *IntegrationKeyType) UnmarshalGQL(v interface{}) error {
 
 func (e IntegrationKeyType) MarshalGQL(w io.Writer) {
 	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *IntegrationKeyType) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e IntegrationKeyType) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
 }
 
 type NotificationStatus string
@@ -728,7 +1416,7 @@ func (e NotificationStatus) String() string {
 	return string(e)
 }
 
-func (e *NotificationStatus) UnmarshalGQL(v interface{}) error {
+func (e *NotificationStatus) UnmarshalGQL(v any) error {
 	str, ok := v.(string)
 	if !ok {
 		return fmt.Errorf("enums must be strings")
@@ -743,6 +1431,199 @@ func (e *NotificationStatus) UnmarshalGQL(v interface{}) error {
 
 func (e NotificationStatus) MarshalGQL(w io.Writer) {
 	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *NotificationStatus) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e NotificationStatus) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
+}
+
+type SWOAction string
+
+const (
+	SWOActionReset   SWOAction = "reset"
+	SWOActionExecute SWOAction = "execute"
+)
+
+var AllSWOAction = []SWOAction{
+	SWOActionReset,
+	SWOActionExecute,
+}
+
+func (e SWOAction) IsValid() bool {
+	switch e {
+	case SWOActionReset, SWOActionExecute:
+		return true
+	}
+	return false
+}
+
+func (e SWOAction) String() string {
+	return string(e)
+}
+
+func (e *SWOAction) UnmarshalGQL(v any) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("enums must be strings")
+	}
+
+	*e = SWOAction(str)
+	if !e.IsValid() {
+		return fmt.Errorf("%s is not a valid SWOAction", str)
+	}
+	return nil
+}
+
+func (e SWOAction) MarshalGQL(w io.Writer) {
+	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *SWOAction) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e SWOAction) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
+}
+
+type SWOState string
+
+const (
+	SWOStateUnknown   SWOState = "unknown"
+	SWOStateResetting SWOState = "resetting"
+	SWOStateIdle      SWOState = "idle"
+	SWOStateSyncing   SWOState = "syncing"
+	SWOStatePausing   SWOState = "pausing"
+	SWOStateExecuting SWOState = "executing"
+	SWOStateDone      SWOState = "done"
+)
+
+var AllSWOState = []SWOState{
+	SWOStateUnknown,
+	SWOStateResetting,
+	SWOStateIdle,
+	SWOStateSyncing,
+	SWOStatePausing,
+	SWOStateExecuting,
+	SWOStateDone,
+}
+
+func (e SWOState) IsValid() bool {
+	switch e {
+	case SWOStateUnknown, SWOStateResetting, SWOStateIdle, SWOStateSyncing, SWOStatePausing, SWOStateExecuting, SWOStateDone:
+		return true
+	}
+	return false
+}
+
+func (e SWOState) String() string {
+	return string(e)
+}
+
+func (e *SWOState) UnmarshalGQL(v any) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("enums must be strings")
+	}
+
+	*e = SWOState(str)
+	if !e.IsValid() {
+		return fmt.Errorf("%s is not a valid SWOState", str)
+	}
+	return nil
+}
+
+func (e SWOState) MarshalGQL(w io.Writer) {
+	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *SWOState) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e SWOState) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
+}
+
+type StatusUpdateState string
+
+const (
+	StatusUpdateStateDisabled       StatusUpdateState = "DISABLED"
+	StatusUpdateStateEnabled        StatusUpdateState = "ENABLED"
+	StatusUpdateStateEnabledForced  StatusUpdateState = "ENABLED_FORCED"
+	StatusUpdateStateDisabledForced StatusUpdateState = "DISABLED_FORCED"
+)
+
+var AllStatusUpdateState = []StatusUpdateState{
+	StatusUpdateStateDisabled,
+	StatusUpdateStateEnabled,
+	StatusUpdateStateEnabledForced,
+	StatusUpdateStateDisabledForced,
+}
+
+func (e StatusUpdateState) IsValid() bool {
+	switch e {
+	case StatusUpdateStateDisabled, StatusUpdateStateEnabled, StatusUpdateStateEnabledForced, StatusUpdateStateDisabledForced:
+		return true
+	}
+	return false
+}
+
+func (e StatusUpdateState) String() string {
+	return string(e)
+}
+
+func (e *StatusUpdateState) UnmarshalGQL(v any) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("enums must be strings")
+	}
+
+	*e = StatusUpdateState(str)
+	if !e.IsValid() {
+		return fmt.Errorf("%s is not a valid StatusUpdateState", str)
+	}
+	return nil
+}
+
+func (e StatusUpdateState) MarshalGQL(w io.Writer) {
+	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *StatusUpdateState) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e StatusUpdateState) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
 }
 
 type UserRole string
@@ -771,7 +1652,7 @@ func (e UserRole) String() string {
 	return string(e)
 }
 
-func (e *UserRole) UnmarshalGQL(v interface{}) error {
+func (e *UserRole) UnmarshalGQL(v any) error {
 	str, ok := v.(string)
 	if !ok {
 		return fmt.Errorf("enums must be strings")
@@ -786,4 +1667,18 @@ func (e *UserRole) UnmarshalGQL(v interface{}) error {
 
 func (e UserRole) MarshalGQL(w io.Writer) {
 	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+func (e *UserRole) UnmarshalJSON(b []byte) error {
+	s, err := strconv.Unquote(string(b))
+	if err != nil {
+		return err
+	}
+	return e.UnmarshalGQL(s)
+}
+
+func (e UserRole) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	e.MarshalGQL(&buf)
+	return buf.Bytes(), nil
 }

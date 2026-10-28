@@ -2,18 +2,33 @@ package app
 
 import (
 	"crypto/tls"
+	"log/slog"
 	"time"
 
 	"github.com/target/goalert/config"
+	"github.com/target/goalert/expflag"
 	"github.com/target/goalert/keyring"
+	"github.com/target/goalert/swo"
+	"github.com/target/goalert/util/log"
 )
 
 type Config struct {
+	LegacyLogger *log.Logger
+
+	Logger *slog.Logger
+
+	ExpFlags expflag.FlagSet
+
 	ListenAddr  string
 	Verbose     bool
 	JSON        bool
 	LogRequests bool
 	APIOnly     bool
+	LogEngine   bool
+
+	ForceRiverDBTime bool
+
+	PublicURL string
 
 	TLSListenAddr string
 	TLSConfig     *tls.Config
@@ -22,6 +37,14 @@ type Config struct {
 	SysAPICertFile   string
 	SysAPIKeyFile    string
 	SysAPICAFile     string
+
+	SMTPListenAddr        string
+	SMTPListenAddrTLS     string
+	SMTPMaxRecipients     int
+	TLSConfigSMTP         *tls.Config
+	SMTPAdditionalDomains string
+
+	EmailIntegrationDomain string
 
 	HTTPPrefix string
 
@@ -33,28 +56,17 @@ type Config struct {
 
 	DisableHTTPSRedirect bool
 
+	EnableSecureHeaders bool
+
 	TwilioBaseURL string
 	SlackBaseURL  string
 
 	DBURL     string
 	DBURLNext string
 
-	JaegerEndpoint      string
-	JaegerAgentEndpoint string
+	StatusAddr string
 
-	StackdriverProjectID string
-
-	TracingClusterName   string
-	TracingPodNamespace  string
-	TracingPodName       string
-	TracingContainerName string
-	TracingNodeName      string
-
-	KubernetesCooldown time.Duration
-	StatusAddr         string
-
-	LogTraces        bool
-	TraceProbability float64
+	EngineCycleTime time.Duration
 
 	EncryptionKeys keyring.Keys
 
@@ -62,9 +74,12 @@ type Config struct {
 
 	StubNotifiers bool
 
-	UIURL string
+	UIDir string
 
 	// InitialConfig will be pushed into the config store
 	// if specified before the engine is started.
 	InitialConfig *config.Config
+
+	// SWO should be set to operate in switchover mode.
+	SWO *swo.Manager
 }

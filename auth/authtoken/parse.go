@@ -19,6 +19,10 @@ func alwaysValid(Type, []byte, []byte) (bool, bool) { return true, false }
 // Parse will parse a token string, optionally verifying it's signature.
 // If verifyFn is nil, the signature is ignored.
 func Parse(s string, verifyFn VerifyFunc) (*Token, bool, error) {
+	if len(s) == 0 {
+		return nil, false, validation.NewGenericError("invalid length")
+	}
+
 	if len(s) == 36 {
 		// integration key type is the only one with possible length 36. Session keys, even if
 		// we switched to a 128-bit signature would be a minimum of 38 base64-encoded chars.
@@ -69,8 +73,22 @@ func Parse(s string, verifyFn VerifyFunc) (*Token, bool, error) {
 	}
 
 	switch data[1] {
+	case 3:
+		if len(data) < 19 {
+			return nil, false, validation.NewGenericError("invalid length")
+		}
+		t := &Token{
+			Version: 3,
+			Type:    Type(data[2]),
+		}
+		valid, isOldKey := verifyFn(t.Type, data[:19], data[19:])
+		if !valid {
+			return nil, false, validation.NewGenericError("invalid signature")
+		}
+		copy(t.ID[:], data[3:])
+		return t, isOldKey, nil
 	case 2:
-		if len(data) < 26 {
+		if len(data) < 27 {
 			return nil, false, validation.NewGenericError("invalid length")
 		}
 		t := &Token{

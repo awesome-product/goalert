@@ -2,7 +2,6 @@ package user
 
 import (
 	"crypto/md5"
-	"database/sql"
 	"encoding/hex"
 	"fmt"
 
@@ -14,25 +13,29 @@ import (
 
 // A User is the base information of a user of the system. Authentication details are stored
 // separately based on the auth provider.
-//
 type User struct {
 	// ID is the unique identifier for the user
-	ID string `json:"id"`
+	ID string
 
 	// Name is the full name of the user
-	Name string `json:"name"`
+	Name string
 
 	// Email is the primary contact email for the user. It is used for account-related communications
-	Email string `json:"email"`
+	Email string
 
 	// AvatarURL is an absolute address for an image to be used as the avatar.
-	AvatarURL string `json:"avatar_url"`
+	AvatarURL string
 
 	// AlertStatusCMID defines a contact method ID for alert status updates.
-	AlertStatusCMID string `json:"alert_status_log_contact_method_id"`
+	//
+	// Deprecated: No longer used.
+	AlertStatusCMID string
 
 	// The Role of the user
-	Role permission.Role `json:"role" store:"readonly"`
+	Role permission.Role
+
+	// isUserFavorite returns true if a user is favorited by the current user.
+	isUserFavorite bool
 }
 
 // ResolveAvatarURL will resolve the user avatar URL, using the email if none is set.
@@ -51,45 +54,32 @@ func (u User) ResolveAvatarURL(fullSize bool) string {
 type scanFn func(...interface{}) error
 
 func (u *User) scanFrom(fn scanFn) error {
-	var statusCM sql.NullString
 	err := fn(
 		&u.ID,
 		&u.Name,
 		&u.Email,
 		&u.AvatarURL,
 		&u.Role,
-		&statusCM,
+		&u.isUserFavorite,
 	)
-	u.AlertStatusCMID = statusCM.String
 	return err
 }
 
 func (u *User) userUpdateFields() []interface{} {
-	var statusCM sql.NullString
-	if u.AlertStatusCMID != "" {
-		statusCM.Valid = true
-		statusCM.String = u.AlertStatusCMID
-	}
 	return []interface{}{
 		u.ID,
 		u.Name,
 		u.Email,
-		statusCM,
 	}
 }
+
 func (u *User) fields() []interface{} {
-	var statusCM sql.NullString
-	if u.AlertStatusCMID != "" {
-		statusCM.Valid = true
-		statusCM.String = u.AlertStatusCMID
-	}
 	return []interface{}{
 		u.ID,
 		u.Name,
 		u.Email,
 		u.AvatarURL,
 		u.Role,
-		statusCM,
 	}
 }
 
@@ -112,13 +102,6 @@ func (u User) Normalize() (*User, error) {
 		)
 	}
 
-	if u.AlertStatusCMID != "" {
-		err = validate.Many(
-			err,
-			validate.UUID("AlertStatusCMID", u.AlertStatusCMID),
-		)
-	}
-
 	err = validate.Many(
 		err,
 		validate.Name("Name", u.Name),
@@ -128,4 +111,9 @@ func (u User) Normalize() (*User, error) {
 		return nil, err
 	}
 	return &u, nil
+}
+
+// IsUserFavorite returns true if a user is a favorite of the current user.
+func (u User) IsUserFavorite() bool {
+	return u.isUserFavorite
 }

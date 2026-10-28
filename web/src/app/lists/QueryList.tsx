@@ -1,21 +1,24 @@
-import React, { useMemo } from 'react'
+import React, { useMemo, useState, useEffect } from 'react'
 import {
   useQuery,
   OperationVariables,
   QueryResult,
   DocumentNode,
 } from '@apollo/client'
-import { useSelector } from 'react-redux'
-import { Grid } from '@material-ui/core'
+import { Card, Grid } from '@mui/material'
 import { once } from 'lodash'
+import { useURLKey, useURLParam } from '../actions/hooks'
 import { PaginatedList, PaginatedListItemProps } from './PaginatedList'
 import { ITEMS_PER_PAGE, POLL_INTERVAL } from '../config'
-import { searchSelector, urlKeySelector } from '../selectors'
 import { fieldAlias } from '../util/graphql'
 import { GraphQLClientWithErrors } from '../apollo'
 import ControlledPaginatedList, {
   ControlledPaginatedListProps,
 } from './ControlledPaginatedList'
+import { PageControls } from './PageControls'
+import { ListHeader } from './ListHeader'
+import CreateFAB from './CreateFAB'
+import { useIsWidthDown } from '../util/useWidth'
 
 // any && object type map
 // used for objects with unknown key/values from parent
@@ -71,6 +74,7 @@ export interface _QueryListProps extends ControlledPaginatedListProps {
    *   }
    *  ```
    */
+
   query: DocumentNode
 
   // mapDataNode should map the struct from each node in `nodes` to the struct required by a PaginatedList item
@@ -82,11 +86,17 @@ export interface _QueryListProps extends ControlledPaginatedListProps {
 
   // mapVariables transforms query variables just before submission
   mapVariables?: (vars: OperationVariables) => OperationVariables
+
+  renderCreateDialog?: (onClose: () => void) => JSX.Element | undefined
+
+  createLabel?: string
+  hideCreate?: boolean
+  pause?: boolean
 }
 
 export type QueryListProps = Omit<_QueryListProps, 'items'>
 
-export default function QueryList(props: QueryListProps): JSX.Element {
+export default function QueryList(props: QueryListProps): React.JSX.Element {
   const {
     mapDataNode = (n: ObjectMap) => ({
       id: n.id,
@@ -98,25 +108,35 @@ export default function QueryList(props: QueryListProps): JSX.Element {
     variables = {},
     noSearch,
     mapVariables = (v) => v,
+    renderCreateDialog,
+    createLabel,
+    hideCreate,
     ...listProps
   } = props
   const { input, ...vars } = variables
+  const [page, setPage] = useState(0)
+  const [showCreate, setShowCreate] = useState(false)
+  const isMobile = useIsWidthDown('md')
 
-  const searchParam = useSelector(searchSelector)
-  const urlKey = useSelector(urlKeySelector)
+  const [searchParam] = useURLParam('search', '')
+  const urlKey = useURLKey()
   const aliasedQuery = useMemo(() => fieldAlias(query, 'data'), [query])
+
+  // reset pageNumber on page reload
+  useEffect(() => {
+    setPage(0)
+  }, [urlKey])
 
   const queryVariables = {
     ...vars,
     input: {
       first: ITEMS_PER_PAGE,
-      search: searchParam,
       ...input,
     },
   }
 
-  if (noSearch) {
-    delete queryVariables.input.search
+  if (searchParam) {
+    queryVariables.input.search = searchParam
   }
 
   const { data, loading, fetchMore, stopPolling } = useQuery(aliasedQuery, {
@@ -124,11 +144,30 @@ export default function QueryList(props: QueryListProps): JSX.Element {
     variables: mapVariables(queryVariables),
     fetchPolicy: 'network-only',
     pollInterval: POLL_INTERVAL,
+    skip: !!props.pause,
   })
 
   const nodes = data?.data?.nodes ?? []
   const items = nodes.map(mapDataNode)
+  const itemCount = items.length
   let loadMore: ((numberToLoad?: number) => void) | undefined
+
+  // isLoading returns true if the parent says we are, or
+  // we are currently on an incomplete page and `loadMore` is available.
+  const isLoading = (() => {
+    if (props.pause) return true
+
+    if (!data && loading) return true
+
+    // We are on a future/incomplete page and loadMore is true
+    if ((page + 1) * ITEMS_PER_PAGE > itemCount && loadMore) return true
+
+    return false
+  })()
+
+  const pageCount = Math.ceil(items.length / ITEMS_PER_PAGE)
+
+  if (itemCount < ITEMS_PER_PAGE && page > 0) setPage(0)
 
   if (data?.data?.pageInfo?.hasNextPage) {
     loadMore = buildFetchMore(
@@ -139,37 +178,78 @@ export default function QueryList(props: QueryListProps): JSX.Element {
     )
   }
 
-  if (
-    props.checkboxActions?.length ||
-    props.secondaryActions ||
-    !props.noSearch
-  ) {
-    return (
-      <Grid container spacing={2}>
+  function renderList(): React.JSX.Element {
+    if (
+      props.checkboxActions?.length ||
+      props.secondaryActions ||
+      !props.noSearch
+    ) {
+      return (
         <ControlledPaginatedList
           {...listProps}
+          listHeader={
+            <ListHeader
+              cardHeader={props.cardHeader}
+              headerNote={props.headerNote}
+              headerAction={props.headerAction}
+            />
+          }
           items={items}
           itemsPerPage={queryVariables.input.first}
+          page={page}
+          isLoading={isLoading}
           loadMore={loadMore}
-          isLoading={!data && loading}
           noSearch={noSearch}
+          renderCreateDialog={renderCreateDialog}
+          createLabel={createLabel}
+          hideCreate={hideCreate}
         />
+      )
+    }
+
+    return (
+      <Grid item xs={12}>
+        <Card>
+          <ListHeader
+            cardHeader={props.cardHeader}
+            headerNote={props.headerNote}
+            headerAction={props.headerAction}
+          />
+          <PaginatedList
+            {...listProps}
+            key={urlKey}
+            items={items}
+            page={page}
+            isLoading={isLoading}
+            itemsPerPage={queryVariables.input.first}
+            loadMore={loadMore}
+          />
+        </Card>
       </Grid>
     )
   }
 
   return (
-    <Grid container spacing={2}>
-      <Grid item xs={12}>
-        <PaginatedList
-          {...listProps}
-          key={urlKey}
-          items={items}
-          itemsPerPage={queryVariables.input.first}
+    <Grid container spacing={2} data-ql='true' data-ql-ready={!isLoading}>
+      {renderList()}
+      {!props.infiniteScroll && (
+        <PageControls
+          pageCount={pageCount}
           loadMore={loadMore}
-          isLoading={!data && loading}
+          page={page}
+          setPage={setPage}
+          isLoading={isLoading}
         />
-      </Grid>
+      )}
+      {!hideCreate && isMobile && renderCreateDialog && createLabel && (
+        <React.Fragment>
+          <CreateFAB
+            onClick={() => setShowCreate(true)}
+            title={`Create ${createLabel}`}
+          />
+          {showCreate && renderCreateDialog(() => setShowCreate(false))}
+        </React.Fragment>
+      )}
     </Grid>
   )
 }

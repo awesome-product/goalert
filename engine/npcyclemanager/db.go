@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 
-	alertlog "github.com/target/goalert/alert/log"
+	"github.com/target/goalert/alert/alertlog"
 	"github.com/target/goalert/engine/processinglock"
 	"github.com/target/goalert/util"
 )
@@ -16,14 +16,14 @@ type DB struct {
 	lock *processinglock.Lock
 
 	queueMessages *sql.Stmt
-	log           alertlog.Store
+	log           *alertlog.Store
 }
 
 // Name returns the name of the module.
 func (db *DB) Name() string { return "Engine.NotificationCycleManager" }
 
 // NewDB creates a new DB.
-func NewDB(ctx context.Context, db *sql.DB, log alertlog.Store) (*DB, error) {
+func NewDB(ctx context.Context, db *sql.DB, log *alertlog.Store) (*DB, error) {
 	lock, err := processinglock.NewLock(ctx, db, processinglock.Config{
 		Type:    processinglock.TypeNPCycle,
 		Version: 2,
@@ -66,7 +66,26 @@ func NewDB(ctx context.Context, db *sql.DB, log alertlog.Store) (*DB, error) {
 				using alerts a, lock_cycles lock
 				where
 					a.status != 'triggered' and a.id = cycle.alert_id and
-					cycle.id = lock.id
+					cycle.id = lock.id and
+					(
+						-- closing always cancels pending notifications
+						a.status = 'closed'
+
+						-- not a multi-ack cycle, so acking cancels it as usual
+						or not cycle.multi_ack
+
+						-- ...or this cycle's own user has already acknowledged since
+						-- it started; no need to keep paging them.
+						or exists (
+							select 1
+							from alert_logs alog
+							where
+								alog.alert_id = cycle.alert_id and
+								alog.event = 'acknowledged' and
+								alog.sub_user_id = cycle.user_id and
+								alog.timestamp > cycle.started_at
+						)
+					)
 				returning cycle.id
 			), process_cycles as (
 				select *

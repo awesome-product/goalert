@@ -3,12 +3,19 @@ package graphqlapp
 import (
 	context "context"
 	"database/sql"
+	"sort"
 
-	"github.com/target/goalert/auth"
-	"github.com/target/goalert/calendarsubscription"
+	"github.com/google/uuid"
+	"github.com/target/goalert/auth/basic"
+	"github.com/target/goalert/calsub"
+	"github.com/target/goalert/gadb"
+	"github.com/target/goalert/notification/twilio"
+	"github.com/target/goalert/schedule"
+	"github.com/target/goalert/validation"
 	"github.com/target/goalert/validation/validate"
 
 	"github.com/pkg/errors"
+	"github.com/target/goalert/assignment"
 	"github.com/target/goalert/escalation"
 	"github.com/target/goalert/graphql2"
 	"github.com/target/goalert/permission"
@@ -18,47 +25,183 @@ import (
 	"github.com/target/goalert/user/notificationrule"
 )
 
-type User App
-type UserSession App
+type (
+	User App
+)
 
 func (a *App) User() graphql2.UserResolver { return (*User)(a) }
 
-func (a *App) UserSession() graphql2.UserSessionResolver { return (*UserSession)(a) }
+func (a *User) OnCallOverview(ctx context.Context, obj *user.User) (*graphql2.OnCallOverview, error) {
+	err := permission.LimitCheckAny(ctx, permission.User)
+	if err != nil {
+		return nil, err
+	}
+	id, err := validate.ParseUUID("UserID", obj.ID)
+	if err != nil {
+		return nil, err
+	}
 
-func (a *User) Sessions(ctx context.Context, obj *user.User) ([]auth.UserSession, error) {
-	return a.AuthHandler.FindAllUserSessions(ctx, obj.ID)
+	data, err := gadb.New(a.DB).GQLUserOnCallOverview(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return &graphql2.OnCallOverview{ServiceAssignments: []graphql2.OnCallServiceAssignment{}}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	svcCount := make(map[uuid.UUID]struct{})
+	var overview graphql2.OnCallOverview
+	for _, svc := range data {
+		svcCount[svc.ServiceID] = struct{}{}
+		overview.ServiceAssignments = append(overview.ServiceAssignments, graphql2.OnCallServiceAssignment{
+			StepNumber:           int(svc.StepNumber),
+			EscalationPolicyID:   svc.PolicyID.String(),
+			EscalationPolicyName: svc.PolicyName,
+			ServiceID:            svc.ServiceID.String(),
+			ServiceName:          svc.ServiceName,
+		})
+	}
+	overview.ServiceCount = len(svcCount)
+
+	// sort by service name, then step number
+	sort.Slice(overview.ServiceAssignments, func(i, j int) bool {
+		a := overview.ServiceAssignments[i]
+		b := overview.ServiceAssignments[j]
+
+		if a.ServiceName != b.ServiceName {
+			return a.ServiceName < b.ServiceName
+		}
+
+		return a.StepNumber < b.StepNumber
+	})
+
+	return &overview, nil
 }
-func (a *UserSession) Current(ctx context.Context, obj *auth.UserSession) (bool, error) {
+
+func (a *User) Sessions(ctx context.Context, obj *user.User) ([]graphql2.UserSession, error) {
+	sess, err := a.AuthHandler.FindAllUserSessions(ctx, obj.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]graphql2.UserSession, len(sess))
+	for i, s := range sess {
+		out[i] = graphql2.UserSession{
+			ID:           s.ID,
+			UserAgent:    s.UserAgent,
+			CreatedAt:    s.CreatedAt,
+			LastAccessAt: s.LastAccessAt,
+			Current:      isCurrentSession(ctx, s.ID),
+		}
+	}
+
+	return out, nil
+}
+
+func isCurrentSession(ctx context.Context, sessID string) bool {
 	src := permission.Source(ctx)
 	if src == nil {
-		return false, nil
+		return false
 	}
 	if src.Type != permission.SourceTypeAuthProvider {
-		return false, nil
+		return false
 	}
 
-	return obj.ID == src.ID, nil
+	return src.ID == sessID
 }
 
 func (a *User) AuthSubjects(ctx context.Context, obj *user.User) ([]user.AuthSubject, error) {
 	return a.UserStore.FindAllAuthSubjectsForUser(ctx, obj.ID)
 }
+
 func (a *User) Role(ctx context.Context, usr *user.User) (graphql2.UserRole, error) {
 	return graphql2.UserRole(usr.Role), nil
 }
 
 func (a *User) ContactMethods(ctx context.Context, obj *user.User) ([]contactmethod.ContactMethod, error) {
-	return a.CMStore.FindAll(ctx, obj.ID)
+	return (*App)(a).FindManyCMsForUser(ctx, obj.ID)
 }
+
 func (a *User) NotificationRules(ctx context.Context, obj *user.User) ([]notificationrule.NotificationRule, error) {
-	return a.NRStore.FindAll(ctx, obj.ID)
+	return (*App)(a).FindManyNRsForUser(ctx, obj.ID)
 }
-func (a *User) CalendarSubscriptions(ctx context.Context, obj *user.User) ([]calendarsubscription.CalendarSubscription, error) {
+
+func (a *User) CalendarSubscriptions(ctx context.Context, obj *user.User) ([]calsub.Subscription, error) {
 	return a.CalSubStore.FindAllByUser(ctx, obj.ID)
 }
 
 func (a *User) OnCallSteps(ctx context.Context, obj *user.User) ([]escalation.Step, error) {
 	return a.PolicyStore.FindAllOnCallStepsForUserTx(ctx, nil, obj.ID)
+}
+
+func (a *User) AssignedSchedules(ctx context.Context, obj *user.User) (schedules []schedule.Schedule, err error) {
+	err = withContextTx(ctx, a.DB, func(ctx context.Context, tx *sql.Tx) error {
+		err = validate.UUID("UserID", obj.ID)
+		if err != nil {
+			return err
+		}
+		_uid, err := uuid.Parse(obj.ID)
+		if err != nil {
+			return err
+		}
+		uid := uuid.NullUUID{
+			Valid: true,
+			UUID:  _uid,
+		}
+
+		// get list of schedules user is on as a direct assignment, or indirectly from a rotation
+		schedules, err = (*App)(a).ScheduleStore.FindManyByUserID(ctx, tx, uid)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	return schedules, err
+}
+
+func (a *Mutation) CreateBasicAuth(ctx context.Context, input graphql2.CreateBasicAuthInput) (bool, error) {
+	pw, err := a.AuthBasicStore.NewHashedPassword(ctx, input.Password)
+	if err != nil {
+		return false, err
+	}
+
+	err = withContextTx(ctx, a.DB, func(ctx context.Context, tx *sql.Tx) error {
+		return a.AuthBasicStore.CreateTx(ctx, tx, input.UserID, input.Username, pw)
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func (a *Mutation) UpdateBasicAuth(ctx context.Context, input graphql2.UpdateBasicAuthInput) (bool, error) {
+	var validatedPW basic.ValidatedPassword
+	var err error
+	if input.OldPassword != nil {
+		if *input.OldPassword == input.Password {
+			return false, validation.NewFieldError("Password", "Cannot match OldPassword")
+		}
+		validatedPW, err = a.AuthBasicStore.ValidatePassword(ctx, *input.OldPassword)
+		if err != nil {
+			return false, err
+		}
+	}
+	pw, err := a.AuthBasicStore.NewHashedPassword(ctx, input.Password)
+	if err != nil {
+		return false, err
+	}
+
+	err = withContextTx(ctx, a.DB, func(ctx context.Context, tx *sql.Tx) error {
+		return a.AuthBasicStore.UpdateTx(ctx, tx, input.UserID, validatedPW, pw)
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 func (a *Mutation) CreateUser(ctx context.Context, input graphql2.CreateUserInput) (*user.User, error) {
@@ -67,6 +210,11 @@ func (a *Mutation) CreateUser(ctx context.Context, input graphql2.CreateUserInpu
 	// NOTE input.username must be validated before input.name
 	// user's name defaults to input.username and a user must be created before an auth_basic_user
 	err := validate.Username("Username", input.Username)
+	if err != nil {
+		return nil, err
+	}
+
+	pass, err := a.AuthBasicStore.NewHashedPassword(ctx, input.Password)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +243,13 @@ func (a *Mutation) CreateUser(ctx context.Context, input graphql2.CreateUserInpu
 		if err != nil {
 			return err
 		}
-		err = a.AuthBasicStore.CreateTx(ctx, tx, newUser.ID, input.Username, input.Password)
+		if input.Favorite != nil && *input.Favorite {
+			err = a.FavoriteStore.Set(ctx, tx, permission.UserID(ctx), assignment.UserTarget(newUser.ID))
+			if err != nil {
+				return err
+			}
+		}
+		err = a.AuthBasicStore.CreateTx(ctx, tx, newUser.ID, input.Username, pass)
 		if err != nil {
 			return err
 		}
@@ -105,13 +259,6 @@ func (a *Mutation) CreateUser(ctx context.Context, input graphql2.CreateUserInpu
 	return newUser, err
 }
 
-func (a *Mutation) DeleteUser(ctx context.Context, id string) (bool, error) {
-	err := a.UserStore.Delete(ctx, id)
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
 func (a *Mutation) UpdateUser(ctx context.Context, input graphql2.UpdateUserInput) (bool, error) {
 	err := withContextTx(ctx, a.DB, func(ctx context.Context, tx *sql.Tx) error {
 		usr, err := a.UserStore.FindOneTx(ctx, tx, input.ID, true)
@@ -132,9 +279,7 @@ func (a *Mutation) UpdateUser(ctx context.Context, input graphql2.UpdateUserInpu
 		if input.Email != nil {
 			usr.Email = *input.Email
 		}
-		if input.StatusUpdateContactMethodID != nil {
-			usr.AlertStatusCMID = *input.StatusUpdateContactMethodID
-		}
+
 		return a.UserStore.UpdateTx(ctx, tx, usr)
 	})
 	return err == nil, err
@@ -150,10 +295,12 @@ func (q *Query) Users(ctx context.Context, opts *graphql2.UserSearchOptions, fir
 	}
 
 	var searchOpts user.SearchOptions
+	searchOpts.FavoritesUserID = permission.UserID(ctx)
 	if opts.Search != nil {
 		searchOpts.Search = *opts.Search
 	}
 	searchOpts.Omit = opts.Omit
+	searchOpts.Only = opts.Only
 	if opts.After != nil && *opts.After != "" {
 		err = search.ParseCursor(*opts.After, &searchOpts)
 		if err != nil {
@@ -166,11 +313,33 @@ func (q *Query) Users(ctx context.Context, opts *graphql2.UserSearchOptions, fir
 	if searchOpts.Limit == 0 {
 		searchOpts.Limit = 15
 	}
-	if opts.CMValue != nil {
-		searchOpts.CMValue = *opts.CMValue
+	if opts.CMType != nil && opts.CMValue != nil {
+		d, err := CompatCMTypeValToDest(*opts.CMType, *opts.CMValue)
+		if err != nil {
+			return nil, err
+		}
+
+		searchOpts.DestType = d.Type
+		searchOpts.DestArgs = d.Args
+	} else if opts.CMType != nil { // type only
+		d, err := CompatCMTypeValToDest(*opts.CMType, "")
+		if err != nil {
+			return nil, err
+		}
+
+		searchOpts.DestType = d.Type
+	} else if opts.CMValue != nil && *opts.CMValue != "" { // value only (assume phone number for compatibility)
+		searchOpts.DestArgs = map[string]string{twilio.FieldPhoneNumber: *opts.CMValue}
 	}
-	if opts.CMType != nil {
-		searchOpts.CMType = *opts.CMType
+	if opts.Dest != nil {
+		searchOpts.DestType = opts.Dest.Type
+		searchOpts.DestArgs = opts.Dest.Args
+	}
+	if opts.FavoritesOnly != nil {
+		searchOpts.FavoritesOnly = *opts.FavoritesOnly
+	}
+	if opts.FavoritesFirst != nil {
+		searchOpts.FavoritesFirst = *opts.FavoritesFirst
 	}
 
 	searchOpts.Limit++
@@ -207,4 +376,8 @@ func (a *Query) User(ctx context.Context, id *string) (*user.User, error) {
 		userID = permission.UserID(ctx)
 	}
 	return (*App)(a).FindOneUser(ctx, userID)
+}
+
+func (a *User) IsFavorite(ctx context.Context, raw *user.User) (bool, error) {
+	return raw.IsUserFavorite(), nil
 }

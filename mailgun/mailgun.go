@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/mail"
 	"strings"
@@ -66,8 +67,8 @@ func httpError(ctx context.Context, w http.ResponseWriter, err error) bool {
 // https://documentation.mailgun.com/en/latest/user_manual.html#securing-webhooks
 func validSignature(ctx context.Context, req *http.Request, apikey string) bool {
 	h := hmac.New(sha256.New, []byte(apikey))
-	io.WriteString(h, req.FormValue("timestamp"))
-	io.WriteString(h, req.FormValue("token"))
+	_, _ = io.WriteString(h, req.FormValue("timestamp"))
+	_, _ = io.WriteString(h, req.FormValue("token"))
 
 	calculatedSignature := h.Sum(nil)
 	signature, err := hex.DecodeString(req.FormValue("signature"))
@@ -79,8 +80,8 @@ func validSignature(ctx context.Context, req *http.Request, apikey string) bool 
 }
 
 type ingressHandler struct {
-	alerts  alert.Store
-	intKeys integrationkey.Store
+	alerts  *alert.Store
+	intKeys *integrationkey.Store
 }
 
 func (h *ingressHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -91,12 +92,27 @@ func (h *ingressHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Form == nil {
-		err := r.ParseMultipartForm(32 << 20)
-		if err != nil && !errors.Is(err, http.ErrNotMultipart) {
-			http.Error(w, err.Error(), http.StatusNotAcceptable)
-			return
-		}
+	ct := r.Header.Get("Content-Type")
+	// RFC 7231, section 3.1.1.5 - empty type
+	//   MAY be treated as application/octet-stream
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	typ, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
+	}
+
+	switch typ {
+	case "application/x-www-form-urlencoded":
+		err = r.ParseForm()
+	case "multipart/form-data", "multipart/mixed":
+		err = r.ParseMultipartForm(32 << 20)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotAcceptable)
+		return
 	}
 
 	if !validSignature(ctx, r, cfg.Mailgun.APIKey) {
@@ -169,7 +185,7 @@ func (h *ingressHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		_, err = h.alerts.CreateOrUpdate(ctx, newAlert)
+		_, _, err = h.alerts.CreateOrUpdate(ctx, newAlert)
 		err = errors.Wrap(err, "create/update alert")
 		err = errutil.MapDBError(err)
 		return err
@@ -185,7 +201,7 @@ func (h *ingressHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // IngressWebhooks is used to accept webhooks from Mailgun to support email as an alert creation mechanism.
 // Will read POST form parameters, validate, sanitize and use to create a new alert.
 // https://documentation.mailgun.com/en/latest/user_manual.html#parsed-messages-parameters
-func IngressWebhooks(aDB alert.Store, intDB integrationkey.Store) http.HandlerFunc {
+func IngressWebhooks(aDB *alert.Store, intDB *integrationkey.Store) http.HandlerFunc {
 	return (&ingressHandler{
 		alerts:  aDB,
 		intKeys: intDB,

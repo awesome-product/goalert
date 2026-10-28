@@ -1,6 +1,5 @@
 html,
 body {
-  background-color: lightgrey;
   height: 100%;
   margin: 0;
 }
@@ -9,30 +8,6 @@ body {
   height: 100%;
 }
 
-a {
-  text-decoration: none;
-  color: #cd1831;
-}
-
 a:hover {
   text-decoration: underline;
-}
-
-/* react-big-calendar */
-.rbc-time-content .rbc-current-time-indicator {
-  background-color: #343434;
-}
-
-.rbc-time-content .rbc-current-time-indicator::before {
-  content: '';
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  left: -6px;
-  top: -4.5px;
-  -moz-border-radius: 5px;
-  -webkit-border-radius: 5px;
-  border-radius: 5px;
-  background-color: #343434;
-  position: absolute;
 }

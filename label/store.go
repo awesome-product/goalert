@@ -3,68 +3,59 @@ package label
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/target/goalert/assignment"
+	"github.com/target/goalert/gadb"
 	"github.com/target/goalert/permission"
-	"github.com/target/goalert/util"
-	"github.com/target/goalert/validation/validate"
 
 	"github.com/pkg/errors"
 )
 
 // Store allows the lookup and management of Labels.
-type Store interface {
-	SetTx(ctx context.Context, tx *sql.Tx, label *Label) error
-	FindAllByService(ctx context.Context, serviceID string) ([]Label, error)
-	UniqueKeysTx(ctx context.Context, tx *sql.Tx) ([]string, error)
-	UniqueKeys(ctx context.Context) ([]string, error)
-	SearchKeys(ctx context.Context, opts *KeySearchOptions) ([]string, error)
-	SearchValues(ctx context.Context, opts *ValueSearchOptions) ([]string, error)
-}
-
-// DB implements the Store interface using a postgres database.
-type DB struct {
+type Store struct {
 	db *sql.DB
-
-	upsert           *sql.Stmt
-	delete           *sql.Stmt
-	findAllByService *sql.Stmt
-	uniqueKeys       *sql.Stmt
 }
 
-// NewDB will Set a DB backend from a sql.DB. An error will be returned if statements fail to prepare.
-func NewDB(ctx context.Context, db *sql.DB) (*DB, error) {
-	p := &util.Prepare{DB: db, Ctx: ctx}
-	return &DB{
-		db: db,
-		upsert: p.P(`
-			INSERT INTO labels (tgt_service_id, key, value)
-			VALUES ($1, $2, $3)
-			ON CONFLICT (key, tgt_service_id) DO UPDATE
-			SET value = $3
-		`),
-		delete: p.P(`
-			DELETE FROM labels
-			WHERE tgt_service_id = $1 
-			AND key = $2 
-		`),
-		findAllByService: p.P(`
-			SELECT key, value
-			FROM labels
-			WHERE tgt_service_id = $1
-			ORDER BY key ASC
-		`),
-		uniqueKeys: p.P(`
-			SELECT DISTINCT (key) 
-			FROM labels
-			ORDER BY key ASC
-		`),
-	}, p.Err
+// NewStore will Set a DB backend from a sql.DB. An error will be returned if statements fail to prepare.
+func NewStore(ctx context.Context, db *sql.DB) (*Store, error) { return &Store{db: db}, nil }
+
+func (l *Label) tgtEP() uuid.NullUUID {
+	if l.Target.TargetType() != assignment.TargetTypeEscalationPolicy {
+		return uuid.NullUUID{}
+	}
+
+	return uuid.NullUUID{UUID: uuid.MustParse(l.Target.TargetID()), Valid: true}
+}
+
+func (l *Label) tgtSvc() uuid.NullUUID {
+	if l.Target.TargetType() != assignment.TargetTypeService {
+		return uuid.NullUUID{}
+	}
+
+	return uuid.NullUUID{UUID: uuid.MustParse(l.Target.TargetID()), Valid: true}
+}
+
+func (l *Label) tgtSched() uuid.NullUUID {
+	if l.Target.TargetType() != assignment.TargetTypeSchedule {
+		return uuid.NullUUID{}
+	}
+
+	return uuid.NullUUID{UUID: uuid.MustParse(l.Target.TargetID()), Valid: true}
+}
+
+func (l *Label) tgtRot() uuid.NullUUID {
+	if l.Target.TargetType() != assignment.TargetTypeRotation {
+		return uuid.NullUUID{}
+	}
+
+	return uuid.NullUUID{UUID: uuid.MustParse(l.Target.TargetID()), Valid: true}
 }
 
 // SetTx will set a label for the service. It can be used to set the key-value pair for the label,
 // delete a label or update the value given the label's key.
-func (db *DB) SetTx(ctx context.Context, tx *sql.Tx, label *Label) error {
+func (s *Store) SetTx(ctx context.Context, db gadb.DBTX, label *Label) error {
 	err := permission.LimitCheckAny(ctx, permission.System, permission.User)
 	if err != nil {
 		return err
@@ -75,98 +66,72 @@ func (db *DB) SetTx(ctx context.Context, tx *sql.Tx, label *Label) error {
 		return err
 	}
 
-	if n.Value == "" {
-		// Delete Operation
-		stmt := db.delete
-		if tx != nil {
-			stmt = tx.StmtContext(ctx, stmt)
+	if n.Value == "" { // delete if value is empty
+		err = gadb.New(db).LabelDeleteKeyByTarget(ctx, gadb.LabelDeleteKeyByTargetParams{
+			Key:        label.Key,
+			ServiceID:  label.tgtSvc(),
+			ScheduleID: label.tgtSched(),
+			RotationID: label.tgtRot(),
+			EpID:       label.tgtEP(),
+		})
+		if err != nil {
+			return fmt.Errorf("delete label: %w", err)
 		}
 
-		_, err = stmt.ExecContext(ctx, n.Target.TargetID(), n.Key)
-		return errors.Wrap(err, "delete label")
+		return nil
 	}
 
-	stmt := db.upsert
-	if tx != nil {
-		stmt = tx.StmtContext(ctx, stmt)
-	}
-
-	_, err = stmt.ExecContext(ctx, n.Target.TargetID(), n.Key, n.Value)
+	err = gadb.New(db).LabelSetByTarget(ctx, gadb.LabelSetByTargetParams{
+		Key:        label.Key,
+		Value:      label.Value,
+		ServiceID:  label.tgtSvc(),
+		ScheduleID: label.tgtSched(),
+		RotationID: label.tgtRot(),
+		EpID:       label.tgtEP(),
+	})
 	if err != nil {
-		return errors.Wrap(err, "set label")
+		return fmt.Errorf("set label: %w", err)
 	}
 
 	return nil
 }
 
-// FindAllByService finds all labels for a particular service. It returns all key-value pairs.
-func (db *DB) FindAllByService(ctx context.Context, serviceID string) ([]Label, error) {
+// FindAllByTarget finds all labels for a particular target. It returns all key-value pairs.
+func (s *Store) FindAllByTarget(ctx context.Context, db gadb.DBTX, t assignment.Target) ([]Label, error) {
 	err := permission.LimitCheckAny(ctx, permission.System, permission.User)
 	if err != nil {
 		return nil, err
 	}
 
-	err = validate.UUID("ServiceID", serviceID)
-	if err != nil {
-		return nil, err
+	label := Label{Target: t}
+	rows, err := gadb.New(db).LabelFindAllByTarget(ctx, gadb.LabelFindAllByTargetParams{
+		ServiceID:  label.tgtSvc(),
+		ScheduleID: label.tgtSched(),
+		RotationID: label.tgtRot(),
+		EpID:       label.tgtEP(),
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
 	}
-	rows, err := db.findAllByService.QueryContext(ctx, serviceID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("find all labels by service: %w", err)
 	}
-	defer rows.Close()
 
-	var labels []Label
-	var l Label
-
-	for rows.Next() {
-		err = rows.Scan(
-			&l.Key,
-			&l.Value,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "scan row")
-		}
-
-		l.Target = assignment.ServiceTarget(serviceID)
-
-		labels = append(labels, l)
+	labels := make([]Label, len(rows))
+	for i, l := range rows {
+		labels[i].Key = l.Key
+		labels[i].Value = l.Value
+		labels[i].Target = t
 	}
 
 	return labels, nil
 }
 
-func (db *DB) UniqueKeysTx(ctx context.Context, tx *sql.Tx) ([]string, error) {
+func (s *Store) UniqueKeysTx(ctx context.Context, db gadb.DBTX) ([]string, error) {
 	err := permission.LimitCheckAny(ctx, permission.System, permission.User)
 	if err != nil {
 		return nil, err
 	}
 
-	stmt := db.uniqueKeys
-	if tx != nil {
-		stmt = tx.StmtContext(ctx, stmt)
-	}
-
-	rows, err := stmt.QueryContext(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var keys []string
-
-	for rows.Next() {
-		var k string
-		err = rows.Scan(&k)
-		if err != nil {
-			return nil, errors.Wrap(err, "scan row")
-		}
-
-		keys = append(keys, k)
-	}
-	return keys, nil
-}
-
-func (db *DB) UniqueKeys(ctx context.Context) ([]string, error) {
-	return db.UniqueKeysTx(ctx, nil)
+	return gadb.New(db).LabelUniqueKeys(ctx)
 }

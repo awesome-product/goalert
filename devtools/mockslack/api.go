@@ -20,7 +20,27 @@ type Channel struct {
 
 // Message represents a Slack message.
 type Message struct {
-	TS   string `json:"ts"`
-	Text string `json:"text"`
-	User string `json:"user"`
+	TS        string `json:"ts"`
+	ThreadTS  string `json:"thread_ts"`
+	UpdateTS  string `json:"update_ts"`
+	Text      string `json:"text"`
+	User      string `json:"user"`
+	Broadcast bool   `json:"reply_broadcast"`
+	Color     string `json:"color"`
+
+	ChannelID string
+	ToUserID  string
+
+	Actions []Action
+}
+
+// UserGroup represents a Slack user group.
+type UserGroup struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Handle string `json:"handle"`
+
+	IsUserGroup bool `json:"is_usergroup"`
+
+	Users []string `json:"users"`
 }

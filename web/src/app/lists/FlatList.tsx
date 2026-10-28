@@ -1,94 +1,145 @@
-import React, { useLayoutEffect } from 'react'
-import List, { ListProps } from '@material-ui/core/List'
-import ListItem, { ListItemProps } from '@material-ui/core/ListItem'
-import ListItemIcon from '@material-ui/core/ListItemIcon'
-import ListItemSecondaryAction from '@material-ui/core/ListItemSecondaryAction'
-import ListItemText from '@material-ui/core/ListItemText'
-import Typography from '@material-ui/core/Typography'
-import {
-  DragDropContext,
-  Droppable,
-  Draggable,
-  DropResult,
-  DraggableStateSnapshot,
-  DraggableProvided,
-  DroppableProvided,
-} from 'react-beautiful-dnd'
-import ListSubheader from '@material-ui/core/ListSubheader'
-import AppLink from '../util/AppLink'
-import { makeStyles } from '@material-ui/core'
+import React, {
+  useEffect,
+  useRef,
+  useState,
+  MouseEvent,
+  ReactNode,
+} from 'react'
+import ButtonBase from '@mui/material/ButtonBase'
+import List, { ListProps } from '@mui/material/List'
+import MUIListItem from '@mui/material/ListItem'
+import ListItemText from '@mui/material/ListItemText'
+import Typography from '@mui/material/Typography'
+import ListSubheader from '@mui/material/ListSubheader'
+import makeStyles from '@mui/styles/makeStyles'
 import { CSSTransition, TransitionGroup } from 'react-transition-group'
-import { Alert, AlertTitle, Color } from '@material-ui/lab'
-import { Notice, NoticeType } from '../details/Notices'
-
-const lime = '#93ed94'
-const lightLime = '#defadf'
-const lightGrey = '#ebebeb'
+import {
+  Alert,
+  AlertTitle,
+  ListItemButton,
+  ListItemIcon,
+  Collapse,
+} from '@mui/material'
+import {
+  closestCenter,
+  DndContext,
+  DragEndEvent,
+  KeyboardSensor,
+  MeasuringStrategy,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core'
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable'
+import { Notice, toSeverity } from '../details/Notices'
+import FlatListItem from './FlatListItem'
+import { DraggableListItem, getAnnouncements } from './DraggableListItem'
+import { ExpandLess, ExpandMore } from '@mui/icons-material'
 
 const useStyles = makeStyles({
-  alert: {
-    margin: '0.5rem 0 0.5rem 0',
-  },
-  background: { backgroundColor: 'white' },
-  highlightedItem: {
+  alertAsButton: {
     width: '100%',
-    borderLeft: '6px solid ' + lime,
-    background: lightLime,
+    marginTop: '6px',
+    marginBottom: '6px',
+    '&:hover, &.Mui-focusVisible': {
+      filter: 'brightness(90%)',
+    },
   },
-  participantDragging: {
-    backgroundColor: lightGrey,
+  buttonBase: {
+    width: '100%',
+    borderRadius: 4,
   },
   slideEnter: {
+    maxHeight: '0px',
+    opacity: 0,
     transform: 'translateX(-100%)',
   },
   slideEnterActive: {
+    maxHeight: '60px',
+    opacity: 1,
     transform: 'translateX(0%)',
-    transition: 'opacity 500ms, transform 500ms',
+    transition: 'all 500ms',
   },
   slideExit: {
+    maxHeight: '60px',
+    opacity: 1,
     transform: 'translateX(0%)',
   },
   slideExitActive: {
+    maxHeight: '0px',
+    opacity: 0,
     transform: 'translateX(-100%)',
-    transition: 'opacity 500ms, transform 500ms',
+    transition: 'all 500ms',
   },
-  listItem: {
-    width: '100%',
-  },
-  listItemText: {
-    fontStyle: 'italic',
+  subheader: {
+    backgroundColor: 'transparent',
+    paddingBottom: '4px',
   },
 })
 
+const measuringConfig = {
+  droppable: {
+    strategy: MeasuringStrategy.Always,
+  },
+}
+
 export interface FlatListSub {
   id?: string
-  subHeader: string
+  subHeader: React.JSX.Element | string
+  disableGutter?: boolean
 }
 
 export interface FlatListNotice extends Notice {
   id?: string
-  icon?: JSX.Element
+  icon?: React.JSX.Element
   transition?: boolean
+  handleOnClick?: (event: MouseEvent) => void
+  'data-cy'?: string
 }
-export interface FlatListItem {
-  title?: string
+export interface FlatListItemOptions {
+  title?: React.ReactNode
+  primaryText?: React.ReactNode
   highlight?: boolean
-  subText?: JSX.Element | string
-  icon?: JSX.Element | null
-  secondaryAction?: JSX.Element | null
+  selected?: boolean
+  subText?: React.JSX.Element | string
+  icon?: React.JSX.Element | null
+  section?: string | number
+  secondaryAction?: React.JSX.Element | null
   url?: string
-  id?: string
+  id?: string // required for drag and drop functionality
   scrollIntoView?: boolean
+  'data-cy'?: string
+  draggable?: boolean // set by DraggableListItem
+  disabled?: boolean
+  disableTypography?: boolean
+  onClick?: () => void
 }
 
-export type FlatListListItem = FlatListSub | FlatListItem | FlatListNotice
+export interface SectionTitle {
+  title: React.ReactNode
+  icon?: React.ReactNode | null
+  subText?: React.JSX.Element | string
+}
+
+export type FlatListListItem =
+  | FlatListSub
+  | FlatListItemOptions
+  | FlatListNotice
 
 export interface FlatListProps extends ListProps {
   items: FlatListListItem[]
 
+  // sectition titles for collaspable sections
+  sections?: SectionTitle[]
+
   // header elements will be displayed at the top of the list.
-  headerNote?: string // left-aligned
-  headerAction?: JSX.Element // right-aligned
+  headerNote?: React.JSX.Element | string | ReactNode // left-aligned
+  headerAction?: React.JSX.Element // right-aligned
 
   // emptyMessage will be displayed if there are no items in the list.
   emptyMessage?: string
@@ -103,32 +154,9 @@ export interface FlatListProps extends ListProps {
 
   // will render transition in list
   transition?: boolean
-}
 
-const severityMap: { [K in NoticeType]: Color } = {
-  INFO: 'info',
-  WARNING: 'warning',
-  ERROR: 'error',
-  OK: 'success',
-}
-
-interface ScrollIntoViewListItemProps extends ListItemProps {
-  scrollIntoView?: boolean
-}
-
-function ScrollIntoViewListItem(
-  props: ScrollIntoViewListItemProps,
-): JSX.Element {
-  const { scrollIntoView, ...other } = props
-  const ref = React.useRef<HTMLLIElement>(null)
-  useLayoutEffect(() => {
-    if (scrollIntoView) {
-      ref.current?.scrollIntoView({ block: 'center' })
-    }
-  }, [scrollIntoView])
-
-  // @ts-expect-error complains due to ListItem not always rendering a list item.
-  return <ListItem ref={ref} {...other} />
+  // will render items in collaspable sections in list
+  collapsable?: boolean
 }
 
 export default function FlatList({
@@ -138,32 +166,111 @@ export default function FlatList({
   headerAction,
   items,
   inset,
+  sections,
   transition,
+  collapsable,
   ...listProps
-}: FlatListProps): JSX.Element {
+}: FlatListProps): React.JSX.Element {
   const classes = useStyles()
 
+  // collapsable sections state
+  const [openSections, setOpenSections] = useState<React.ReactNode[]>(
+    sections && sections.length ? [sections[0].title] : [],
+  )
+
+  useEffect(() => {
+    const sectionArr = sections?.map((section) => section.title)
+    // update openSections if there are new sections
+    if (
+      openSections.length &&
+      sectionArr?.length &&
+      !sectionArr?.find(
+        (section: React.ReactNode) => section === openSections[0],
+      )
+    ) {
+      setOpenSections([sectionArr[0]])
+    }
+  }, [sections])
+
+  // drag and drop stuff
+  const sensors = useSensors(
+    useSensor(PointerSensor),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  )
+  const [dndItems, setDndItems] = useState(
+    // use IDs to sort, fallback to index
+    items.map((i, idx) => (i.id ? i.id : idx.toString())),
+  )
+
+  useEffect(() => {
+    setDndItems(items.map((i, idx) => (i.id ? i.id : idx.toString())))
+  }, [items])
+
+  const isFirstAnnouncement = useRef(false)
+  const announcements = getAnnouncements(dndItems, isFirstAnnouncement)
   function handleDragStart(): void {
-    // adds a little vibration if the browser supports it
-    if (window.navigator.vibrate) {
-      window.navigator.vibrate(100)
+    if (!isFirstAnnouncement.current) {
+      isFirstAnnouncement.current = true
+    }
+  }
+  function handleDragEnd(e: DragEndEvent): void {
+    if (!onReorder || !e.over) return
+    if (e.active.id !== e.over.id) {
+      const oldIndex = dndItems.indexOf(e.active.id.toString())
+      const newIndex = dndItems.indexOf(e.over.id.toString())
+      setDndItems(arrayMove(dndItems, oldIndex, newIndex)) // update order in local state
+      onReorder(oldIndex, newIndex) // callback fn from props
     }
   }
 
-  function handleDragEnd(result: DropResult): void {
-    if (result.destination && onReorder) {
-      onReorder(result.source.index, result.destination.index)
-    }
+  function renderEmptyMessage(): React.JSX.Element {
+    return (
+      <MUIListItem>
+        <ListItemText
+          disableTypography
+          secondary={
+            <Typography data-cy='list-empty-message' variant='caption'>
+              {emptyMessage}
+            </Typography>
+          }
+        />
+      </MUIListItem>
+    )
   }
 
-  function renderNoticeItem(item: FlatListNotice, idx: number): JSX.Element {
+  function renderNoticeItem(
+    item: FlatListNotice,
+    idx: number,
+  ): React.JSX.Element {
+    if (item.handleOnClick) {
+      return (
+        <ButtonBase
+          className={classes.buttonBase}
+          onClick={item.handleOnClick}
+          data-cy={item['data-cy']}
+        >
+          <Alert
+            className={classes.alertAsButton}
+            key={idx}
+            severity={toSeverity(item.type)}
+            icon={item.icon}
+            action={item.action}
+          >
+            {item.message && <AlertTitle>{item.message}</AlertTitle>}
+            {item.details}
+          </Alert>
+        </ButtonBase>
+      )
+    }
+
     return (
       <Alert
         key={idx}
-        component='li'
-        className={classes.alert}
-        severity={severityMap[item.type]}
+        severity={toSeverity(item.type)}
         icon={item.icon}
+        sx={{ mt: '16px', mb: '16px' }}
       >
         {item.message && <AlertTitle>{item.message}</AlertTitle>}
         {item.details}
@@ -171,9 +278,16 @@ export default function FlatList({
     )
   }
 
-  function renderSubheaderItem(item: FlatListSub, idx: number): JSX.Element {
+  function renderSubheaderItem(
+    item: FlatListSub,
+    idx: number,
+  ): React.JSX.Element {
     return (
-      <ListSubheader key={idx} className={classes.background}>
+      <ListSubheader
+        key={idx}
+        className={classes.subheader}
+        sx={item.disableGutter ? { pl: 0 } : null}
+      >
         <Typography
           component='h2'
           variant='subtitle1'
@@ -186,45 +300,12 @@ export default function FlatList({
     )
   }
 
-  function renderItem(item: FlatListItem, idx: number): JSX.Element {
-    let itemProps = {}
-    if (item.url) {
-      itemProps = {
-        component: AppLink,
-        to: item.url,
-        button: true,
-      }
-    }
-
-    return (
-      <ScrollIntoViewListItem
-        scrollIntoView={item.scrollIntoView}
-        key={idx}
-        {...itemProps}
-        className={item.highlight ? classes.highlightedItem : classes.listItem}
-      >
-        {item.icon && <ListItemIcon>{item.icon}</ListItemIcon>}
-        <ListItemText
-          primary={item.title}
-          secondary={item.subText}
-          secondaryTypographyProps={{ style: { whiteSpace: 'pre-line' } }}
-          inset={inset && !item.icon}
-        />
-        {item.secondaryAction && (
-          <ListItemSecondaryAction>
-            {item.secondaryAction}
-          </ListItemSecondaryAction>
-        )}
-      </ScrollIntoViewListItem>
-    )
-  }
-
-  function renderTransitionItems(): JSX.Element[] {
+  function renderTransitionItems(): React.JSX.Element[] {
     return items.map((item, idx) => {
       if ('subHeader' in item) {
         return (
           <CSSTransition
-            key={'header_' + item.id + idx}
+            key={'header_' + item.id}
             timeout={0}
             exit={false}
             enter={false}
@@ -236,7 +317,7 @@ export default function FlatList({
       if ('type' in item) {
         return (
           <CSSTransition
-            key={'notice_' + item.id + idx}
+            key={'notice_' + item.id}
             timeout={500}
             exit={Boolean(item.transition)}
             enter={Boolean(item.transition)}
@@ -253,7 +334,7 @@ export default function FlatList({
       }
       return (
         <CSSTransition
-          key={'item_' + item.id + idx}
+          key={'item_' + item.id}
           timeout={500}
           classNames={{
             enter: classes.slideEnter,
@@ -262,25 +343,14 @@ export default function FlatList({
             exitActive: classes.slideExitActive,
           }}
         >
-          {renderItem(item, idx)}
+          <FlatListItem index={idx} item={item} />
         </CSSTransition>
       )
     })
   }
 
-  function renderEmptyMessage(): JSX.Element {
-    return (
-      <ListItem>
-        <ListItemText
-          disableTypography
-          secondary={
-            <Typography data-cy='list-empty-message' variant='caption'>
-              {emptyMessage}
-            </Typography>
-          }
-        />
-      </ListItem>
-    )
+  function renderTransitions(): React.JSX.Element {
+    return <TransitionGroup>{renderTransitionItems()}</TransitionGroup>
   }
 
   function renderItems(): (JSX.Element | undefined)[] | JSX.Element {
@@ -291,86 +361,119 @@ export default function FlatList({
       if ('type' in item) {
         return renderNoticeItem(item, idx)
       }
-      if (!onReorder) {
-        return renderItem(item, idx)
-      }
-      if (item.id) {
+      if (onReorder) {
         return (
-          <Draggable key={item.id} draggableId={item.id} index={idx}>
-            {(
-              provided: DraggableProvided,
-              snapshot: DraggableStateSnapshot,
-            ) => {
-              // light grey background while dragging non-active user
-              const draggingBackground = snapshot.isDragging
-                ? classes.participantDragging
-                : ''
-              return (
-                <div
-                  ref={provided.innerRef}
-                  {...provided.draggableProps}
-                  {...provided.dragHandleProps}
-                  className={draggingBackground}
-                >
-                  {renderItem(item, idx)}
-                </div>
-              )
-            }}
-          </Draggable>
+          <DraggableListItem
+            key={`${idx}-${item.id}`}
+            index={idx}
+            item={item}
+            id={item.id ?? idx.toString()}
+          />
         )
       }
+
+      return <FlatListItem key={item.id || idx} index={idx} item={item} />
     })
   }
 
-  function renderTransitions(): JSX.Element {
-    return <TransitionGroup>{renderTransitionItems()}</TransitionGroup>
+  function renderCollapsableItems(): React.JSX.Element[] | undefined {
+    const toggleSection = (section: React.ReactNode): void => {
+      if (openSections?.includes(section)) {
+        setOpenSections(
+          openSections.filter((openSection) => openSection !== section),
+        )
+      } else {
+        setOpenSections([...openSections, section])
+      }
+    }
+    return sections?.map((section, idx) => {
+      const open = openSections?.includes(section.title)
+      return (
+        <React.Fragment key={idx}>
+          <ListItemButton onClick={() => toggleSection(section.title)}>
+            {section.icon && <ListItemIcon>{section.icon}</ListItemIcon>}
+            <ListItemText primary={section.title} secondary={section.subText} />
+            {open ? <ExpandLess /> : <ExpandMore />}
+          </ListItemButton>
+          <Collapse in={open} unmountOnExit>
+            <List>
+              {items
+                .filter(
+                  (item: FlatListItemOptions) => item.section === section.title,
+                )
+                .map((item, idx) => {
+                  return <FlatListItem index={idx} key={idx} item={item} />
+                })}
+            </List>
+          </Collapse>
+        </React.Fragment>
+      )
+    })
   }
 
-  // renderList handles rendering the list container as well as any
-  // header elements provided
-  function renderList(): JSX.Element {
+  function renderList(): React.JSX.Element {
+    const renderListItems = ():
+      | (JSX.Element | undefined)[]
+      | JSX.Element
+      | JSX.Element[]
+      | undefined => {
+      if (transition) return renderTransitions()
+      if (collapsable) return renderCollapsableItems()
+      return renderItems()
+    }
+
+    // if drag and drop is enabled, this is needed
+    // to resolve z-index issues when dragging an
+    // item down the y-axis
+    let sx = listProps.sx
+    if (onReorder) {
+      sx = {
+        ...sx,
+        display: 'grid',
+      }
+    }
+
     return (
-      <List {...listProps}>
-        {(headerNote || headerAction) && (
-          <ListItem>
+      <List {...listProps} sx={sx}>
+        {(headerNote || headerAction || onReorder) && (
+          <MUIListItem>
             {headerNote && (
               <ListItemText
                 disableTypography
                 secondary={
                   <Typography color='textSecondary'>{headerNote}</Typography>
                 }
-                className={classes.listItemText}
+                sx={{ fontStyle: 'italic', pr: 2 }}
               />
             )}
-            {headerAction && (
-              <ListItemSecondaryAction>{headerAction}</ListItemSecondaryAction>
-            )}
-          </ListItem>
+            {headerAction && <div>{headerAction}</div>}
+          </MUIListItem>
         )}
         {!items.length && renderEmptyMessage()}
-        {transition ? renderTransitions() : renderItems()}
+        {renderListItems()}
       </List>
     )
   }
 
-  function renderDragAndDrop(): JSX.Element {
+  if (onReorder) {
     return (
-      <DragDropContext onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
-        <Droppable droppableId='droppable'>
-          {(provided: DroppableProvided) => (
-            <div ref={provided.innerRef} {...provided.droppableProps}>
-              {renderList()}
-              {provided.placeholder}
-            </div>
-          )}
-        </Droppable>
-      </DragDropContext>
+      <DndContext
+        accessibility={{ announcements }}
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragStart={handleDragStart}
+        onDragEnd={handleDragEnd}
+        measuring={measuringConfig}
+      >
+        <SortableContext
+          items={dndItems}
+          strategy={verticalListSortingStrategy}
+        >
+          {renderList()}
+        </SortableContext>
+      </DndContext>
     )
   }
 
-  if (onReorder) {
-    // Enable drag and drop
-    return renderDragAndDrop()
-  }
   return renderList()
 }

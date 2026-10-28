@@ -1,7 +1,43 @@
 import { Chance } from 'chance'
 import { Schedule } from '../../schema'
+import profile from '../fixtures/profile.json'
 
 const c = new Chance()
+
+declare global {
+  namespace Cypress {
+    interface Chainable {
+      /**
+       * Creates a new calendar subscription.
+       */
+      createCalendarSubscription: typeof createCalendarSubscription
+
+      /**
+       * Deletes all calendar subscriptions given the specified user ID.
+       * Will default to deleting all subscriptions for 'profile' if no ID provided.
+       */
+      resetCalendarSubscriptions: typeof resetCalendarSubscriptions
+    }
+  }
+
+  interface CalendarSubscription {
+    id: string
+    name: string
+    reminderMinutes: Array<number>
+    scheduleID: string
+    schedule: Schedule
+    lastAccess: string
+    disabled: boolean
+  }
+
+  interface CalendarSubscriptionOptions {
+    name?: string
+    reminderMinutes?: Array<number>
+    scheduleID?: string
+    schedule?: Partial<Schedule>
+    disabled?: boolean
+  }
+}
 
 /*
  * Generate a random array for the reminderMinutes variable
@@ -64,9 +100,7 @@ function createCalendarSubscription(
 
 function resetCalendarSubscriptions(userID?: string): Cypress.Chainable<void> {
   if (!userID) {
-    return cy.fixture('profile').then((prof) => {
-      resetCalendarSubscriptions(prof.id)
-    })
+    return resetCalendarSubscriptions(profile.id)
   }
 
   const dbQuery = `delete from user_calendar_subscriptions where user_id = '${userID}'`

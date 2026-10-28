@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -17,26 +18,36 @@ const SchemaVersion = 1
 type Config struct {
 	data        []byte
 	fallbackURL string
+	explicitURL string
+
+	intEmailDomain string
 
 	General struct {
-		PublicURL                    string `public:"true" info:"Publicly routable URL for UI links and API calls."`
-		GoogleAnalyticsID            string `public:"true"`
+		ApplicationName              string `public:"true" info:"The name used in messaging and page titles. Defaults to \"GoAlert\"."`
+		PublicURL                    string `public:"true" info:"Publicly routable URL for UI links and API calls." deprecated:"Use --public-url flag instead, which takes precedence."`
+		GoogleAnalyticsID            string `public:"true" info:"If set, will post user metrics to the corresponding data stream in Google Analytics 4."`
 		NotificationDisclaimer       string `public:"true" info:"Disclaimer text for receiving pre-recorded notifications (appears on profile page)."`
-		MessageBundles               bool   `public:"true" info:"Enables bundling status updates and alert notifications. Also allows 'ack/close all' responses to bundled alerts."`
+		DisableMessageBundles        bool   `public:"true" info:"Disable bundling status updates and alert notifications."`
 		ShortURL                     string `public:"true" info:"If set, messages will contain a shorter URL using this as a prefix (e.g. http://example.com). It should point to GoAlert and can be the same as the PublicURL."`
 		DisableSMSLinks              bool   `public:"true" info:"If set, SMS messages will not contain a URL pointing to GoAlert."`
 		DisableLabelCreation         bool   `public:"true" info:"Disables the ability to create new labels for services."`
 		DisableCalendarSubscriptions bool   `public:"true" info:"If set, disables all active calendar subscriptions as well as the ability to create new calendar subscriptions."`
-		EnableV1GraphQL              bool   `info:"Enables the deprecated /v1/graphql endpoint (replaced by /api/graphql)."`
+	}
+
+	Services struct {
+		RequiredLabels []string `public:"true" info:"List of label names to require new services to define."`
 	}
 
 	Maintenance struct {
-		AlertCleanupDays int `public:"true" info:"Closed alerts will be deleted after this many days (0 means disable cleanup)."`
-		APIKeyExpireDays int `public:"true" info:"Unused calendar API keys will be disabled after this many days (0 means disable cleanup)."`
+		AlertCleanupDays     int  `public:"true" info:"Closed alerts will be deleted after this many days (0 means disable cleanup)."`
+		AlertAutoCloseDays   int  `public:"true" info:"Unacknowledged alerts will automatically be closed after this many days of inactivity. (0 means disable auto-close)."`
+		AutoCloseAckedAlerts bool `public:"true" info:"If set, alerts that are acknowledged will also be automatically closed after the configured number of days of inactivity."`
+		APIKeyExpireDays     int  `public:"true" info:"Unused calendar API keys will be disabled after this many days (0 means disable cleanup)."`
+		ScheduleCleanupDays  int  `public:"true" info:"Schedule on-call history will be deleted after this many days (0 means disable cleanup)."`
 	}
 
 	Auth struct {
-		RefererURLs  []string `info:"Allowed referer URLs for auth and redirects."`
+		RefererURLs  []string `info:"Allowed referer URLs for auth and redirects." deprecated:"Use --public-url flag instead, which takes precedence."`
 		DisableBasic bool     `public:"true" info:"Disallow username/password login."`
 	}
 
@@ -73,7 +84,7 @@ type Config struct {
 	Mailgun struct {
 		Enable bool `public:"true"`
 
-		APIKey      string `password:"true"`
+		APIKey      string `password:"true" info:"Set this to the HTTP webhook signing key."`
 		EmailDomain string `info:"The TO address for all incoming alerts."`
 	}
 
@@ -86,14 +97,27 @@ type Config struct {
 		// The `xoxb-` prefix is documented by Slack.
 		// https://api.slack.com/docs/token-types#bot
 		AccessToken string `password:"true" info:"Slack app bot user OAuth access token (should start with xoxb-)."`
+
+		SigningSecret       string `password:"true" info:"Signing secret to verify requests from slack."`
+		InteractiveMessages bool   `info:"Enable interactive messages (e.g. buttons)."`
+		DisableBroadcastThreadReplies bool `info:"Disable broadcasting alert status updates in threads to the main channel." public:"true"`
 	}
 
 	Twilio struct {
 		Enable bool `public:"true" info:"Enables sending and processing of Voice and SMS messages through the Twilio notification provider."`
 
-		AccountSID string
-		AuthToken  string `password:"true" info:"The primary Auth Token for Twilio. Must be primary (not secondary) for request valiation."`
+		VoiceName     string `info:"The Twilio voice to use for Text To Speech for phone calls. See https://www.twilio.com/docs/voice/twiml/say/text-speech#polly-standard-and-neural-voices"`
+		VoiceLanguage string `info:"The Twilio voice language to use for Text To Speech for phone calls. See https://www.twilio.com/docs/voice/twiml/say/text-speech#polly-standard-and-neural-voices"`
+
+		AccountSID         string
+		AuthToken          string `password:"true" info:"The primary Auth Token for Twilio. Must be primary unless Alternate Auth Token is set. This token is used for outgoing requests."`
+		AlternateAuthToken string `password:"true" info:"An alternate Auth Token for validating incoming requests. During a key change, set this to the Primary, and Auth Token to the Secondary, then promote and clear this field."`
+
 		FromNumber string `public:"true" info:"The Twilio number to use for outgoing notifications."`
+
+		MessagingServiceSID string `public:"true" info:"If set, replaces the use of From Number for SMS notifications."`
+
+		RCSSenderID string `info:"The sender ID for RCS messages. Required if RCS is enabled for the MessagingServiceSID."`
 
 		DisableTwoWaySMS      bool     `info:"Disables SMS reply codes for alert messages."`
 		SMSCarrierLookup      bool     `info:"Perform carrier lookup of SMS contact methods (required for SMSFromNumberOverride). Extra charges may apply."`
@@ -105,12 +129,18 @@ type Config struct {
 
 		From string `public:"true" info:"The email address messages should be sent from."`
 
-		Address    string `info:"The server address to use for sending email. Port is optional."`
+		Address    string `info:"The server address to use for sending email. Port is optional and defaults to 465, or 25 if Disable TLS is set. Common ports are: 25 or 587 for STARTTLS (or unencrypted) and 465 for TLS."`
 		DisableTLS bool   `info:"Disables TLS on the connection (STARTTLS will still be used if supported)."`
 		SkipVerify bool   `info:"Disables certificate validation for TLS/STARTTLS (insecure)."`
 
 		Username string `info:"Username for authentication."`
 		Password string `password:"true" info:"Password for authentication."`
+	}
+
+	Webhook struct {
+		Enable                bool     `public:"true" info:"Enables webhook as a contact method."`
+		AllowedURLs           []string `public:"true" info:"If set, allows webhooks for these domains only. If empty, any URL is allowed, including internal/private network addresses."`
+		BlockPrivateAddresses bool     `info:"If enabled, webhook requests to private, loopback, and link-local addresses (e.g., 10.0.0.0/8, 127.0.0.1, 169.254.169.254) are rejected. The check is applied at connection time, so it also covers DNS names and redirects that resolve to such addresses. If requests are routed through an HTTP proxy, destination policy must be enforced at the proxy."`
 	}
 
 	Feedback struct {
@@ -119,24 +149,71 @@ type Config struct {
 	}
 }
 
+// EmailIngressEnabled returns true if a provider is configured for generating alerts from email, otherwise false
+func (cfg Config) EmailIngressEnabled() bool {
+	if (cfg.Mailgun.Enable && cfg.Mailgun.EmailDomain != "") || cfg.intEmailDomain != "" {
+		return true
+	}
+	return false
+}
+
+// EmailIngressDomain returns the domain configured to receive email for alert generation
+func (cfg Config) EmailIngressDomain() string {
+	if cfg.intEmailDomain != "" {
+		// cli flag always takes precedence
+		return cfg.intEmailDomain
+	}
+	if cfg.Mailgun.EmailDomain != "" {
+		return cfg.Mailgun.EmailDomain
+	}
+	return ""
+}
+
 // TwilioSMSFromNumber will determine the appropriate FROM number to use for SMS messages to the given number
 func (cfg Config) TwilioSMSFromNumber(carrier string) string {
-	if carrier == "" {
-		return cfg.Twilio.FromNumber
+	if carrier != "" {
+		for _, s := range cfg.Twilio.SMSFromNumberOverride {
+			parts := strings.SplitN(s, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			if parts[0] != carrier {
+				continue
+			}
+			return parts[1]
+		}
 	}
 
-	for _, s := range cfg.Twilio.SMSFromNumberOverride {
-		parts := strings.SplitN(s, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		if parts[0] != carrier {
-			continue
-		}
-		return parts[1]
+	if cfg.Twilio.MessagingServiceSID != "" {
+		return cfg.Twilio.MessagingServiceSID
 	}
 
 	return cfg.Twilio.FromNumber
+}
+
+// RequestURL returns the full URL for the given request based on the current public url.
+func RequestURL(req *http.Request) string {
+	cfg := FromContext(req.Context())
+	if !cfg.ShouldUsePublicURL() {
+		// fallback to old method
+		u, err := url.ParseRequestURI(req.RequestURI)
+		if err != nil {
+			panic(errors.Wrap(err, "parse RequestURI"))
+		}
+		u.Host = req.Host
+		u.Scheme = req.URL.Scheme
+		return u.String()
+	}
+
+	base, err := url.Parse(cfg.PublicURL())
+	if err != nil {
+		panic(errors.Wrap(err, "parse PublicURL"))
+	}
+
+	base.Path = strings.TrimSuffix(base.Path, "/") + req.URL.Path
+	base.RawQuery = req.URL.RawQuery
+
+	return base.String()
 }
 
 func (cfg Config) rawCallbackURL(path string, mergeParams ...url.Values) *url.URL {
@@ -191,8 +268,94 @@ func (cfg Config) CallbackURL(path string, mergeParams ...url.Values) string {
 	return base.String()
 }
 
+// MatchURL will compare two url strings and will return true if they match.
+func MatchURL(baseURL, testURL string) (bool, error) {
+	compareQueryValues := func(baseVal, testVal url.Values) bool {
+		for name := range baseVal {
+			if baseVal.Get(name) == testVal.Get(name) {
+				continue
+			}
+			return false
+		}
+		return true
+	}
+
+	addImplicitPort := func(u *url.URL) {
+		if strings.Contains(u.Host, ":") {
+			return
+		}
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			u.Host += ":80"
+		case "https":
+			u.Host += ":443"
+		}
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return false, err
+	}
+
+	test, err := url.Parse(testURL)
+	if err != nil {
+		return false, err
+	}
+
+	addImplicitPort(base)
+	addImplicitPort(test)
+
+	// host/port check
+	if !strings.EqualFold(base.Host, test.Host) {
+		return false, nil
+	}
+
+	// scheme check
+	if !strings.EqualFold(base.Scheme, test.Scheme) {
+		return false, nil
+	}
+
+	// path check
+	if len(base.Path) > 1 && !strings.HasPrefix(test.Path, base.Path) {
+		return false, nil
+	}
+
+	// query check
+	if !compareQueryValues(base.Query(), test.Query()) {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// ValidWebhookURL returns true if the URL is an allowed webhook source.
+func (cfg Config) ValidWebhookURL(testURL string) bool {
+	if len(cfg.Webhook.AllowedURLs) == 0 {
+		return true
+	}
+	for _, baseU := range cfg.Webhook.AllowedURLs {
+		matched, err := MatchURL(baseU, testURL)
+		if err != nil {
+			return false
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+// ShouldUsePublicURL returns true if redirects, validation, etc.. should use the
+// configured PublicURL instead of host/referer.
+func (cfg Config) ShouldUsePublicURL() bool { return cfg.explicitURL != "" }
+
 // ValidReferer returns true if the URL is an allowed referer source.
 func (cfg Config) ValidReferer(reqURL, ref string) bool {
+	// --public-url flag takes precedence
+	if cfg.explicitURL != "" {
+		valid, _ := MatchURL(cfg.explicitURL, ref)
+		return valid
+	}
+
 	pubURL := cfg.PublicURL()
 	if pubURL != "" && strings.HasPrefix(ref, pubURL) {
 		return true
@@ -206,11 +369,19 @@ func (cfg Config) ValidReferer(reqURL, ref string) bool {
 		// just ensure ref is same host/scheme as req
 		u.Path = ""
 		u.RawQuery = ""
-		return strings.HasPrefix(ref, u.String())
+		matched, err := MatchURL(u.String(), ref)
+		if err != nil {
+			return false
+		}
+		return matched
 	}
 
 	for _, u := range cfg.Auth.RefererURLs {
-		if strings.HasPrefix(ref, u) {
+		matched, err := MatchURL(u, ref)
+		if err != nil {
+			return false
+		}
+		if matched {
 			return true
 		}
 	}
@@ -218,13 +389,24 @@ func (cfg Config) ValidReferer(reqURL, ref string) bool {
 	return false
 }
 
+// ApplicationName will return the General.ApplicationName
+func (cfg Config) ApplicationName() string {
+	if cfg.General.ApplicationName == "" {
+		return "GoAlert"
+	}
+	return cfg.General.ApplicationName
+}
+
 // PublicURL will return the General.PublicURL or a fallback address (i.e. the app listening port).
 func (cfg Config) PublicURL() string {
-	if cfg.General.PublicURL == "" {
-		return strings.TrimSuffix(cfg.fallbackURL, "/")
+	switch {
+	case cfg.explicitURL != "":
+		return strings.TrimSuffix(cfg.explicitURL, "/")
+	case cfg.General.PublicURL != "":
+		return strings.TrimSuffix(cfg.General.PublicURL, "/")
 	}
 
-	return strings.TrimSuffix(cfg.General.PublicURL, "/")
+	return strings.TrimSuffix(cfg.fallbackURL, "/")
 }
 
 func validateEnable(prefix string, isEnabled bool, vals ...string) error {
@@ -257,6 +439,10 @@ func (cfg Config) Validate() error {
 		)
 	}
 
+	if cfg.General.ApplicationName != "" {
+		err = validate.Many(err, validate.ASCII("General.ApplicationName", cfg.General.ApplicationName, 0, 32))
+	}
+
 	validateKey := func(fname, val string) error { return validate.ASCII(fname, val, 0, 128) }
 	validatePath := func(fname, val string) error {
 		if val == "" {
@@ -270,6 +456,12 @@ func (cfg Config) Validate() error {
 		}
 		return validate.OAuthScope(fname, val, "openid")
 	}
+	validateLabels := func(fname string, vals []string) (err error) {
+		for i, v := range vals {
+			err = validate.Many(err, validate.LabelKey(fmt.Sprintf("%s[%d]", fname, i), v))
+		}
+		return err
+	}
 
 	err = validate.Many(
 		err,
@@ -279,16 +471,31 @@ func (cfg Config) Validate() error {
 		validateKey("Slack.ClientSecret", cfg.Slack.ClientSecret),
 		validateKey("Twilio.AccountSID", cfg.Twilio.AccountSID),
 		validateKey("Twilio.AuthToken", cfg.Twilio.AuthToken),
+		validateLabels("Services.RequiredLabels", cfg.Services.RequiredLabels),
+		validateKey("Twilio.AlternateAuthToken", cfg.Twilio.AlternateAuthToken),
+		validate.ASCII("Twilio.VoiceName", cfg.Twilio.VoiceName, 0, 50),
+		validate.ASCII("Twilio.VoiceLanguage", cfg.Twilio.VoiceLanguage, 0, 10),
 		validateKey("GitHub.ClientID", cfg.GitHub.ClientID),
 		validateKey("GitHub.ClientSecret", cfg.GitHub.ClientSecret),
 		validateKey("Slack.AccessToken", cfg.Slack.AccessToken),
 		validate.Range("Maintenance.AlertCleanupDays", cfg.Maintenance.AlertCleanupDays, 0, 9000),
+		validate.Range("Maintenance.AlertAutoCloseDays", cfg.Maintenance.AlertAutoCloseDays, 0, 9000),
 		validate.Range("Maintenance.APIKeyExpireDays", cfg.Maintenance.APIKeyExpireDays, 0, 9000),
+		validate.Range("Maintenance.ScheduleCleanupDays", cfg.Maintenance.ScheduleCleanupDays, 0, 9000),
 		validateScopes("OIDC.Scopes", cfg.OIDC.Scopes),
 		validatePath("OIDC.UserInfoEmailPath", cfg.OIDC.UserInfoEmailPath),
 		validatePath("OIDC.UserInfoEmailVerifiedPath", cfg.OIDC.UserInfoEmailVerifiedPath),
 		validatePath("OIDC.UserInfoNamePath", cfg.OIDC.UserInfoNamePath),
+		validateKey("Slack.SigningSecret", cfg.Slack.SigningSecret),
 	)
+
+	if cfg.General.GoogleAnalyticsID != "" {
+		err = validate.Many(err, validate.MeasurementID("General.GoogleAnalyticsID", cfg.General.GoogleAnalyticsID))
+	}
+
+	if cfg.Twilio.VoiceName != "" && cfg.Twilio.VoiceLanguage == "" {
+		err = validate.Many(err, validation.NewFieldError("Twilio.VoiceLanguage", "required when Twilio.VoiceName is set"))
+	}
 
 	if cfg.OIDC.IssuerURL != "" {
 		err = validate.Many(err, validate.AbsoluteURL("OIDC.IssuerURL", cfg.OIDC.IssuerURL))
@@ -302,11 +509,24 @@ func (cfg Config) Validate() error {
 	if cfg.Twilio.FromNumber != "" {
 		err = validate.Many(err, validate.Phone("Twilio.FromNumber", cfg.Twilio.FromNumber))
 	}
+	if cfg.Twilio.MessagingServiceSID != "" {
+		err = validate.Many(err, validate.TwilioSID("Twilio.MessagingServiceSID", "MG", cfg.Twilio.MessagingServiceSID))
+	}
+	if cfg.Twilio.RCSSenderID != "" {
+		err = validate.Many(err, validate.ASCII("Twilio.RCSSenderSID", cfg.Twilio.RCSSenderID, 1, 255))
+		if cfg.Twilio.MessagingServiceSID == "" {
+			err = validate.Many(err, validation.NewFieldError("Twilio.MessagingServiceSID", "required when Twilio.RCSSenderID is set"))
+		}
+	}
+
 	if cfg.Mailgun.EmailDomain != "" {
 		err = validate.Many(err, validate.Email("Mailgun.EmailDomain", "example@"+cfg.Mailgun.EmailDomain))
 	}
 	if cfg.SMTP.From != "" {
 		err = validate.Many(err, validate.Email("SMTP.From", cfg.SMTP.From))
+	}
+	if cfg.Slack.InteractiveMessages && cfg.Slack.SigningSecret == "" {
+		err = validate.Many(err, validation.NewFieldError("Slack.SigningSecret", "required to enable Slack interactive messages"))
 	}
 
 	err = validate.Many(
@@ -364,6 +584,11 @@ func (cfg Config) Validate() error {
 			err,
 			validate.AbsoluteURL(field, urlStr),
 		)
+	}
+
+	for i, urlStr := range cfg.Webhook.AllowedURLs {
+		field := fmt.Sprintf("Webhook.AllowedURLs[%d]", i)
+		err = validate.Many(err, validate.AbsoluteURL(field, urlStr))
 	}
 
 	m := make(map[string]bool)

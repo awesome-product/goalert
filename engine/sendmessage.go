@@ -2,39 +2,32 @@ package engine
 
 import (
 	"context"
-	"database/sql"
+	"encoding/json"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
-	alertlog "github.com/target/goalert/alert/log"
+	"github.com/target/goalert/alert/alertlog"
 	"github.com/target/goalert/engine/message"
+	"github.com/target/goalert/gadb"
 	"github.com/target/goalert/notification"
 	"github.com/target/goalert/permission"
 	"github.com/target/goalert/util/log"
-	"go.opencensus.io/trace"
 )
 
 func (p *Engine) sendMessage(ctx context.Context, msg *message.Message) (*notification.SendResult, error) {
-	ctx, sp := trace.StartSpan(ctx, "Engine.SendMessage")
-	defer sp.End()
-	sp.AddAttributes(
-		trace.StringAttribute("message.id", msg.ID),
-		trace.StringAttribute("message.type", msg.Type.String()),
-		trace.StringAttribute("dest.type", msg.Dest.Type.String()),
-		trace.StringAttribute("dest.id", msg.Dest.ID),
-	)
 	ctx = log.WithField(ctx, "CallbackID", msg.ID)
 
-	if msg.Dest.Type.IsUserCM() {
+	if msg.DestID.IsUserCM() {
 		ctx = permission.UserSourceContext(ctx, msg.UserID, permission.RoleUser, &permission.SourceInfo{
 			Type: permission.SourceTypeContactMethod,
-			ID:   msg.Dest.ID,
+			ID:   msg.DestID.String(),
 		})
 	} else {
 		ctx = permission.SystemContext(ctx, "SendMessage")
 		ctx = permission.SourceContext(ctx, &permission.SourceInfo{
 			Type: permission.SourceTypeNotificationChannel,
-			ID:   msg.Dest.ID,
+			ID:   msg.DestID.String(),
 		})
 	}
 
@@ -42,7 +35,7 @@ func (p *Engine) sendMessage(ctx context.Context, msg *message.Message) (*notifi
 	var isFirstAlertMessage bool
 	switch msg.Type {
 	case notification.MessageTypeAlertBundle:
-		name, count, err := p.am.ServiceInfo(ctx, msg.ServiceID)
+		name, count, err := p.a.ServiceInfo(ctx, msg.ServiceID)
 		if err != nil {
 			return nil, errors.Wrap(err, "lookup service info")
 		}
@@ -57,18 +50,21 @@ func (p *Engine) sendMessage(ctx context.Context, msg *message.Message) (*notifi
 			}, nil
 		}
 		notifMsg = notification.AlertBundle{
-			Dest:        msg.Dest,
-			CallbackID:  msg.ID,
+			Base:        msg.Base(),
 			ServiceID:   msg.ServiceID,
 			ServiceName: name,
 			Count:       count,
 		}
 	case notification.MessageTypeAlert:
-		a, err := p.am.FindOne(ctx, msg.AlertID)
+		name, _, err := p.a.ServiceInfo(ctx, msg.ServiceID)
+		if err != nil {
+			return nil, errors.Wrap(err, "lookup service info")
+		}
+		a, err := p.a.FindOne(ctx, msg.AlertID)
 		if err != nil {
 			return nil, errors.Wrap(err, "lookup alert")
 		}
-		stat, err := p.cfg.NotificationStore.OriginalMessageStatus(ctx, msg.AlertID, msg.Dest)
+		stat, err := p.cfg.NotificationStore.OriginalMessageStatus(ctx, msg.AlertID, msg.DestID)
 		if err != nil {
 			return nil, fmt.Errorf("lookup original message: %w", err)
 		}
@@ -76,12 +72,18 @@ func (p *Engine) sendMessage(ctx context.Context, msg *message.Message) (*notifi
 			// set to nil if it's the current message
 			stat = nil
 		}
+		meta, err := p.a.Metadata(ctx, p.b.db, msg.AlertID)
+		if err != nil {
+			return nil, errors.Wrap(err, "lookup alert metadata")
+		}
 		notifMsg = notification.Alert{
-			Dest:       msg.Dest,
-			AlertID:    msg.AlertID,
-			Summary:    a.Summary,
-			Details:    a.Details,
-			CallbackID: msg.ID,
+			Base:        msg.Base(),
+			AlertID:     msg.AlertID,
+			Summary:     a.Summary,
+			Details:     a.Details,
+			ServiceID:   a.ServiceID,
+			ServiceName: name,
+			Meta:        meta,
 
 			OriginalStatus: stat,
 		}
@@ -91,16 +93,51 @@ func (p *Engine) sendMessage(ctx context.Context, msg *message.Message) (*notifi
 		if err != nil {
 			return nil, errors.Wrap(err, "lookup alert log entry")
 		}
+		a, err := p.cfg.AlertStore.FindOne(ctx, msg.AlertID)
+		if err != nil {
+			return nil, fmt.Errorf("lookup original alert: %w", err)
+		}
+		stat, err := p.cfg.NotificationStore.OriginalMessageStatus(ctx, msg.AlertID, msg.DestID)
+		if err != nil {
+			return nil, fmt.Errorf("lookup original message: %w", err)
+		}
+		if stat == nil {
+			return nil, fmt.Errorf("could not find original notification for alert %d to %s", msg.AlertID, msg.Dest.String())
+		}
+		name, _, err := p.a.ServiceInfo(ctx, a.ServiceID)
+		if err != nil {
+			return nil, errors.Wrap(err, "lookup service info")
+		}
+		meta, err := p.a.Metadata(ctx, p.b.db, msg.AlertID)
+		if err != nil {
+			return nil, errors.Wrap(err, "lookup alert metadata")
+		}
+
+		var status notification.AlertState
+		switch e.Type() {
+		case alertlog.TypeAcknowledged:
+			status = notification.AlertStateAcknowledged
+		case alertlog.TypeEscalated:
+			status = notification.AlertStateUnacknowledged
+		case alertlog.TypeClosed:
+			status = notification.AlertStateClosed
+		}
+
 		notifMsg = notification.AlertStatus{
-			Dest:       msg.Dest,
-			AlertID:    e.AlertID(),
-			CallbackID: msg.ID,
-			LogEntry:   e.String(),
+			Base:           msg.Base(),
+			AlertID:        e.AlertID(),
+			ServiceID:      a.ServiceID,
+			LogEntry:       e.String(ctx),
+			Summary:        a.Summary,
+			Details:        a.Details,
+			NewAlertState:  status,
+			OriginalStatus: *stat,
+			ServiceName:    name,
+			Meta:           meta,
 		}
 	case notification.MessageTypeTest:
 		notifMsg = notification.Test{
-			Dest:       msg.Dest,
-			CallbackID: msg.ID,
+			Base: msg.Base(),
 		}
 	case notification.MessageTypeVerification:
 		code, err := p.cfg.NotificationStore.Code(ctx, msg.VerifyID)
@@ -108,9 +145,8 @@ func (p *Engine) sendMessage(ctx context.Context, msg *message.Message) (*notifi
 			return nil, errors.Wrap(err, "lookup verification code")
 		}
 		notifMsg = notification.Verification{
-			Dest:       msg.Dest,
-			CallbackID: msg.ID,
-			Code:       code,
+			Base: msg.Base(),
+			Code: fmt.Sprintf("%06d", code),
 		}
 	case notification.MessageTypeScheduleOnCallUsers:
 		users, err := p.cfg.OnCallStore.OnCallUsersBySchedule(ctx, msg.ScheduleID)
@@ -132,15 +168,34 @@ func (p *Engine) sendMessage(ctx context.Context, msg *message.Message) (*notifi
 		}
 
 		notifMsg = notification.ScheduleOnCallUsers{
-			Dest:         msg.Dest,
-			CallbackID:   msg.ID,
+			Base:         msg.Base(),
 			ScheduleName: sched.Name,
 			ScheduleURL:  p.cfg.ConfigSource.Config().CallbackURL("/schedules/" + msg.ScheduleID),
 			ScheduleID:   msg.ScheduleID,
 			Users:        onCallUsers,
 		}
+	case notification.MessageTypeSignalMessage:
+		id, err := uuid.Parse(msg.ID)
+		if err != nil {
+			return nil, errors.Wrap(err, "parse signal message id")
+		}
+		rawParams, err := gadb.New(p.b.db).EngineGetSignalParams(ctx, uuid.NullUUID{Valid: true, UUID: id})
+		if err != nil {
+			return nil, errors.Wrap(err, "get signal message params")
+		}
+
+		var params map[string]string
+		err = json.Unmarshal(rawParams, &params)
+		if err != nil {
+			return nil, errors.Wrap(err, "parse signal message params")
+		}
+
+		notifMsg = notification.SignalMessage{
+			Base:   msg.Base(),
+			Params: params,
+		}
 	default:
-		log.Log(ctx, errors.New("SEND NOT IMPLEMENTED FOR MESSAGE TYPE"))
+		log.Log(ctx, errors.New("SEND NOT IMPLEMENTED FOR MESSAGE TYPE "+string(msg.Type)))
 		return &notification.SendResult{ID: msg.ID, Status: notification.Status{State: notification.StateFailedPerm}}, nil
 	}
 
@@ -164,15 +219,7 @@ func (p *Engine) sendMessage(ctx context.Context, msg *message.Message) (*notifi
 	}
 
 	if isFirstAlertMessage && res.State.IsOK() {
-		var chanID, cmID sql.NullString
-		if msg.Dest.Type.IsUserCM() {
-			cmID.Valid = true
-			cmID.String = msg.Dest.ID
-		} else {
-			chanID.Valid = true
-			chanID.String = msg.Dest.ID
-		}
-		_, err = p.b.trackStatus.ExecContext(ctx, chanID, cmID, msg.AlertID)
+		_, err = p.b.trackStatus.ExecContext(ctx, msg.DestID.NCID, msg.DestID.CMID, msg.AlertID)
 		if err != nil {
 			// non-fatal, but log because it means status updates will not work for that alert/dest.
 			log.Log(ctx, fmt.Errorf("track status updates for alert #%d for %s: %w", msg.AlertID, msg.Dest.String(), err))

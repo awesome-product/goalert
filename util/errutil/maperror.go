@@ -21,6 +21,8 @@ func MapDBError(err error) error {
 	switch dbErr.Code {
 	case "23503": // fkey constraint
 		switch dbErr.ConstraintName {
+		case "schedule_rules_tgt_rotation_id_fkey":
+			return validation.NewFieldError("RotationID", "rotation does not exist")
 		case "user_calendar_subscriptions_user_id_fkey":
 			return validation.NewFieldError("UserID", "user does not exist")
 		case "user_calendar_subscriptions_schedule_id_fkey", "schedule_data_schedule_id_fkey":
@@ -35,8 +37,15 @@ func MapDBError(err error) error {
 			return validation.NewFieldError("ServiceID", "service does not exist")
 		case "schedule_rules_tgt_user_id_fkey":
 			return validation.NewFieldError("TargetID", "user does not exist")
+		case "rotation_participants_user_id_fkey":
+			return validation.NewFieldError("UserID", "user does not exist")
+		case "auth_basic_users_user_id_fkey":
+			return validation.NewFieldError("UserID", "user does not exist")
 		}
 	case "23505": // unique constraint
+		if dbErr.ConstraintName == "idx_int_key_name_svc_ext" {
+			return validation.NewFieldError("Name", "already in use")
+		}
 		if dbErr.ConstraintName == "auth_basic_users_username_key" {
 			return validation.NewFieldError("Username", "already in use")
 		}
@@ -54,6 +63,21 @@ func MapDBError(err error) error {
 		}
 		if dbErr.ConstraintName == "idx_no_alert_duplicates" {
 			return validation.NewFieldError("", "duplicate alert already exists")
+		}
+		if dbErr.ConstraintName == "auth_basic_users_pkey" {
+			return validation.NewFieldError("UserID", "already has a basic auth username configured")
+		}
+		if dbErr.ConstraintName == "epa_no_duplicate_schedules" {
+			return validation.NewGenericError("same schedule cannot be assigned twice to the same step")
+		}
+		if dbErr.ConstraintName == "epa_no_duplicate_rotations" {
+			return validation.NewGenericError("same rotation cannot be assigned twice to the same step")
+		}
+		if dbErr.ConstraintName == "epa_no_duplicate_users" {
+			return validation.NewGenericError("same user cannot be assigned twice to the same step")
+		}
+		if dbErr.ConstraintName == "epa_no_duplicate_channels" {
+			return validation.NewGenericError("same destination cannot be assigned twice to the same step")
 		}
 	case "23514": // check constraint
 		newErr := mapLimitError(dbErr)

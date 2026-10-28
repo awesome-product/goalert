@@ -18,9 +18,10 @@ import (
 
 	"github.com/target/goalert/util"
 	"github.com/target/goalert/util/log"
+	"github.com/target/goalert/util/sqlutil"
 	"github.com/target/goalert/validation/validate"
 
-	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/pkg/errors"
 )
 
@@ -43,7 +44,7 @@ type Keyring interface {
 	Verify(p []byte, signature []byte) (valid, oldKey bool)
 
 	SignJWT(jwt.Claims) (string, error)
-	VerifyJWT(string, jwt.Claims) (bool, error)
+	VerifyJWT(token string, c jwt.Claims, iss, aud string) (bool, error)
 
 	Shutdown(context.Context) error
 }
@@ -79,6 +80,8 @@ type Config struct {
 
 // DB implements a Keyring using postgres as the datastore.
 type DB struct {
+	logger *log.Logger
+
 	db *sql.DB
 
 	cfg Config
@@ -95,8 +98,6 @@ type DB struct {
 	setKeys    *sql.Stmt
 	txTime     *sql.Stmt
 	insertKeys *sql.Stmt
-
-	parser *jwt.Parser
 }
 
 func marshalVerificationKeys(keys map[byte]ecdsa.PublicKey) ([]byte, error) {
@@ -110,6 +111,7 @@ func marshalVerificationKeys(keys map[byte]ecdsa.PublicKey) ([]byte, error) {
 	}
 	return json.Marshal(m)
 }
+
 func parseVerificationKeys(data []byte) (map[byte]ecdsa.PublicKey, error) {
 	var m map[byte][]byte
 	err := json.Unmarshal(data, &m)
@@ -133,7 +135,7 @@ func parseVerificationKeys(data []byte) (map[byte]ecdsa.PublicKey, error) {
 }
 
 // NewDB creates a new postgres-backed keyring.
-func NewDB(ctx context.Context, db *sql.DB, cfg *Config) (*DB, error) {
+func NewDB(ctx context.Context, logger *log.Logger, db *sql.DB, cfg *Config) (*DB, error) {
 	if cfg == nil {
 		cfg = &Config{Name: "default"}
 	}
@@ -148,6 +150,7 @@ func NewDB(ctx context.Context, db *sql.DB, cfg *Config) (*DB, error) {
 
 		validate.Range("RotationDays", cfg.RotationDays, 0, 9000),
 	)
+
 	if err != nil {
 		return nil, err
 	}
@@ -156,10 +159,10 @@ func NewDB(ctx context.Context, db *sql.DB, cfg *Config) (*DB, error) {
 		db:  db,
 		cfg: *cfg,
 
+		logger: logger,
+
 		forceRotate: make(chan chan error),
 		shutdown:    make(chan context.Context),
-
-		parser: &jwt.Parser{ValidMethods: []string{"ES224"}},
 
 		txTime: p.P(`select now()`),
 		insertKeys: p.P(`
@@ -224,6 +227,7 @@ func (db *DB) Shutdown(ctx context.Context) error {
 	<-db.shutdown
 	return nil
 }
+
 func (db *DB) loop() {
 	t := time.NewTicker(12 * time.Hour)
 	var shutdownCtx context.Context
@@ -232,7 +236,7 @@ mainLoop:
 	for {
 		select {
 		case <-t.C:
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			ctx, cancel := context.WithTimeout(db.logger.BackgroundContext(), time.Minute)
 			err := db.refreshAndRotateKeys(ctx, false)
 			cancel()
 			if err != nil {
@@ -241,7 +245,7 @@ mainLoop:
 		case shutdownCtx = <-db.shutdown:
 			break mainLoop
 		case ch := <-db.forceRotate:
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			ctx, cancel := context.WithTimeout(db.logger.BackgroundContext(), time.Minute)
 			ch <- db.refreshAndRotateKeys(ctx, true)
 			cancel()
 		}
@@ -271,6 +275,7 @@ func (db *DB) newKey() (*ecdsa.PrivateKey, []byte, error) {
 	}
 	return key, data, nil
 }
+
 func (db *DB) loadKey(encData []byte) (*ecdsa.PrivateKey, error) {
 	data, _, err := db.cfg.Keys.Decrypt(encData)
 	if err != nil {
@@ -337,7 +342,7 @@ func (db *DB) commitNewKeyring(ctx context.Context, tx *sql.Tx) error {
 	if rowCount == 0 {
 		// failed to insert the new data, so scan old & refresh
 		var vKeysData, signKeyData, nextKeyData []byte
-		var rotateT time.Time
+		var rotateT sql.NullTime
 		err = db.fetchKeys.QueryRowContext(ctx, db.cfg.Name).Scan(&vKeysData, &signKeyData, &nextKeyData, &t, &rotateT, &rotationCount)
 		if err != nil {
 			return err
@@ -393,7 +398,7 @@ func (db *DB) refreshAndRotateKeys(ctx context.Context, forceRotation bool) erro
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer sqlutil.Rollback(ctx, "keyring: rotate keys", tx)
 
 	row := tx.Stmt(db.fetchKeys).QueryRowContext(ctx, db.cfg.Name)
 
@@ -401,7 +406,7 @@ func (db *DB) refreshAndRotateKeys(ctx context.Context, forceRotation bool) erro
 
 	var vKeysData, signKeyData, nextKeyData []byte
 	var t time.Time
-	var rotateT *time.Time
+	var rotateT sql.NullTime
 	var count int
 	err = row.Scan(&vKeysData, &signKeyData, &nextKeyData, &t, &rotateT, &count)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -416,7 +421,7 @@ func (db *DB) refreshAndRotateKeys(ctx context.Context, forceRotation bool) erro
 		return errors.Wrap(err, "unmarshal verification keys")
 	}
 
-	if forceRotation || (rotateT != nil && !t.Before(*rotateT)) {
+	if forceRotation || (rotateT.Valid && !t.Before(rotateT.Time)) {
 		// perform a key rotation
 		signKeyData = nextKeyData
 		var nextKey *ecdsa.PrivateKey
@@ -515,12 +520,12 @@ func (db *DB) Sign(p []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func (db *DB) VerifyJWT(s string, c jwt.Claims) (bool, error) {
+func (db *DB) VerifyJWT(s string, c jwt.Claims, iss, aud string) (bool, error) {
 	db.mx.RLock()
 	defer db.mx.RUnlock()
 
 	var currentKey bool
-	_, err := db.parser.ParseWithClaims(s, c, func(tok *jwt.Token) (interface{}, error) {
+	_, err := jwt.ParseWithClaims(s, c, func(tok *jwt.Token) (interface{}, error) {
 		keyIndex, ok := tok.Header["key"].(float64)
 		if !ok {
 			return nil, errors.New("invalid key index")
@@ -532,7 +537,11 @@ func (db *DB) VerifyJWT(s string, c jwt.Claims) (bool, error) {
 
 		currentKey = byte(keyIndex) == byte(db.rotationCount) || byte(keyIndex) == byte(db.rotationCount+1)
 		return &key, nil
-	})
+	},
+		jwt.WithValidMethods([]string{"ES224"}),
+		jwt.WithIssuer(iss),
+		jwt.WithAudience(aud),
+	)
 	if err != nil {
 		return false, err
 	}

@@ -29,7 +29,8 @@ type SMS struct {
 	doneCh   chan struct{}
 }
 
-func (s *Server) sendSMS(from, to, body, statusURL, destURL string) (*SMS, error) {
+func (s *Server) sendSMS(fromValue, to, body, statusURL, destURL string) (*SMS, error) {
+	fromNumber := s.getFromNumber(fromValue)
 	if statusURL != "" {
 		err := validate.URL("StatusCallback", statusURL)
 		if err != nil {
@@ -39,7 +40,7 @@ func (s *Server) sendSMS(from, to, body, statusURL, destURL string) (*SMS, error
 			}
 		}
 		s.mx.RLock()
-		_, hasCallback := s.callbacks["SMS:"+from]
+		_, hasCallback := s.callbacks["SMS:"+fromNumber]
 		s.mx.RUnlock()
 
 		if !hasCallback {
@@ -59,11 +60,22 @@ func (s *Server) sendSMS(from, to, body, statusURL, destURL string) (*SMS, error
 		}
 	}
 
+	// Use the RCS ID for the rest of the processing
+	s.mx.RLock()
+	rcsID := s.rcs[fromValue]
+	if rcsID != "" {
+		fromNumber = "rcs:" + rcsID
+	}
+	s.mx.RUnlock()
+
+	if strings.HasPrefix(fromNumber, "rcs:") {
+		to = "rcs:" + to
+	}
 	sms := &SMS{
 		s: s,
 		msg: twilio.Message{
 			To:     to,
-			From:   from,
+			From:   fromNumber,
 			Status: twilio.MessageStatusAccepted,
 			SID:    s.id("SM"),
 		},
@@ -73,6 +85,12 @@ func (s *Server) sendSMS(from, to, body, statusURL, destURL string) (*SMS, error
 		body:      body,
 		acceptCh:  make(chan bool, 1),
 		doneCh:    make(chan struct{}),
+	}
+
+	if strings.HasPrefix(fromValue, "MG") {
+		sms.msg.MessagingServiceSID = fromValue
+	} else {
+		sms.msg.From = fromValue
 	}
 
 	s.mx.Lock()
@@ -130,6 +148,15 @@ func (s *Server) serveMessageStatus(w http.ResponseWriter, req *http.Request) {
 func (sms *SMS) updateStatus(stat twilio.MessageStatus) {
 	sms.mx.Lock()
 	sms.msg.Status = stat
+	switch stat {
+	case twilio.MessageStatusAccepted, twilio.MessageStatusQueued:
+	default:
+		if sms.msg.MessagingServiceSID == "" {
+			break
+		}
+
+		sms.msg.From = sms.s.getFromNumber(sms.msg.MessagingServiceSID)
+	}
 	sms.mx.Unlock()
 
 	if sms.statusURL == "" {
@@ -142,6 +169,7 @@ func (sms *SMS) updateStatus(stat twilio.MessageStatus) {
 		sms.s.errs <- err
 	}
 }
+
 func (sms *SMS) cloneMessage() *twilio.Message {
 	sms.mx.Lock()
 	defer sms.mx.Unlock()
@@ -170,7 +198,7 @@ func (sms *SMS) values(body bool) url.Values {
 	return v
 }
 
-// SMS will return a channel that will be fed incomming SMS messages as they arrive.
+// SMS will return a channel that will be fed incoming SMS messages as they arrive.
 func (s *Server) SMS() chan *SMS {
 	return s.smsCh
 }
@@ -184,7 +212,7 @@ func (s *Server) SendSMS(from, to, body string) error {
 	s.mx.RUnlock()
 
 	if cbURL == "" {
-		return fmt.Errorf(`unknown/unregistered desination (to) number "%s"`, to)
+		return fmt.Errorf(`unknown/unregistered destination (to) number "%s"`, to)
 	}
 
 	sms, err := s.sendSMS(from, to, body, "", cbURL)
@@ -236,7 +264,11 @@ func (sms *SMS) process() {
 		return
 	case accepted := <-sms.acceptCh:
 		if accepted {
-			sms.updateStatus(twilio.MessageStatusDelivered)
+			if strings.HasPrefix(sms.To(), "rcs:") {
+				sms.updateStatus(twilio.MessageStatusRead)
+			} else {
+				sms.updateStatus(twilio.MessageStatusDelivered)
+			}
 		} else {
 			sms.updateStatus(twilio.MessageStatusFailed)
 		}

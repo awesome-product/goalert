@@ -1,11 +1,15 @@
-/* eslint-disable camelcase */
-declare namespace NodeJS {
-  export interface Global {
-    __webpack_public_path__: string
-    pathPrefix: string
-    GOALERT_VERSION: string
-  }
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
+/* eslint-disable no-var */
+
+declare namespace NodeJS {
   declare module '*.md'
   declare module '*.png'
+  declare module '*.svg'
 }
+
+var pathPrefix: string
+var applicationName: string
+var GOALERT_VERSION: string
+var Cypress: any
+var nonce: string

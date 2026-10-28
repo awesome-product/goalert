@@ -2,6 +2,13 @@
 /setup.cfg
 /setup.pid
 /config.json.bak
+/*.session.json
+*.zip
+/test-results
+/test/coverage/
+/storybook-static
+
+/cypress/
 
 *.pem
 *.key
@@ -16,7 +23,8 @@
 *.so
 *.out
 *.pid
-.env
+*.env
+Procfile.local
 .ready
 /run.sh
 /config.json*
@@ -62,3 +70,13 @@ ngrok.log
 
 smoketest_db_dump
 *.pid
+
+/.yarn
+/.pnp.*
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+
+/.gitrev
+__debug*

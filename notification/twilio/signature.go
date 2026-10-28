@@ -27,12 +27,12 @@ func Signature(authToken, url string, fields url.Values) []byte {
 	}
 
 	hash := hmac.New(sha1.New, []byte(authToken))
-	io.Copy(hash, buf)
+	_, _ = io.Copy(hash, buf)
 
 	buf.Reset()
 	enc := base64.NewEncoder(base64.StdEncoding, buf)
-	enc.Write(hash.Sum(nil))
-	enc.Close()
+	_, _ = enc.Write(hash.Sum(nil))
+	_ = enc.Close()
 
 	return buf.Bytes()
 }

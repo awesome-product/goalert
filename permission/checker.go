@@ -3,31 +3,10 @@ package permission
 import (
 	"context"
 	"strings"
-	"sync/atomic"
-
-	"go.opencensus.io/trace"
 )
 
 // A Checker is used to give a pass-or-fail result for a given context.
 type Checker func(context.Context) bool
-
-func checkLimit(ctx context.Context) error {
-	n, ok := ctx.Value(contextKeyCheckCount).(*uint64)
-	if !ok {
-		return newGeneric(false, "invalid auth context for check limit")
-	}
-	max, ok := ctx.Value(contextKeyCheckCountMax).(uint64)
-	if !ok {
-		return newGeneric(false, "invalid auth context for max check limit")
-	}
-
-	v := atomic.AddUint64(n, 1) // always add
-	if max > 0 && v > max {
-		return newGeneric(false, "exceeded auth check limit")
-	}
-
-	return nil
-}
 
 // LimitCheckAny will return a permission error if none of the checks pass, or
 // if the auth check limit is reached. If no checks are provided, only
@@ -39,50 +18,16 @@ func LimitCheckAny(ctx context.Context, checks ...Checker) error {
 		return newGeneric(true, "")
 	}
 
-	// ensure we don't get hammered with auth checks (or DB calls, for example)
-	err := checkLimit(ctx)
-	if err != nil {
-		return err
-	}
-
 	if len(checks) == 0 {
 		return nil
 	}
 	for _, c := range checks {
 		if c != nil && c(ctx) {
-			addAuthAttrs(ctx)
 			return nil
 		}
 	}
 
 	return newGeneric(false, "")
-}
-
-func addAuthAttrs(ctx context.Context) {
-	sp := trace.FromContext(ctx)
-	if sp == nil {
-		return
-	}
-	var attrs []trace.Attribute
-	if User(ctx) {
-		attrs = append(attrs,
-			sourceAttrs(ctx,
-				trace.StringAttribute("auth.user.id", UserID(ctx)),
-				trace.StringAttribute("auth.user.role", string(userRole(ctx))),
-			)...)
-	}
-	if System(ctx) {
-		attrs = append(attrs, trace.StringAttribute("auth.system.componentName", SystemComponentName(ctx)))
-	}
-	if Service(ctx) {
-		attrs = append(attrs, sourceAttrs(ctx,
-			trace.StringAttribute("auth.service.id", ServiceID(ctx)),
-		)...)
-	}
-	if len(attrs) == 0 {
-		return
-	}
-	sp.AddAttributes(attrs...)
 }
 
 // All is a Checker that checks against ALL providers, returning true

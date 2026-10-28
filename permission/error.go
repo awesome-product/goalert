@@ -3,7 +3,7 @@ package permission
 import "github.com/pkg/errors"
 
 // Error represents an auth error where the context does not have
-// a sufficient role for the opertion.
+// a sufficient role for the operation.
 type Error interface {
 	error
 	Permission() bool // Is the error permission denied?
@@ -30,6 +30,11 @@ func newGeneric(unauth bool, reason string) genericError {
 // NewAccessDenied will return a new generic access denied error.
 func NewAccessDenied(reason string) error {
 	return newGeneric(false, reason)
+}
+
+// Unauthorized will return an unauthorized error.
+func Unauthorized() error {
+	return newGeneric(true, "")
 }
 
 func (e genericError) ClientError() bool { return true }

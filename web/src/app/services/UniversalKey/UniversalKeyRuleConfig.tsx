@@ -1,0 +1,220 @@
+import React, { Suspense, useState } from 'react'
+import { Button, Card, Grid, Typography } from '@mui/material'
+import { Add } from '@mui/icons-material'
+import UniversalKeyRuleDialog from './UniversalKeyRuleDialog'
+import UniversalKeyRuleRemoveDialog from './UniversalKeyRuleRemoveDialog'
+import OtherActions from '../../util/OtherActions'
+import { gql, useMutation, useQuery } from 'urql'
+import { IntegrationKey, Service } from '../../../schema'
+import Spinner from '../../loading/components/Spinner'
+import { GenericError } from '../../error-pages'
+import UniversalKeyActionsList from './UniversalKeyActionsList'
+import { UniversalKeyActionDialog } from './UniversalKeyActionDialog'
+import CompList from '../../lists/CompList'
+import ReorderGroup from '../../lists/ReorderGroup'
+import { ReorderableItem } from '../../lists/ReorderableItem'
+import { CompListItemText } from '../../lists/CompListItems'
+
+interface UniversalKeyRuleListProps {
+  serviceID: string
+  keyID: string
+}
+
+const query = gql`
+  query UniversalKeyPage($keyID: ID!) {
+    integrationKey(id: $keyID) {
+      id
+      config {
+        rules {
+          id
+          name
+          description
+          conditionExpr
+          continueAfterMatch
+          actions {
+            dest {
+              type
+              args
+            }
+            params
+          }
+        }
+      }
+    }
+  }
+`
+
+const updateKeyConfig = gql`
+  mutation UpdateKeyConfig($input: UpdateKeyConfigInput!) {
+    updateKeyConfig(input: $input)
+  }
+`
+
+/* truncateCond truncates the condition expression to 50 characters and a single line. */
+function truncateCond(cond: string): string {
+  const singleLineCond = cond.replace(/\s+/g, ' ')
+  if (singleLineCond.length > 50) {
+    return singleLineCond.slice(0, 50) + '...'
+  }
+  return singleLineCond
+}
+
+export default function UniversalKeyRuleList(
+  props: UniversalKeyRuleListProps,
+): JSX.Element {
+  const [create, setCreate] = useState(false)
+  const [edit, setEdit] = useState('')
+  const [remove, setRemove] = useState('')
+  const [editAction, setEditAction] = useState<null | {
+    ruleID: string
+    actionIndex: number
+  }>(null)
+  const [addAction, setAddAction] = useState<null | { ruleID: string }>(null)
+
+  const [{ data, fetching, error }] = useQuery<{
+    integrationKey: IntegrationKey
+    service: Service
+  }>({
+    query,
+    variables: {
+      keyID: props.keyID,
+      serviceID: props.serviceID,
+    },
+  })
+  const [, commit] = useMutation(updateKeyConfig)
+
+  if (fetching && !data) return <Spinner />
+  if (error) return <GenericError error={error.message} />
+
+  const items = (data?.integrationKey.config.rules ?? []).map((rule) => (
+    <ReorderableItem id={rule.id} key={rule.id}>
+      <CompListItemText
+        title={
+          <Typography component='h4' variant='subtitle1' sx={{ pb: 1 }}>
+            <b>{rule.name}:</b>
+            &nbsp;
+            {rule.description}
+          </Typography>
+        }
+        subText={
+          <Grid container>
+            <Grid item xs={12}>
+              <b>If</b>
+              <code style={{ paddingLeft: '1em' }}>
+                {truncateCond(rule.conditionExpr)}
+              </code>
+            </Grid>
+            <Grid item xs={12}>
+              <b>Then</b>
+            </Grid>
+            <Grid item xs={12} sx={{ paddingLeft: '1em' }}>
+              <UniversalKeyActionsList
+                actions={rule.actions}
+                onEdit={(index) =>
+                  setEditAction({ ruleID: rule.id, actionIndex: index })
+                }
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <b>Finally</b> {rule.continueAfterMatch ? 'continue' : 'stop'}
+            </Grid>
+          </Grid>
+        }
+        action={
+          <OtherActions
+            actions={[
+              {
+                label: 'Add Action',
+                onClick: () => setAddAction({ ruleID: rule.id }),
+              },
+              {
+                label: 'Edit Rule',
+                onClick: () => setEdit(rule.id),
+              },
+              {
+                label: 'Delete Rule',
+                onClick: () => setRemove(rule.id),
+              },
+            ]}
+          />
+        }
+      />
+    </ReorderableItem>
+  ))
+
+  return (
+    <React.Fragment>
+      <Card>
+        <CompList
+          emptyMessage='No rules exist for this integration key.'
+          action={
+            <Button
+              variant='contained'
+              startIcon={<Add />}
+              onClick={() => setCreate(true)}
+            >
+              Create Rule
+            </Button>
+          }
+          note='Rules are a set of filters that allow notifications to be sent to a specific destination. '
+        >
+          <ReorderGroup
+            onReorder={(oldIdx, newIdx) => {
+              const ruleIDs =
+                data?.integrationKey.config.rules.map((r) => r.id) || []
+              const tmp = ruleIDs[oldIdx]
+              ruleIDs[oldIdx] = ruleIDs[newIdx]
+              ruleIDs[newIdx] = tmp
+              commit(
+                {
+                  input: {
+                    keyID: props.keyID,
+                    setRuleOrder: ruleIDs,
+                  },
+                },
+                { additionalTypenames: ['IntegrationKey'] },
+              )
+            }}
+          >
+            {items}
+          </ReorderGroup>
+        </CompList>
+      </Card>
+
+      <Suspense>
+        {(create || edit) && (
+          <UniversalKeyRuleDialog
+            onClose={() => {
+              setCreate(false)
+              setEdit('')
+            }}
+            keyID={props.keyID}
+            ruleID={edit}
+          />
+        )}
+        {remove && (
+          <UniversalKeyRuleRemoveDialog
+            onClose={() => setRemove('')}
+            keyID={props.keyID}
+            ruleID={remove}
+          />
+        )}
+        {editAction && (
+          <UniversalKeyActionDialog
+            onClose={() => setEditAction(null)}
+            keyID={props.keyID}
+            ruleID={editAction.ruleID}
+            actionIndex={editAction.actionIndex}
+          />
+        )}
+        {addAction && (
+          <UniversalKeyActionDialog
+            onClose={() => setAddAction(null)}
+            keyID={props.keyID}
+            ruleID={addAction.ruleID}
+          />
+        )}
+      </Suspense>
+    </React.Fragment>
+  )
+}

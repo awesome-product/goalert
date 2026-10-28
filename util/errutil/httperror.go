@@ -3,20 +3,19 @@ package errutil
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"net/http"
 
-	"github.com/pkg/errors"
+	"github.com/target/goalert/ctxlock"
 	"github.com/target/goalert/permission"
 	"github.com/target/goalert/util/log"
 	"github.com/target/goalert/util/sqlutil"
 	"github.com/target/goalert/validation"
 )
 
-func isCtxCause(err error) bool {
+func isCancel(err error) bool {
 	if errors.Is(err, context.Canceled) {
-		return true
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 	if errors.Is(err, sql.ErrTxDone) {
@@ -51,35 +50,46 @@ func HTTPError(ctx context.Context, w http.ResponseWriter, err error) bool {
 	}
 
 	err = MapDBError(err)
-	if permission.IsUnauthorized(err) {
-		log.Debug(ctx, err)
+	var bodyLimit *http.MaxBytesError
+	switch {
+	case errors.As(err, &bodyLimit):
+		http.Error(w, fmt.Sprintf("%s (max body: %v bytes)", http.StatusText(http.StatusRequestEntityTooLarge), bodyLimit.Limit), http.StatusRequestEntityTooLarge)
+	case errors.Is(err, ctxlock.ErrQueueFull):
+		// The queue is full meaning we have over 100 requests from the
+		// same source.
+		//
+		// Because of the way the lock works, we can guarantee that
+		// we will process one request at a time (per source), but we
+		// may have to wait for a previous request to finish before we
+		// can start processing the next one.
+		//
+		// This means only concurrent requests (per process/per key) have
+		// the possibility to be rate limited, and not sequential requests,
+		// even in the worst case scenario.
+		http.Error(w, "Too many concurrent requests for this key or session", http.StatusTooManyRequests)
+	case errors.Is(err, ctxlock.ErrTimeout):
+		// Similar to above, but that we timed out waiting in the queue.
+		http.Error(w, http.StatusText(http.StatusRequestTimeout), http.StatusRequestTimeout)
+	case isCancel(err):
+		// Client disconnected, send 499 back so logs reflect that this
+		// was a client-side problem.
+		http.Error(w, "Client disconnected.", 499)
+	case permission.IsUnauthorized(err):
 		http.Error(w, unwrapAll(err).Error(), http.StatusUnauthorized)
-		return true
-	}
-	if permission.IsPermissionError(err) {
-		log.Debug(ctx, err)
+	case permission.IsPermissionError(err):
 		http.Error(w, unwrapAll(err).Error(), http.StatusForbidden)
-		return true
-	}
-	if validation.IsClientError(err) {
-		log.Debug(ctx, err)
+	case validation.IsClientError(err):
 		http.Error(w, unwrapAll(err).Error(), http.StatusBadRequest)
-		return true
-	}
-	if IsLimitError(err) {
-		log.Debug(ctx, err)
+	case IsLimitError(err):
 		http.Error(w, unwrapAll(err).Error(), http.StatusConflict)
-		return true
-	}
-
-	if ctx.Err() != nil && isCtxCause(err) {
-		// context timed out or was canceled
-		log.Debug(ctx, err)
+	case errors.Is(err, context.DeadlineExceeded):
+		// Timeout
 		http.Error(w, http.StatusText(http.StatusGatewayTimeout), http.StatusGatewayTimeout)
-		return true
+	default:
+		// For all other unexpected errors, log the error and send a 500.
+		log.Log(ctx, err)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 	}
 
-	log.Log(ctx, err)
-	http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 	return true
 }

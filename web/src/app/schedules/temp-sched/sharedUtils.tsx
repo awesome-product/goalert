@@ -1,42 +1,64 @@
-import { DateTime, Interval } from 'luxon'
+import { DateTime, Duration, Interval } from 'luxon'
 import React, { ReactNode } from 'react'
 
-export type Value = {
+export type TempSchedValue = {
   start: string
   end: string
   shifts: Shift[]
+  shiftDur?: Duration
 }
 
 export type Shift = {
+  displayStart?: string
   start: string
   end: string
   userID: string
+  truncated: boolean
+  custom?: boolean
 
-  user?: {
+  user?: null | {
     id: string
     name: string
   }
 }
 
-const parseInterval = (start: string, end: string): Interval =>
-  Interval.fromDateTimes(DateTime.fromISO(start), DateTime.fromISO(end))
+export function inferDuration(shifts: Shift[]): Duration {
+  const totalDurations = shifts.reduce((acc, shift) => {
+    const startDateTime = DateTime.fromISO(shift.start)
+    const endDateTime = DateTime.fromISO(shift.end)
 
-export function validateShift(
-  schedStart: string,
-  schedEnd: string,
-  shift: Shift,
-): Error | null {
-  const schedSpan = parseInterval(schedStart, schedEnd)
-  const shiftSpan = parseInterval(shift.start, shift.end)
+    if (startDateTime.isValid && endDateTime.isValid) {
+      const interval = Interval.fromDateTimes(startDateTime, endDateTime)
+      return acc.plus(interval.toDuration())
+    }
 
-  // these two just for completeness but should never happen
-  if (!shiftSpan.isValid) return new Error('invalid shift times')
-  if (!schedSpan.isValid) return new Error('invalid schedule times')
+    return acc
+  }, Duration.fromObject({}))
 
-  if (!schedSpan.engulfs(shiftSpan))
-    return new Error('shift extends beyond temporary schedule')
+  return Duration.fromObject({
+    hours: totalDurations.as('hours') / shifts.length,
+    days: totalDurations.as('days') / shifts.length,
+    weeks: totalDurations.as('weeks') / shifts.length,
+  })
+}
 
-  return null
+// defaultTempScheduleValue returns a timespan, with no shifts,
+// of the following week.
+export function defaultTempSchedValue(zone: string): TempSchedValue {
+  // We want the start to be the _next_ start-of-week for the current locale.
+  // For example, if today is Sunday, we want the start to be next Sunday.
+  // If today is Saturday, we want the start to be tomorrow.
+  const startDT = DateTime.local()
+    .setZone(zone)
+    .startOf('week')
+    .plus({ weeks: 1 })
+
+  return {
+    start: startDT.toISO(),
+    end: startDT.plus({ days: 7 }).toISO(),
+    shifts: [],
+    shiftDur: Duration.fromObject({ days: 1 }),
+  }
 }
 
 // removes bottom margin from content text so form fields
@@ -76,4 +98,10 @@ export function StepContainer({
       </div>
     </div>
   )
+}
+
+// dtToDuration takes two date times and returns the duration between the two
+export function dtToDuration(a: DateTime, b: DateTime): number {
+  if (!a.isValid || !b.isValid) return -1
+  return b.diff(a, 'hours').hours
 }

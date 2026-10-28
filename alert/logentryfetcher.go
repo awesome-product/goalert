@@ -3,13 +3,13 @@ package alert
 import (
 	"context"
 
-	alertlog "github.com/target/goalert/alert/log"
+	"github.com/target/goalert/alert/alertlog"
 
 	"github.com/pkg/errors"
 )
 
 type LogEntryFetcher interface {
-	// LogEntry fetchs the latest log entry for a given alertID and type.
+	// LogEntry fetches the latest log entry for a given alertID and type.
 	LogEntry(ctx context.Context) (*alertlog.Entry, error)
 }
 
@@ -18,8 +18,10 @@ type logError struct {
 	isAlreadyClosed       bool
 	alertID               int
 	_type                 alertlog.Type
-	logDB                 alertlog.Store
+	logDB                 *alertlog.Store
 }
+
+func (logError) ClientError() bool { return true }
 
 func (e logError) LogEntry(ctx context.Context) (*alertlog.Entry, error) {
 	return e.logDB.FindLatestByType(ctx, e.alertID, e._type)

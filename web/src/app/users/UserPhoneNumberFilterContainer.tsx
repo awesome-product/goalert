@@ -1,5 +1,5 @@
 import React, { Ref, useEffect, useState } from 'react'
-import Grid from '@material-ui/core/Grid'
+import Grid from '@mui/material/Grid'
 import { Filter as LabelFilterIcon } from 'mdi-material-ui'
 import FilterContainer from '../util/FilterContainer'
 import TelTextField from '../util/TelTextField'
@@ -52,8 +52,6 @@ export default function UserPhoneNumberFilterContainer(
           fullWidth
           name='user-phone-search'
           label='Search by Phone Number'
-          helperText='Please provide your country code e.g. +1 (USA)'
-          type='tel'
         />
       </Grid>
     </FilterContainer>

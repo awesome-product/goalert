@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 
-	alertlog "github.com/target/goalert/alert/log"
+	"github.com/target/goalert/alert/alertlog"
 	"github.com/target/goalert/engine/processinglock"
 	"github.com/target/goalert/util"
 )
@@ -13,7 +13,8 @@ import (
 type DB struct {
 	lock *processinglock.Lock
 
-	cleanupNoSteps *sql.Stmt
+	clearMaintExpiredSvc *sql.Stmt
+	cleanupNoSteps       *sql.Stmt
 
 	lockStmt     *sql.Stmt
 	updateOnCall *sql.Stmt
@@ -22,16 +23,16 @@ type DB struct {
 	deletedSteps     *sql.Stmt
 	normalEscalation *sql.Stmt
 
-	log alertlog.Store
+	log *alertlog.Store
 }
 
 // Name returns the name of the module.
 func (db *DB) Name() string { return "Engine.EscalationManager" }
 
 // NewDB creates a new DB.
-func NewDB(ctx context.Context, db *sql.DB, log alertlog.Store) (*DB, error) {
+func NewDB(ctx context.Context, db *sql.DB, log *alertlog.Store) (*DB, error) {
 	lock, err := processinglock.NewLock(ctx, db, processinglock.Config{
-		Version: 3,
+		Version: 4,
 		Type:    processinglock.TypeEscalation,
 	})
 	if err != nil {
@@ -82,6 +83,12 @@ func NewDB(ctx context.Context, db *sql.DB, log alertlog.Store) (*DB, error) {
 			returning ep_step_id, user_id
 		`),
 
+		clearMaintExpiredSvc: p.P(`
+				update services s
+				set maintenance_expires_at = null
+				where s.maintenance_expires_at <= now()
+		`),
+
 		cleanupNoSteps: p.P(`
 			delete from escalation_policy_state state
 			using escalation_policies pol
@@ -93,24 +100,25 @@ func NewDB(ctx context.Context, db *sql.DB, log alertlog.Store) (*DB, error) {
 
 		newPolicies: p.P(`
 			with to_escalate as (
-				select alert_id, step.id ep_step_id, step.delay, step.escalation_policy_id, a.service_id
+				select alert_id, step.id ep_step_id, step.delay, step.escalation_policy_id, a.service_id, step.multi_ack
 				from escalation_policy_state state
 				join escalation_policy_steps step on
 					step.escalation_policy_id = state.escalation_policy_id and
 					step.step_number = 0
 				join alerts a on a.id = state.alert_id and (a.status = 'triggered' or state.force_escalation)
+				join services s on a.service_id = s.id and s.maintenance_expires_at isnull
 				where state.last_escalation isnull
 				for update skip locked
 				limit 1000
 			), _step_cycles as (
-				select esc.alert_id, on_call.user_id, esc.ep_step_id
+				select esc.alert_id, on_call.user_id, esc.ep_step_id, esc.multi_ack
 				from to_escalate esc
 				join ep_step_on_call_users on_call on
 					on_call.end_time isnull and
 					on_call.ep_step_id = esc.ep_step_id
 			), _cycles as (
-				insert into notification_policy_cycles (alert_id, user_id)
-				select alert_id, user_id from _step_cycles
+				insert into notification_policy_cycles (alert_id, user_id, multi_ack)
+				select alert_id, user_id, multi_ack from _step_cycles
 			), _step_channels as (
 				select
 					cast('alert_notification' as enum_outgoing_messages_type),
@@ -159,7 +167,8 @@ func NewDB(ctx context.Context, db *sql.DB, log alertlog.Store) (*DB, error) {
 					step.delay,
 					state.escalation_policy_step_number >= ep.step_count repeated,
 					a.service_id,
-					step.escalation_policy_id
+					step.escalation_policy_id,
+					step.multi_ack
 				from escalation_policy_state state
 				join alerts a on a.id = state.alert_id and (a.status = 'triggered' or state.force_escalation)
 				join escalation_policies ep on ep.id = state.escalation_policy_id
@@ -169,20 +178,21 @@ func NewDB(ctx context.Context, db *sql.DB, log alertlog.Store) (*DB, error) {
 						WHEN state.escalation_policy_step_number >= ep.step_count THEN 0
 						ELSE state.escalation_policy_step_number
 						END
+				join services s on a.service_id = s.id and s.maintenance_expires_at isnull
 				where
 					state.last_escalation notnull and
 					escalation_policy_step_id isnull
 				for update skip locked
 				limit 100
 			), _step_cycles as (
-				select esc.alert_id, on_call.user_id, esc.ep_step_id
+				select esc.alert_id, on_call.user_id, esc.ep_step_id, esc.multi_ack
 				from to_escalate esc
 				join ep_step_on_call_users on_call on
 					on_call.end_time isnull and
 					on_call.ep_step_id = esc.ep_step_id
 			), _cycles as (
-				insert into notification_policy_cycles (alert_id, user_id)
-				select alert_id, user_id
+				insert into notification_policy_cycles (alert_id, user_id, multi_ack)
+				select alert_id, user_id, multi_ack
 				from _step_cycles
 			), _step_channels as (
 				select
@@ -234,7 +244,8 @@ func NewDB(ctx context.Context, db *sql.DB, log alertlog.Store) (*DB, error) {
 					oldStep.delay old_delay,
 					oldStep.step_number + 1 >= ep.step_count repeated,
 					nextStep.escalation_policy_id,
-					a.service_id
+					a.service_id,
+					nextStep.multi_ack
 				from escalation_policy_state state
 				join alerts a on a.id = state.alert_id and (a.status = 'triggered' or state.force_escalation)
 				join escalation_policies ep on ep.id = state.escalation_policy_id
@@ -248,6 +259,7 @@ func NewDB(ctx context.Context, db *sql.DB, log alertlog.Store) (*DB, error) {
 						WHEN state.loop_count < ep.repeat THEN 0
 						ELSE -1
 					END
+				join services s on a.service_id = s.id and s.maintenance_expires_at isnull
 				where
 					state.last_escalation notnull and
 					escalation_policy_step_id notnull and
@@ -256,14 +268,14 @@ func NewDB(ctx context.Context, db *sql.DB, log alertlog.Store) (*DB, error) {
 				for update skip locked
 				limit 500
 			), _step_cycles as (
-				select esc.alert_id, on_call.user_id, esc.ep_step_id
+				select esc.alert_id, on_call.user_id, esc.ep_step_id, esc.multi_ack
 				from to_escalate esc
 				join ep_step_on_call_users on_call on
 					on_call.end_time isnull and
 					on_call.ep_step_id = esc.ep_step_id
 			), _cycles as (
-				insert into notification_policy_cycles (alert_id, user_id)
-				select alert_id, user_id
+				insert into notification_policy_cycles (alert_id, user_id, multi_ack)
+				select alert_id, user_id, multi_ack
 				from _step_cycles
 			), _step_channels as (
 				select

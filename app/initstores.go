@@ -5,20 +5,24 @@ import (
 	"net/url"
 
 	"github.com/target/goalert/alert"
-	alertlog "github.com/target/goalert/alert/log"
+	"github.com/target/goalert/alert/alertlog"
+	"github.com/target/goalert/alert/alertmetrics"
+	"github.com/target/goalert/apikey"
+	"github.com/target/goalert/auth/authlink"
 	"github.com/target/goalert/auth/basic"
 	"github.com/target/goalert/auth/nonce"
-	"github.com/target/goalert/calendarsubscription"
+	"github.com/target/goalert/calsub"
 	"github.com/target/goalert/config"
-	"github.com/target/goalert/engine/resolver"
 	"github.com/target/goalert/escalation"
 	"github.com/target/goalert/heartbeat"
 	"github.com/target/goalert/integrationkey"
+	"github.com/target/goalert/integrationkey/uik"
 	"github.com/target/goalert/keyring"
 	"github.com/target/goalert/label"
 	"github.com/target/goalert/limit"
 	"github.com/target/goalert/notice"
 	"github.com/target/goalert/notification"
+	"github.com/target/goalert/notification/nfydest"
 	"github.com/target/goalert/notification/slack"
 	"github.com/target/goalert/notificationchannel"
 	"github.com/target/goalert/oncall"
@@ -40,12 +44,21 @@ import (
 func (app *App) initStores(ctx context.Context) error {
 	var err error
 
+	app.DestRegistry = nfydest.NewRegistry()
+
 	if app.ConfigStore == nil {
 		var fallback url.URL
 		fallback.Scheme = "http"
 		fallback.Host = app.l.Addr().String()
 		fallback.Path = app.cfg.HTTPPrefix
-		app.ConfigStore, err = config.NewStore(ctx, app.db, app.cfg.EncryptionKeys, fallback.String())
+		storeCfg := config.StoreConfig{
+			DB:                 app.db,
+			Keys:               app.cfg.EncryptionKeys,
+			FallbackURL:        fallback.String(),
+			ExplicitURL:        app.cfg.PublicURL,
+			IngressEmailDomain: app.cfg.EmailIntegrationDomain,
+		}
+		app.ConfigStore, err = config.NewStore(ctx, storeCfg)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init config store")
@@ -60,14 +73,14 @@ func (app *App) initStores(ctx context.Context) error {
 	}
 
 	if app.NonceStore == nil {
-		app.NonceStore, err = nonce.NewStore(ctx, app.db)
+		app.NonceStore, err = nonce.NewStore(ctx, app.cfg.LegacyLogger, app.db)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init nonce store")
 	}
 
 	if app.OAuthKeyring == nil {
-		app.OAuthKeyring, err = keyring.NewDB(ctx, app.db, &keyring.Config{
+		app.OAuthKeyring, err = keyring.NewDB(ctx, app.cfg.LegacyLogger, app.db, &keyring.Config{
 			Name:         "oauth-state",
 			RotationDays: 1,
 			MaxOldKeys:   1,
@@ -78,8 +91,20 @@ func (app *App) initStores(ctx context.Context) error {
 		return errors.Wrap(err, "init oauth state keyring")
 	}
 
+	if app.AuthLinkKeyring == nil {
+		app.AuthLinkKeyring, err = keyring.NewDB(ctx, app.cfg.LegacyLogger, app.db, &keyring.Config{
+			Name:         "auth-link",
+			RotationDays: 1,
+			MaxOldKeys:   1,
+			Keys:         app.cfg.EncryptionKeys,
+		})
+	}
+	if err != nil {
+		return errors.Wrap(err, "init oauth state keyring")
+	}
+
 	if app.SessionKeyring == nil {
-		app.SessionKeyring, err = keyring.NewDB(ctx, app.db, &keyring.Config{
+		app.SessionKeyring, err = keyring.NewDB(ctx, app.cfg.LegacyLogger, app.db, &keyring.Config{
 			Name:         "browser-sessions",
 			RotationDays: 1,
 			MaxOldKeys:   30,
@@ -91,7 +116,7 @@ func (app *App) initStores(ctx context.Context) error {
 	}
 
 	if app.APIKeyring == nil {
-		app.APIKeyring, err = keyring.NewDB(ctx, app.db, &keyring.Config{
+		app.APIKeyring, err = keyring.NewDB(ctx, app.cfg.LegacyLogger, app.db, &keyring.Config{
 			Name:       "api-keys",
 			MaxOldKeys: 100,
 			Keys:       app.cfg.EncryptionKeys,
@@ -101,36 +126,47 @@ func (app *App) initStores(ctx context.Context) error {
 		return errors.Wrap(err, "init API keyring")
 	}
 
+	if app.AuthLinkStore == nil {
+		app.AuthLinkStore, err = authlink.NewStore(ctx, app.db, app.AuthLinkKeyring)
+	}
+	if err != nil {
+		return errors.Wrap(err, "init auth link store")
+	}
+
+	if app.AlertMetricsStore == nil {
+		app.AlertMetricsStore, err = alertmetrics.NewStore(ctx, app.db)
+	}
+	if err != nil {
+		return errors.Wrap(err, "init alert metrics store")
+	}
+
 	if app.AlertLogStore == nil {
-		app.AlertLogStore, err = alertlog.NewDB(ctx, app.db)
+		app.AlertLogStore, err = alertlog.NewStore(ctx, app.db, app.DestRegistry)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init alertlog store")
 	}
 
 	if app.AlertStore == nil {
-		app.AlertStore, err = alert.NewDB(ctx, app.db, app.AlertLogStore)
+		app.AlertStore, err = alert.NewStore(ctx, app.db, app.AlertLogStore)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init alert store")
 	}
 
 	if app.ContactMethodStore == nil {
-		app.ContactMethodStore, err = contactmethod.NewDB(ctx, app.db)
-	}
-	if err != nil {
-		return errors.Wrap(err, "init contact method store")
+		app.ContactMethodStore = contactmethod.NewStore(app.DestRegistry)
 	}
 
 	if app.NotificationRuleStore == nil {
-		app.NotificationRuleStore, err = notificationrule.NewDB(ctx, app.db)
+		app.NotificationRuleStore, err = notificationrule.NewStore(ctx, app.db)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init notification rule store")
 	}
 
 	if app.ServiceStore == nil {
-		app.ServiceStore, err = service.NewDB(ctx, app.db)
+		app.ServiceStore, err = service.NewStore(ctx, app.db)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init service store")
@@ -158,23 +194,24 @@ func (app *App) initStores(ctx context.Context) error {
 	}
 
 	if app.RotationStore == nil {
-		app.RotationStore, err = rotation.NewDB(ctx, app.db)
+		app.RotationStore, err = rotation.NewStore(ctx, app.db)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init rotation store")
 	}
 
 	if app.NCStore == nil {
-		app.NCStore, err = notificationchannel.NewDB(ctx, app.db)
+		app.NCStore, err = notificationchannel.NewStore(ctx, app.db, app.DestRegistry)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init notification channel store")
 	}
 
 	if app.EscalationStore == nil {
-		app.EscalationStore, err = escalation.NewDB(ctx, app.db, escalation.Config{
+		app.EscalationStore, err = escalation.NewStore(ctx, app.db, escalation.Config{
 			LogStore: app.AlertLogStore,
 			NCStore:  app.NCStore,
+			Registry: app.DestRegistry,
 			SlackLookupFunc: func(ctx context.Context, channelID string) (*slack.Channel, error) {
 				return app.slackChan.Channel(ctx, channelID)
 			},
@@ -185,45 +222,35 @@ func (app *App) initStores(ctx context.Context) error {
 	}
 
 	if app.IntegrationKeyStore == nil {
-		app.IntegrationKeyStore, err = integrationkey.NewDB(ctx, app.db)
-	}
-	if err != nil {
-		return errors.Wrap(err, "init integration key store")
+		app.IntegrationKeyStore = integrationkey.NewStore(ctx, app.db, app.APIKeyring, app.DestRegistry, app.NCStore)
 	}
 
 	if app.ScheduleRuleStore == nil {
-		app.ScheduleRuleStore, err = rule.NewDB(ctx, app.db)
+		app.ScheduleRuleStore, err = rule.NewStore(ctx, app.db)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init schedule rule store")
 	}
 
 	if app.NotificationStore == nil {
-		app.NotificationStore, err = notification.NewDB(ctx, app.db)
+		app.NotificationStore, err = notification.NewStore(ctx, app.db)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init notification store")
 	}
 
 	if app.FavoriteStore == nil {
-		app.FavoriteStore, err = favorite.NewDB(ctx, app.db)
+		app.FavoriteStore, err = favorite.NewStore(ctx)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init favorite store")
 	}
 
 	if app.OverrideStore == nil {
-		app.OverrideStore, err = override.NewDB(ctx, app.db)
+		app.OverrideStore, err = override.NewStore(ctx, app.db)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init override store")
-	}
-
-	if app.Resolver == nil {
-		app.Resolver, err = resolver.NewDB(ctx, app.db, app.ScheduleRuleStore, app.ScheduleStore)
-	}
-	if err != nil {
-		return errors.Wrap(err, "init resolver")
 	}
 
 	if app.LimitStore == nil {
@@ -239,14 +266,14 @@ func (app *App) initStores(ctx context.Context) error {
 		return errors.Wrap(err, "init heartbeat store")
 	}
 	if app.LabelStore == nil {
-		app.LabelStore, err = label.NewDB(ctx, app.db)
+		app.LabelStore, err = label.NewStore(ctx, app.db)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init label store")
 	}
 
 	if app.OnCallStore == nil {
-		app.OnCallStore, err = oncall.NewDB(ctx, app.db, app.ScheduleRuleStore, app.ScheduleStore)
+		app.OnCallStore, err = oncall.NewStore(ctx, app.db, app.ScheduleRuleStore, app.ScheduleStore)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init on-call store")
@@ -257,7 +284,7 @@ func (app *App) initStores(ctx context.Context) error {
 	}
 
 	if app.CalSubStore == nil {
-		app.CalSubStore, err = calendarsubscription.NewStore(ctx, app.db, app.APIKeyring, app.OnCallStore)
+		app.CalSubStore, err = calsub.NewStore(ctx, app.db, app.APIKeyring, app.OnCallStore)
 	}
 	if err != nil {
 		return errors.Wrap(err, "init calendar subscription store")
@@ -269,6 +296,15 @@ func (app *App) initStores(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "init notice store")
 	}
+
+	if app.APIKeyStore == nil {
+		app.APIKeyStore, err = apikey.NewStore(ctx, app.db, app.APIKeyring)
+	}
+	if err != nil {
+		return errors.Wrap(err, "init API key store")
+	}
+
+	app.UIKHandler = uik.NewHandler(app.db, app.httpClient, app.IntegrationKeyStore, app.AlertStore)
 
 	return nil
 }

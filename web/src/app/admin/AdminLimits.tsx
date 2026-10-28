@@ -1,10 +1,11 @@
 import React, { useState } from 'react'
-import { useQuery, gql } from '@apollo/client'
-import Button from '@material-ui/core/Button'
-import ButtonGroup from '@material-ui/core/ButtonGroup'
-import Card from '@material-ui/core/Card'
-import Grid from '@material-ui/core/Grid'
-import { makeStyles } from '@material-ui/core/styles'
+import { useQuery, gql } from 'urql'
+import Button from '@mui/material/Button'
+import ButtonGroup from '@mui/material/ButtonGroup'
+import Card from '@mui/material/Card'
+import Grid from '@mui/material/Grid'
+import makeStyles from '@mui/styles/makeStyles'
+import { Theme } from '@mui/material/styles'
 import { startCase, isEmpty } from 'lodash'
 import AdminDialog from './AdminDialog'
 import { Form } from '../forms'
@@ -14,20 +15,21 @@ import { GenericError } from '../error-pages'
 
 const query = gql`
   query getLimits {
-    systemLimits {
+    values: systemLimits {
       id
       description
       value
     }
   }
 `
+
 const mutation = gql`
   mutation ($input: [SystemLimitInput!]!) {
     setSystemLimits(input: $input)
   }
 `
 
-const useStyles = makeStyles((theme) => ({
+const useStyles = makeStyles((theme: Theme) => ({
   actionsContainer: {
     display: 'flex',
     justifyContent: 'flex-end',
@@ -50,18 +52,18 @@ interface LimitsValues {
   [id: string]: string
 }
 
-export default function AdminLimits(): JSX.Element {
+export default function AdminLimits(): React.JSX.Element {
   const classes = useStyles()
   const [confirm, setConfirm] = useState(false)
   const [values, setValues] = useState({})
 
-  const { data, loading, error } = useQuery(query)
+  const [{ data, fetching, error }] = useQuery({ query })
 
   if (error) {
     return <GenericError error={error.message} />
   }
 
-  if (loading && !data) {
+  if (fetching && !data) {
     return <Spinner />
   }
 
@@ -81,7 +83,7 @@ export default function AdminLimits(): JSX.Element {
     <div className={classes.pageContainer}>
       <Grid container spacing={2} className={classes.gridContainer}>
         <Grid item xs={12} className={classes.actionsContainer}>
-          <ButtonGroup color='primary' variant='outlined'>
+          <ButtonGroup variant='outlined'>
             <Button
               data-cy='reset'
               disabled={isEmpty(values)}
@@ -101,9 +103,9 @@ export default function AdminLimits(): JSX.Element {
 
         {confirm && (
           <AdminDialog
+            query={query}
             mutation={mutation}
-            values={data.systemLimits}
-            fieldValues={values}
+            value={values}
             onClose={() => setConfirm(false)}
             onComplete={() => {
               setValues({})
@@ -121,7 +123,7 @@ export default function AdminLimits(): JSX.Element {
                   updateValue(id, value)
                 }
                 headerNote='Set limits to -1 to disable.'
-                fields={data.systemLimits.map(
+                fields={data.values.map(
                   (f: { id: string; description: string; value: number }) => ({
                     id: f.id,
                     type: 'integer',

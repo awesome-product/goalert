@@ -3,8 +3,10 @@ package slack
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
+	"github.com/slack-go/slack/slackutilsx"
 	"github.com/target/goalert/notification"
 	"github.com/target/goalert/user"
 	"github.com/target/goalert/util/log"
@@ -31,10 +33,10 @@ func (s *ChannelSender) onCallNotificationText(ctx context.Context, t notificati
 	}
 
 	userSlackIDs := make(map[string]string, len(t.Users))
-	err = s.cfg.UserStore.AuthSubjectsFunc(ctx, "slack:"+teamID, func(sub user.AuthSubject) error {
+	err = s.cfg.UserStore.AuthSubjectsFunc(ctx, "slack:"+teamID, userIDs, func(sub user.AuthSubject) error {
 		userSlackIDs[sub.UserID] = sub.SubjectID
 		return nil
-	}, userIDs...)
+	})
 	if err != nil {
 		log.Log(ctx, fmt.Errorf("lookup auth subjects for slack: %w", err))
 		// handled error by logging, continue on to render message with any included slack IDs
@@ -47,7 +49,16 @@ func (s *ChannelSender) onCallNotificationText(ctx context.Context, t notificati
 //
 // If a user's ID is available in userSlackIDs, an `@` user mention will be used in place of a link to the GoAlert user's detail page.
 func renderOnCallNotificationMessage(msg notification.ScheduleOnCallUsers, userSlackIDs map[string]string) string {
-	suffix := fmt.Sprintf("on-call for <%s|%s>", msg.ScheduleURL, msg.ScheduleName)
+	suffix := fmt.Sprintf("on-call for <%s|%s>", slackutilsx.EscapeMessage(msg.ScheduleURL), slackutilsx.EscapeMessage(msg.ScheduleName))
+
+	sort.Slice(msg.Users, func(i, j int) bool {
+		ui, uj := msg.Users[i], msg.Users[j]
+		if ui.Name == uj.Name {
+			return ui.ID < uj.ID
+		}
+
+		return ui.Name < uj.Name
+	})
 
 	var userLinks []string
 	for _, u := range msg.Users {
@@ -57,11 +68,11 @@ func renderOnCallNotificationMessage(msg notification.ScheduleOnCallUsers, userS
 		}
 		if subjectID == "" {
 			// fallback to a link to the GoAlert user
-			userLinks = append(userLinks, fmt.Sprintf("<%s|%s>", u.URL, u.Name))
+			userLinks = append(userLinks, fmt.Sprintf("<%s|%s>", slackutilsx.EscapeMessage(u.URL), slackutilsx.EscapeMessage(u.Name)))
 			continue
 		}
 
-		userLinks = append(userLinks, fmt.Sprintf("<@%s>", subjectID))
+		userLinks = append(userLinks, fmt.Sprintf("<@%s>", slackutilsx.EscapeMessage(subjectID)))
 	}
 
 	if len(userLinks) == 0 {

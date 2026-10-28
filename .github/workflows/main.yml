@@ -1,25 +1,34 @@
 name: reviewdog
-on: [pull_request]
+
+on:
+  pull_request:
+    types: ['opened', 'ready_for_review', 'reopened', 'synchronize']
+
 jobs:
   node-checks:
     name: Node checks
     runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-node@v2
+      - uses: actions/setup-go@v5
         with:
-          node-version: '14'
-      - run: yarn install
+          go-version: '1.24'
+      - uses: actions/checkout@v6
+      - uses: actions/cache@v6
+        with:
+          key: key
+          path: ~/.bun/install/cache
+      - run: make node_modules
       - uses: reviewdog/action-eslint@v1
         with:
           reporter: github-pr-review
           level: warning
-          fail_on_error: true
+          fail_level: warning
       - uses: reviewdog/action-stylelint@v1
         with:
           github_token: ${{ secrets.github_token }}
           reporter: github-pr-review
           level: warning
-          fail_on_error: true
+          fail_level: warning
       - name: tsc
-        run: yarn workspaces run check
+        run: ./bin/tools/bun run check

@@ -3,12 +3,11 @@ package permission
 import (
 	"context"
 	"errors"
-	"github.com/target/goalert/util/log"
 	"regexp"
 	"strings"
-	"sync/atomic"
 
-	"go.opencensus.io/trace"
+	"github.com/google/uuid"
+	"github.com/target/goalert/util/log"
 )
 
 // SourceContext will return a context with the provided SourceInfo.
@@ -31,17 +30,6 @@ func Source(ctx context.Context) *SourceInfo {
 	return &src
 }
 
-func sourceAttrs(ctx context.Context, extra ...trace.Attribute) []trace.Attribute {
-	src := Source(ctx)
-	if src == nil {
-		return extra
-	}
-	return append([]trace.Attribute{
-		trace.StringAttribute("auth.source.type", src.Type.String()),
-		trace.StringAttribute("auth.source.id", src.ID),
-	}, extra...)
-}
-
 // UserSourceContext behaves like UserContext, but provides SourceInfo about the authorization.
 func UserSourceContext(ctx context.Context, id string, r Role, src *SourceInfo) context.Context {
 	ctx = SourceContext(ctx, src)
@@ -54,13 +42,8 @@ func UserContext(ctx context.Context, id string, r Role) context.Context {
 	id = strings.ToLower(id)
 	ctx = context.WithValue(ctx, contextHasAuth, 1)
 	ctx = context.WithValue(ctx, contextKeyUserID, id)
-	ctx = ensureAuthCheckCountContext(ctx)
 	ctx = context.WithValue(ctx, contextKeyUserRole, r)
 	ctx = log.WithField(ctx, "AuthUserID", id)
-	trace.FromContext(ctx).Annotate(sourceAttrs(ctx,
-		trace.StringAttribute("auth.user.id", id),
-		trace.StringAttribute("auth.user.role", string(r)),
-	), "Authorized as User.")
 	return ctx
 }
 
@@ -74,42 +57,7 @@ func SystemContext(ctx context.Context, componentName string) context.Context {
 	}
 	ctx = context.WithValue(ctx, contextHasAuth, 1)
 	ctx = context.WithValue(ctx, contextKeySystem, componentName)
-	ctx = AuthCheckCountContext(ctx, 0)
 	ctx = log.WithField(ctx, "AuthSystemComponent", componentName)
-	trace.FromContext(ctx).Annotate([]trace.Attribute{trace.StringAttribute("auth.system.componentName", componentName)}, "Authorized as System.")
-	return ctx
-}
-
-// AuthCheckCount will return the current number of authorization checks as
-// well as the maximum.
-func AuthCheckCount(ctx context.Context) (value, max uint64) {
-	val, ok := ctx.Value(contextKeyCheckCount).(*uint64)
-	if ok {
-		value = atomic.LoadUint64(val)
-	}
-
-	max, _ = ctx.Value(contextKeyCheckCountMax).(uint64)
-
-	return value, max
-}
-
-func ensureAuthCheckCountContext(ctx context.Context) context.Context {
-	_, ok := ctx.Value(contextKeyCheckCount).(*uint64)
-	if !ok {
-		return AuthCheckCountContext(ctx, 0)
-	}
-	return ctx
-}
-
-// AuthCheckCountContext will return a new context with the AuthCheckCount maximum
-// set to the provided value. If max is 0, there will be no limit.
-func AuthCheckCountContext(ctx context.Context, max uint64) context.Context {
-	val, _ := ctx.Value(contextKeyCheckCount).(*uint64)
-	if val == nil {
-		ctx = context.WithValue(ctx, contextKeyCheckCount, new(uint64))
-	}
-	ctx = context.WithValue(ctx, contextKeyCheckCountMax, max)
-
 	return ctx
 }
 
@@ -124,13 +72,8 @@ func ServiceSourceContext(ctx context.Context, id string, src *SourceInfo) conte
 func ServiceContext(ctx context.Context, serviceID string) context.Context {
 	serviceID = strings.ToLower(serviceID)
 	ctx = context.WithValue(ctx, contextHasAuth, 1)
-	ctx = ensureAuthCheckCountContext(ctx)
 	ctx = context.WithValue(ctx, contextKeyServiceID, serviceID)
 	ctx = log.WithField(ctx, "AuthServiceID", serviceID)
-
-	trace.FromContext(ctx).Annotate(sourceAttrs(ctx,
-		trace.StringAttribute("auth.service.id", serviceID),
-	), "Authorized as Service.")
 
 	return ctx
 }
@@ -139,7 +82,6 @@ func ServiceContext(ctx context.Context, serviceID string) context.Context {
 func TeamContext(ctx context.Context, teamID string) context.Context {
 	teamID = strings.ToLower(teamID)
 	ctx = context.WithValue(ctx, contextHasAuth, 1)
-	ctx = context.WithValue(ctx, contextKeyCheckCount, new(uint64))
 	ctx = context.WithValue(ctx, contextKeyTeamID, teamID)
 	ctx = log.WithField(ctx, "AuthTeamID", teamID)
 
@@ -163,14 +105,11 @@ func WithoutAuth(ctx context.Context) context.Context {
 	if v == 1 {
 		ctx = context.WithValue(ctx, contextHasAuth, nil)
 	}
-	trace.FromContext(ctx).Annotate(
-		nil,
-		"Authorization dropped.",
-	)
+
 	return ctx
 }
 
-// SudoContext elevates an existing context to system level. The elevated context is automatically cancelled
+// SudoContext elevates an existing context to system level. The elevated context is automatically canceled
 // as soon as the callback returns.
 func SudoContext(ctx context.Context, f func(context.Context)) {
 	name := "Sudo"
@@ -178,22 +117,33 @@ func SudoContext(ctx context.Context, f func(context.Context)) {
 	if cname != "" {
 		name += "[" + cname + "]"
 	}
-	sCtx, span := trace.StartSpan(ctx, "Auth.Sudo")
-	defer span.End()
-	sCtx, cancel := context.WithCancel(SystemContext(sCtx, name))
+	sCtx, cancel := context.WithCancel(SystemContext(ctx, name))
 	defer cancel()
 	f(sCtx)
-}
-
-func userRole(ctx context.Context) Role {
-	role, _ := ctx.Value(contextKeyUserRole).(Role)
-	return role
 }
 
 // UserID will return the UserID associated with a context.
 func UserID(ctx context.Context) string {
 	uid, _ := ctx.Value(contextKeyUserID).(string)
 	return uid
+}
+
+// UserNullUUID will return the UserID associated with a context as a NullUUID.
+func UserNullUUID(ctx context.Context) uuid.NullUUID {
+	if id, err := uuid.Parse(UserID(ctx)); err == nil {
+		return uuid.NullUUID{UUID: id, Valid: true}
+	}
+
+	return uuid.NullUUID{}
+}
+
+// ServiceNullUUID will return the ServiceID associated with a context as a NullUUID.
+func ServiceNullUUID(ctx context.Context) uuid.NullUUID {
+	if id, err := uuid.Parse(ServiceID(ctx)); err == nil {
+		return uuid.NullUUID{UUID: id, Valid: true}
+	}
+
+	return uuid.NullUUID{}
 }
 
 // SystemComponentName will return the component name used to initiate a context.

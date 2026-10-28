@@ -2,204 +2,90 @@ package contactmethod
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"time"
 
+	"github.com/google/uuid"
+	"github.com/target/goalert/gadb"
+	"github.com/target/goalert/notification/nfydest"
 	"github.com/target/goalert/permission"
-	"github.com/target/goalert/util"
 	"github.com/target/goalert/util/log"
-	"github.com/target/goalert/util/sqlutil"
 	"github.com/target/goalert/validation"
 	"github.com/target/goalert/validation/validate"
 )
 
-// Store allows the lookup and management of ContactMethods.
-type Store interface {
-	Insert(context.Context, *ContactMethod) (*ContactMethod, error)
-	CreateTx(context.Context, *sql.Tx, *ContactMethod) (*ContactMethod, error)
-	Update(context.Context, *ContactMethod) error
-	UpdateTx(context.Context, *sql.Tx, *ContactMethod) error
-	Delete(ctx context.Context, id string) error
-	FindOne(ctx context.Context, id string) (*ContactMethod, error)
-	FindOneTx(ctx context.Context, tx *sql.Tx, id string) (*ContactMethod, error)
-	FindMany(ctx context.Context, ids []string) ([]ContactMethod, error)
-	FindAll(ctx context.Context, userID string) ([]ContactMethod, error)
-	DeleteTx(ctx context.Context, tx *sql.Tx, id ...string) error
-	EnableByValue(context.Context, Type, string) error
-	DisableByValue(context.Context, Type, string) error
-
-	MetadataByTypeValue(ctx context.Context, tx *sql.Tx, t Type, value string) (*Metadata, error)
-	SetCarrierV1MetadataByTypeValue(ctx context.Context, tx *sql.Tx, t Type, value string, m *Metadata) error
+// Store implements the lookup and management of ContactMethods against a *sql.Store backend.
+type Store struct {
+	reg *nfydest.Registry
 }
 
-// DB implements the ContactMethodStore against a *sql.DB backend.
-type DB struct {
-	db *sql.DB
-
-	insert       *sql.Stmt
-	update       *sql.Stmt
-	delete       *sql.Stmt
-	findOne      *sql.Stmt
-	findOneUpd   *sql.Stmt
-	findMany     *sql.Stmt
-	findAll      *sql.Stmt
-	lookupUserID *sql.Stmt
-	enable       *sql.Stmt
-	disable      *sql.Stmt
-	metaTV       *sql.Stmt
-	setMetaTV    *sql.Stmt
-	now          *sql.Stmt
+func NewStore(reg *nfydest.Registry) *Store {
+	return &Store{reg: reg}
 }
 
-// NewDB will create a DB backend from a sql.DB. An error will be returned if statements fail to prepare.
-func NewDB(ctx context.Context, db *sql.DB) (*DB, error) {
-	p := &util.Prepare{DB: db, Ctx: ctx}
-	return &DB{
-		db: db,
-
-		now: p.P(`select now()`),
-
-		metaTV: p.P(`
-			SELECT coalesce(metadata, '{}'), now()
-			FROM user_contact_methods
-			WHERE type = $1 AND value = $2
-		`),
-		setMetaTV: p.P(`
-			UPDATE user_contact_methods
-			SET metadata = $3
-			WHERE type = $1 AND value = $2
-		`),
-
-		enable: p.P(`
-			UPDATE user_contact_methods
-			SET disabled = false
-			WHERE type = $1
-				AND value = $2
-			RETURNING id
-		`),
-		disable: p.P(`
-			UPDATE user_contact_methods
-			SET disabled = true
-			WHERE type = $1
-				AND value = $2
-			RETURNING id
-		`),
-		lookupUserID: p.P(`
-			SELECT DISTINCT user_id
-			FROM user_contact_methods
-			WHERE id = any($1)
-		`),
-		insert: p.P(`
-			INSERT INTO user_contact_methods (id,name,type,value,disabled,user_id)
-			VALUES ($1,$2,$3,$4,$5,$6)
-		`),
-		findOne: p.P(`
-			SELECT id,name,type,value,disabled,user_id,last_test_verify_at
-			FROM user_contact_methods
-			WHERE id = $1
-		`),
-		findOneUpd: p.P(`
-			SELECT id,name,type,value,disabled,user_id,last_test_verify_at
-			FROM user_contact_methods
-			WHERE id = $1
-			FOR UPDATE
-		`),
-		findMany: p.P(`
-			SELECT id,name,type,value,disabled,user_id,last_test_verify_at
-			FROM user_contact_methods
-			WHERE id = any($1)
-		`),
-		findAll: p.P(`
-			SELECT id,name,type,value,disabled,user_id,last_test_verify_at
-			FROM user_contact_methods
-			WHERE user_id = $1
-		`),
-		update: p.P(`
-				UPDATE user_contact_methods
-				SET name = $2, disabled = $3
-				WHERE id = $1
-			`),
-		delete: p.P(`
-				DELETE FROM user_contact_methods
-				WHERE id = any($1)
-			`),
-	}, p.Err
-}
-
-func (db *DB) MetadataByTypeValue(ctx context.Context, tx *sql.Tx, typ Type, value string) (*Metadata, error) {
+func (s *Store) MetadataByDest(ctx context.Context, dbtx gadb.DBTX, dest gadb.DestV1) (*Metadata, error) {
 	err := permission.LimitCheckAny(ctx, permission.Admin)
 	if err != nil {
 		return nil, err
 	}
-	var data json.RawMessage
-	var t time.Time
-	err = wrapTx(ctx, tx, db.metaTV).QueryRowContext(ctx, typ, value).Scan(&data, &t)
+
+	data, err := gadb.New(dbtx).ContactMethodMetaDest(ctx, gadb.NullDestV1{Valid: true, DestV1: dest})
 	if err != nil {
 		return nil, err
 	}
 
 	var m Metadata
-	err = json.Unmarshal(data, &m)
+	err = json.Unmarshal(data.Metadata, &m)
 	if err != nil {
 		return nil, err
 	}
-	m.FetchedAt = t
+	m.FetchedAt = data.Now
 
 	return &m, nil
 }
 
-func (db *DB) SetCarrierV1MetadataByTypeValue(ctx context.Context, tx *sql.Tx, typ Type, value string, newM *Metadata) error {
+func (s *Store) SetCarrierV1MetadataByDest(ctx context.Context, dbtx gadb.DBTX, dest gadb.DestV1, newM *Metadata) error {
 	err := permission.LimitCheckAny(ctx, permission.Admin)
 	if err != nil {
 		return err
 	}
-	var ownTx bool
-	if tx == nil {
-		tx, err = db.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		ownTx = true
-	}
-	m, err := db.MetadataByTypeValue(ctx, tx, typ, value)
-	if err != nil {
-		return err
-	}
-	m.CarrierV1 = newM.CarrierV1
-	m.CarrierV1.UpdatedAt = m.FetchedAt
 
-	data, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	_, err = tx.StmtContext(ctx, db.setMetaTV).ExecContext(ctx, typ, value, data)
+	data, err := json.Marshal(newM.CarrierV1)
 	if err != nil {
 		return err
 	}
 
-	if ownTx {
-		return tx.Commit()
+	err = gadb.New(dbtx).ContactMethodUpdateMetaDest(ctx, gadb.ContactMethodUpdateMetaDestParams{Dest: gadb.NullDestV1{Valid: true, DestV1: dest}, CarrierV1: data})
+	if err != nil {
+		return err
 	}
 
 	return nil
 }
 
-func (db *DB) EnableByValue(ctx context.Context, t Type, v string) error {
+func (s *Store) FindDestByID(ctx context.Context, tx gadb.DBTX, id uuid.UUID) (gadb.DestV1, error) {
+	err := permission.LimitCheckAny(ctx, permission.User)
+	if err != nil {
+		return gadb.DestV1{}, err
+	}
+
+	row, err := gadb.New(tx).ContactMethodFineOne(ctx, id)
+	if err != nil {
+		return gadb.DestV1{}, err
+	}
+
+	return row.Dest.DestV1, nil
+}
+
+func (s *Store) EnableByDest(ctx context.Context, dbtx gadb.DBTX, dest gadb.DestV1) error {
 	err := permission.LimitCheckAny(ctx, permission.System)
 	if err != nil {
 		return err
 	}
 
-	c := ContactMethod{Name: "Enable", Type: t, Value: v}
-	n, err := c.Normalize()
-	if err != nil {
-		return err
-	}
-
-	var id string
-	err = db.enable.QueryRowContext(ctx, n.Type, n.Value).Scan(&id)
+	id, err := gadb.New(dbtx).ContactMethodEnableDisable(ctx, gadb.ContactMethodEnableDisableParams{
+		Dest:     gadb.NullDestV1{Valid: true, DestV1: dest},
+		Disabled: false,
+	})
 
 	if err == nil {
 		// NOTE: maintain a record of consent/dissent
@@ -213,20 +99,16 @@ func (db *DB) EnableByValue(ctx context.Context, t Type, v string) error {
 	return err
 }
 
-func (db *DB) DisableByValue(ctx context.Context, t Type, v string) error {
+func (s *Store) DisableByDest(ctx context.Context, dbtx gadb.DBTX, dest gadb.DestV1) error {
 	err := permission.LimitCheckAny(ctx, permission.System)
 	if err != nil {
 		return err
 	}
 
-	c := ContactMethod{Name: "Disable", Type: t, Value: v}
-	n, err := c.Normalize()
-	if err != nil {
-		return err
-	}
-
-	var id string
-	err = db.disable.QueryRowContext(ctx, n.Type, n.Value).Scan(&id)
+	id, err := gadb.New(dbtx).ContactMethodEnableDisable(ctx, gadb.ContactMethodEnableDisableParams{
+		Dest:     gadb.NullDestV1{Valid: true, DestV1: dest},
+		Disabled: true,
+	})
 
 	if err == nil {
 		// NOTE: maintain a record of consent/dissent
@@ -240,26 +122,27 @@ func (db *DB) DisableByValue(ctx context.Context, t Type, v string) error {
 	return err
 }
 
-// Insert implements the ContactMethodStore interface by inserting the new ContactMethod into the database.
-// A new ID is always created.
-func (db *DB) Insert(ctx context.Context, c *ContactMethod) (*ContactMethod, error) {
-	return db.CreateTx(ctx, nil, c)
-}
-
-// CreateTx implements the ContactMethodStore interface by inserting the new ContactMethod into the database.
-// A new ID is always created.
-func (db *DB) CreateTx(ctx context.Context, tx *sql.Tx, c *ContactMethod) (*ContactMethod, error) {
+// CreateTx inserts the new ContactMethod into the database. A new ID is always created.
+func (s *Store) Create(ctx context.Context, dbtx gadb.DBTX, c *ContactMethod) (*ContactMethod, error) {
 	err := permission.LimitCheckAny(ctx, permission.System, permission.Admin, permission.MatchUser(c.UserID))
 	if err != nil {
 		return nil, err
 	}
 
-	n, err := c.Normalize()
+	n, err := c.Normalize(ctx, s.reg)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = wrapTx(ctx, tx, db.insert).ExecContext(ctx, n.ID, n.Name, n.Type, n.Value, n.Disabled, n.UserID)
+	err = gadb.New(dbtx).ContactMethodAdd(ctx, gadb.ContactMethodAddParams{
+		ID:                  n.ID,
+		Name:                n.Name,
+		Dest:                gadb.NullDestV1{Valid: true, DestV1: n.Dest},
+		Disabled:            n.Disabled,
+		UserID:              uuid.MustParse(n.UserID),
+		EnableStatusUpdates: n.StatusUpdates,
+		Private:             n.Private,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -267,21 +150,8 @@ func (db *DB) CreateTx(ctx context.Context, tx *sql.Tx, c *ContactMethod) (*Cont
 	return n, nil
 }
 
-// Delete implements the ContactMethodStore interface.
-func (db *DB) Delete(ctx context.Context, id string) error {
-	return db.DeleteTx(ctx, nil, id)
-}
-
-func wrapTx(ctx context.Context, tx *sql.Tx, stmt *sql.Stmt) *sql.Stmt {
-	if tx == nil {
-		return stmt
-	}
-
-	return tx.StmtContext(ctx, stmt)
-}
-
-// DeleteTx implements the ContactMethodStore interface.
-func (db *DB) DeleteTx(ctx context.Context, tx *sql.Tx, ids ...string) error {
+// Delete removes the ContactMethod from the database using the provided ID within a transaction.
+func (s *Store) Delete(ctx context.Context, dbtx gadb.DBTX, ids ...string) error {
 	err := permission.LimitCheckAny(ctx, permission.Admin, permission.User)
 	if err != nil {
 		return err
@@ -291,114 +161,87 @@ func (db *DB) DeleteTx(ctx context.Context, tx *sql.Tx, ids ...string) error {
 		return nil
 	}
 
-	err = validate.ManyUUID("ContactMethodID", ids, 50)
+	uids, err := validate.ParseManyUUID("ContactMethodID", ids, 50)
 	if err != nil {
 		return err
 	}
 
 	if permission.Admin(ctx) {
-		_, err = wrapTx(ctx, tx, db.delete).ExecContext(ctx, sqlutil.UUIDArray(ids))
+		err = gadb.New(dbtx).DeleteContactMethod(ctx, uids)
 		return err
 	}
 
-	rows, err := wrapTx(ctx, tx, db.lookupUserID).QueryContext(ctx, sqlutil.UUIDArray(ids))
+	rows, err := gadb.New(dbtx).ContactMethodLookupUserID(ctx, uids)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 
 	var checks []permission.Checker
-	var userID string
-	for rows.Next() {
-		err = rows.Scan(&userID)
-		if err != nil {
-			return err
-		}
-		checks = append(checks, permission.MatchUser(userID))
+	for _, id := range rows {
+		checks = append(checks, permission.MatchUser(id.String()))
 	}
 
 	err = permission.LimitCheckAny(ctx, checks...)
 	if err != nil {
 		return err
 	}
-	_, err = wrapTx(ctx, tx, db.delete).ExecContext(ctx, sqlutil.UUIDArray(ids))
+
+	err = gadb.New(dbtx).DeleteContactMethod(ctx, uids)
 	return err
 }
 
-// FindOneTx implements the ContactMethodStore interface.
-func (db *DB) FindOneTx(ctx context.Context, tx *sql.Tx, id string) (*ContactMethod, error) {
+// FindOneTx finds the contact method from the database using the provided ID within a transaction.
+func (s *Store) FindOne(ctx context.Context, dbtx gadb.DBTX, id uuid.UUID) (*ContactMethod, error) {
 	err := permission.LimitCheckAny(ctx, permission.All)
 	if err != nil {
 		return nil, err
 	}
-	err = validate.UUID("ContactMethodID", id)
+
+	row, err := gadb.New(dbtx).ContactMethodFindOneUpdate(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 
-	var c ContactMethod
-	row := wrapTx(ctx, tx, db.findOneUpd).QueryRowContext(ctx, id)
-	err = row.Scan(&c.ID, &c.Name, &c.Type, &c.Value, &c.Disabled, &c.UserID, &c.lastTestVerifyAt)
-	if err != nil {
-		return nil, err
+	c := ContactMethod{
+		ID:               row.ID,
+		Name:             row.Name,
+		Dest:             row.Dest.DestV1,
+		Disabled:         row.Disabled,
+		UserID:           row.UserID.String(),
+		Pending:          row.Pending,
+		StatusUpdates:    row.EnableStatusUpdates,
+		Private:          row.Private,
+		lastTestVerifyAt: row.LastTestVerifyAt,
 	}
+
 	return &c, nil
 }
 
-// FindOne implements the ContactMethodStore interface.
-func (db *DB) FindOne(ctx context.Context, id string) (*ContactMethod, error) {
-	err := validate.UUID("ContactMethodID", id)
-	if err != nil {
-		return nil, err
-	}
-
-	err = permission.LimitCheckAny(ctx, permission.All)
-	if err != nil {
-		return nil, err
-	}
-
-	var c ContactMethod
-	row := db.findOne.QueryRowContext(ctx, id)
-	err = row.Scan(&c.ID, &c.Name, &c.Type, &c.Value, &c.Disabled, &c.UserID, &c.lastTestVerifyAt)
-	if err != nil {
-		return nil, err
-	}
-	return &c, nil
-}
-
-// Update implements the ContactMethodStore interface.
-func (db *DB) Update(ctx context.Context, c *ContactMethod) error {
-	return db.UpdateTx(ctx, nil, c)
-}
-
-// UpdateTx implements the ContactMethodStore interface.
-func (db *DB) UpdateTx(ctx context.Context, tx *sql.Tx, c *ContactMethod) error {
+// UpdateTx updates the contact method with the newly provided values within a transaction.
+func (s *Store) Update(ctx context.Context, dbtx gadb.DBTX, c *ContactMethod) error {
 	err := permission.LimitCheckAny(ctx, permission.Admin, permission.User)
 	if err != nil {
 		return err
 	}
 
-	n, err := c.Normalize()
+	n, err := c.Normalize(ctx, s.reg)
 	if err != nil {
 		return err
 	}
 
-	cm, err := db.FindOneTx(ctx, tx, c.ID)
+	cm, err := s.FindOne(ctx, dbtx, c.ID)
 	if err != nil {
 		return err
 	}
-	if n.Type != cm.Type {
-		return validation.NewFieldError("Type", "cannot update type of contact method")
-	}
-	if n.Value != cm.Value {
-		return validation.NewFieldError("Value", "cannot update value of contact method")
+	if !n.Dest.Equal(cm.Dest) {
+		return validation.NewFieldError("Dest", "cannot update destination of contact method")
 	}
 	if n.UserID != cm.UserID {
 		return validation.NewFieldError("UserID", "cannot update owner of contact method")
 	}
 
 	if permission.Admin(ctx) {
-		_, err = wrapTx(ctx, tx, db.update).ExecContext(ctx, n.ID, n.Name, n.Disabled)
+		err = gadb.New(dbtx).ContactMethodUpdate(ctx, gadb.ContactMethodUpdateParams{ID: n.ID, Name: n.Name, Disabled: n.Disabled, EnableStatusUpdates: n.StatusUpdates, Private: n.Private})
 		return err
 	}
 
@@ -407,13 +250,14 @@ func (db *DB) UpdateTx(ctx context.Context, tx *sql.Tx, c *ContactMethod) error 
 		return err
 	}
 
-	_, err = wrapTx(ctx, tx, db.update).ExecContext(ctx, n.ID, n.Name, n.Disabled)
+	err = gadb.New(dbtx).ContactMethodUpdate(ctx, gadb.ContactMethodUpdateParams{ID: n.ID, Name: n.Name, Disabled: n.Disabled, EnableStatusUpdates: n.StatusUpdates, Private: n.Private})
+
 	return err
 }
 
 // FindMany will fetch all contact methods matching the given ids.
-func (db *DB) FindMany(ctx context.Context, ids []string) ([]ContactMethod, error) {
-	err := validate.ManyUUID("ContactMethodID", ids, 50)
+func (s *Store) FindMany(ctx context.Context, dbtx gadb.DBTX, ids []string) ([]ContactMethod, error) {
+	uids, err := validate.ParseManyUUID("ContactMethodID", ids, 50)
 	if err != nil {
 		return nil, err
 	}
@@ -423,32 +267,77 @@ func (db *DB) FindMany(ctx context.Context, ids []string) ([]ContactMethod, erro
 		return nil, err
 	}
 
-	rows, err := db.findMany.QueryContext(ctx, sqlutil.UUIDArray(ids))
+	rows, err := gadb.New(dbtx).ContactMethodFindMany(ctx, uids)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	return scanAll(rows)
+	cms := make([]ContactMethod, len(rows))
+	for i, row := range rows {
+		cms[i] = ContactMethod{
+			ID:               row.ID,
+			Name:             row.Name,
+			Dest:             row.Dest.DestV1,
+			Disabled:         row.Disabled,
+			UserID:           row.UserID.String(),
+			Pending:          row.Pending,
+			StatusUpdates:    row.EnableStatusUpdates,
+			Private:          row.Private,
+			lastTestVerifyAt: row.LastTestVerifyAt,
+		}
+	}
+
+	return cms, nil
 }
 
-func scanAll(rows *sql.Rows) ([]ContactMethod, error) {
-	var contactMethods []ContactMethod
-	for rows.Next() {
-		var c ContactMethod
-		err := rows.Scan(&c.ID, &c.Name, &c.Type, &c.Value, &c.Disabled, &c.UserID, &c.lastTestVerifyAt)
-		if err != nil {
-			return nil, err
+// FindAll finds all contact methods from the database associated with the given user ID along with the number of omitted (private) entries.
+func (s *Store) FindAll(ctx context.Context, dbtx gadb.DBTX, userID string) ([]ContactMethod, int, error) {
+	uid, err := validate.ParseUUID("ContactMethodID", userID)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	err = permission.LimitCheckAny(ctx, permission.All)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := gadb.New(dbtx).ContactMethodFindAll(ctx, uid)
+	if err != nil {
+		return nil, 0, err
+	}
+	authID := permission.UserNullUUID(ctx).UUID
+
+	result := make([]ContactMethod, 0, len(rows))
+	var omitted int
+	for _, row := range rows {
+		if row.Private && row.UserID != authID {
+			omitted++
+			continue
 		}
 
-		contactMethods = append(contactMethods, c)
+		result = append(result, ContactMethod{
+			ID:               row.ID,
+			Name:             row.Name,
+			Dest:             row.Dest.DestV1,
+			Disabled:         row.Disabled,
+			UserID:           row.UserID.String(),
+			Pending:          row.Pending,
+			StatusUpdates:    row.EnableStatusUpdates,
+			lastTestVerifyAt: row.LastTestVerifyAt,
+			Private:          row.Private,
+		})
 	}
-	return contactMethods, nil
+
+	return result, omitted, nil
 }
 
-// FindAll implements the ContactMethodStore interface.
-func (db *DB) FindAll(ctx context.Context, userID string) ([]ContactMethod, error) {
-	err := validate.UUID("UserID", userID)
+// FindAllByUserIDs finds all contact methods from the database associated with any of the
+// given user IDs, batched into a single query. Unlike FindAll, private contact methods are
+// not filtered here -- callers are expected to apply that check themselves, the same way
+// FindOneCM does for a single contact method.
+func (s *Store) FindAllByUserIDs(ctx context.Context, dbtx gadb.DBTX, userIDs []string) ([]ContactMethod, error) {
+	uids, err := validate.ParseManyUUID("UserID", userIDs, 100)
 	if err != nil {
 		return nil, err
 	}
@@ -458,11 +347,25 @@ func (db *DB) FindAll(ctx context.Context, userID string) ([]ContactMethod, erro
 		return nil, err
 	}
 
-	rows, err := db.findAll.QueryContext(ctx, userID)
+	rows, err := gadb.New(dbtx).ContactMethodFindAllByUserIDs(ctx, uids)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	return scanAll(rows)
+	result := make([]ContactMethod, len(rows))
+	for i, row := range rows {
+		result[i] = ContactMethod{
+			ID:               row.ID,
+			Name:             row.Name,
+			Dest:             row.Dest.DestV1,
+			Disabled:         row.Disabled,
+			UserID:           row.UserID.String(),
+			Pending:          row.Pending,
+			StatusUpdates:    row.EnableStatusUpdates,
+			lastTestVerifyAt: row.LastTestVerifyAt,
+			Private:          row.Private,
+		}
+	}
+
+	return result, nil
 }

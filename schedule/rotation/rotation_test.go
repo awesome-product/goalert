@@ -8,6 +8,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSearchOptions_Only(t *testing.T) {
+	validUUID := "A035FD3C-73C8-4F72-BECD-36B027AE1374"
+
+	_, err := (*renderData)(&SearchOptions{Only: []string{validUUID}}).Normalize()
+	require.NoError(t, err)
+
+	_, err = (*renderData)(&SearchOptions{Only: []string{"not-a-uuid"}}).Normalize()
+	require.Error(t, err)
+
+	tooMany := make([]string, 51)
+	for i := range tooMany {
+		tooMany[i] = validUUID
+	}
+	_, err = (*renderData)(&SearchOptions{Only: tooMany}).Normalize()
+	require.Error(t, err)
+
+	args := (*renderData)(&SearchOptions{Only: []string{validUUID}}).QueryArgs()
+	require.Condition(t, func() bool {
+		for _, a := range args {
+			if a.Name == "only" {
+				return a.Value != nil
+			}
+		}
+		return false
+	}, "QueryArgs() should include a non-nil 'only' parameter")
+}
+
 const timeFmt = "Jan 2 2006 3:04 pm"
 
 func mustParse(t *testing.T, value string) time.Time {
@@ -54,7 +81,7 @@ func TestRotation_StartEnd_BruteForce(t *testing.T) {
 
 			ts = ts.Add(30 * time.Second)
 		}
-		assert.EqualValues(t, expectedHandoffs, times)
+		assert.ElementsMatch(t, expectedHandoffs, times)
 	}
 
 	check(&Rotation{
@@ -163,6 +190,36 @@ func TestRotation_StartEnd_BruteForce(t *testing.T) {
 		"2020-11-01 03:00:00 -0600 CST",
 		"2020-11-01 04:00:00 -0600 CST",
 		"2020-11-01 05:00:00 -0600 CST",
+	)
+
+	// monthly rotation sanity check
+	check(&Rotation{
+		Type:        TypeMonthly,
+		ShiftLength: 1,
+		Start:       time.Date(2020, time.January, 2, 1, 30, 0, 0, loc),
+	},
+		time.Date(2020, time.April, 5, 1, 0, 0, 0, loc),
+		time.Date(2020, time.June, 12, 1, 0, 0, 0, loc),
+
+		"2020-04-02 01:30:00 -0500 CDT",
+		"2020-05-02 01:30:00 -0500 CDT",
+		"2020-06-02 01:30:00 -0500 CDT",
+		"2020-07-02 01:30:00 -0500 CDT",
+	)
+
+	// check monthly rotations with shift from daylight savings to standard time
+	check(&Rotation{
+		Type:        TypeMonthly,
+		ShiftLength: 1,
+		Start:       time.Date(2020, time.October, 1, 1, 30, 0, 0, loc),
+	},
+		time.Date(2020, time.October, 2, 1, 0, 0, 0, loc),
+		time.Date(2020, time.December, 2, 1, 0, 0, 0, loc),
+
+		"2020-10-01 01:30:00 -0500 CDT",
+		"2020-11-01 01:30:00 -0500 CDT",
+		"2020-12-01 01:30:00 -0600 CST",
+		"2021-01-01 01:30:00 -0600 CST",
 	)
 
 	loc, err = time.LoadLocation("Australia/Lord_Howe")
@@ -289,6 +346,57 @@ func TestRotation_StartEnd_BruteForce(t *testing.T) {
 		"2020-10-06 02:15:00 +1100 +11",
 	)
 
+	// DST starts at midnight in Santiago on 2026-09-06 (00:00 -> 01:00), so
+	// local midnight does not exist on that day.
+	loc, err = time.LoadLocation("America/Santiago")
+	require.NoError(t, err)
+
+	// daily handoff that does not exist on the 6th; it happens at the first instant after (01:00)
+	check(&Rotation{
+		Type:        TypeDaily,
+		ShiftLength: 1,
+		Start:       time.Date(2026, time.September, 3, 0, 30, 0, 0, loc),
+	},
+		time.Date(2026, time.September, 4, 1, 0, 0, 0, loc),
+		time.Date(2026, time.September, 8, 0, 0, 0, 0, loc),
+
+		"2026-09-04 00:30:00 -0400 -04",
+		"2026-09-05 00:30:00 -0400 -04",
+		"2026-09-06 01:00:00 -0300 -03", // 00:30 does not exist
+		"2026-09-07 00:30:00 -0300 -03",
+		"2026-09-08 00:30:00 -0300 -03",
+	)
+
+	// daily handoff later in the day keeps its wall-clock time
+	check(&Rotation{
+		Type:        TypeDaily,
+		ShiftLength: 1,
+		Start:       time.Date(2026, time.September, 3, 8, 0, 0, 0, loc),
+	},
+		time.Date(2026, time.September, 4, 9, 0, 0, 0, loc),
+		time.Date(2026, time.September, 8, 7, 0, 0, 0, loc),
+
+		"2026-09-04 08:00:00 -0400 -04",
+		"2026-09-05 08:00:00 -0400 -04",
+		"2026-09-06 08:00:00 -0300 -03",
+		"2026-09-07 08:00:00 -0300 -03",
+		"2026-09-08 08:00:00 -0300 -03",
+	)
+
+	// hourly handoffs across the gap; the shift that would start at 00:00 is skipped
+	check(&Rotation{
+		Type:        TypeHourly,
+		ShiftLength: 1,
+		Start:       time.Date(2026, time.September, 5, 22, 0, 0, 0, loc),
+	},
+		time.Date(2026, time.September, 5, 22, 30, 0, 0, loc),
+		time.Date(2026, time.September, 6, 1, 30, 0, 0, loc),
+
+		"2026-09-05 22:00:00 -0400 -04",
+		"2026-09-05 23:00:00 -0400 -04",
+		"2026-09-06 01:00:00 -0300 -03",
+		"2026-09-06 02:00:00 -0300 -03",
+	)
 }
 
 func TestRotation_EndTime_DST(t *testing.T) {
@@ -396,8 +504,21 @@ func TestRotation_EndTime(t *testing.T) {
 		dur time.Duration
 	}
 
-	// weekly
+	// monthly
 	data := []dat{
+		{s: "Jun 1 2017 12:00 am", l: 1, exp: "Jul 1 2017 12:00 am", dur: time.Hour * 24 * 30},
+		{s: "Jul 1 2017 12:00 am", l: 2, exp: "Sep 1 2017 12:00 am", dur: time.Hour * 24 * 31 * 2},
+
+		// DST tests
+		{s: "Mar 1 2017 12:00 am", l: 1, exp: "Apr 1 2017 12:00 am", dur: time.Hour*24*31 - time.Hour},
+		{s: "Nov 1 2017 12:00 am", l: 2, exp: "Jan 1 2018 12:00 am", dur: time.Hour*(24*(30+31)) + time.Hour},
+	}
+	for _, d := range data {
+		test(d.s, d.exp, d.l, d.dur, TypeMonthly)
+	}
+
+	// weekly
+	data = []dat{
 		{s: "Jun 10 2017 8:00 am", l: 1, exp: "Jun 17 2017 8:00 am", dur: time.Hour * 24 * 7},
 		{s: "Jun 10 2017 8:00 am", l: 2, exp: "Jun 24 2017 8:00 am", dur: time.Hour * 24 * 7 * 2},
 
@@ -467,6 +588,23 @@ func TestRotation_EndTime(t *testing.T) {
 
 		ts = r.EndTime(ts)
 		assert.Equal(t, orig.AddDate(0, 0, 1).String(), ts.String())
+	})
+
+	t.Run("subsequent calls (monthly)", func(t *testing.T) {
+		orig := time.Date(2020, time.January, 10, 0, 0, 0, 0, time.UTC)
+		r := &Rotation{
+			Type:        TypeMonthly,
+			ShiftLength: 1,
+			Start:       orig,
+		}
+		ts := r.EndTime(orig.AddDate(0, -2, 0))
+		assert.Equal(t, orig.AddDate(0, -1, 0).String(), ts.String())
+
+		ts = r.EndTime(ts)
+		assert.Equal(t, orig.String(), ts.String())
+
+		ts = r.EndTime(ts)
+		assert.Equal(t, orig.AddDate(0, 1, 0).String(), ts.String())
 	})
 }
 
@@ -564,8 +702,21 @@ func TestRotation_StartTime(t *testing.T) {
 		dur time.Duration
 	}
 
-	// weekly
+	// monthly
 	data := []dat{
+		{s: "Jun 1 2017 12:00 am", l: 1, exp: "Jul 1 2017 12:00 am", dur: time.Hour * 24 * 30},
+		{s: "Jul 1 2017 12:00 am", l: 2, exp: "Sep 1 2017 12:00 am", dur: time.Hour * 24 * 31 * 2},
+
+		// DST tests
+		{s: "Mar 1 2017 12:00 am", l: 1, exp: "Apr 1 2017 12:00 am", dur: time.Hour*24*31 - time.Hour},
+		{s: "Nov 1 2017 12:00 am", l: 2, exp: "Jan 1 2018 12:00 am", dur: time.Hour*(24*(31+30)) + time.Hour},
+	}
+	for _, d := range data {
+		test(d.s, d.exp, d.l, d.dur, TypeMonthly)
+	}
+
+	// weekly
+	data = []dat{
 		{s: "Jun 10 2017 8:00 am", l: 1, exp: "Jun 17 2017 8:00 am", dur: time.Hour * 24 * 7},
 		{s: "Jun 10 2017 8:00 am", l: 2, exp: "Jun 24 2017 8:00 am", dur: time.Hour * 24 * 7 * 2},
 

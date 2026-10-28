@@ -2,27 +2,40 @@
 
 GoAlert provides on-call scheduling, automated escalations and notifications (like SMS or voice calls) to automatically engage the right person, the right way, and at the right time.
 
-![image](https://user-images.githubusercontent.com/11381794/78996595-889b7400-7b0a-11ea-90e9-dd10b0116b1a.png)
+![main-screen-updated](https://user-images.githubusercontent.com/595010/189744659-66ee6aed-b7b6-4625-a2ac-1f8ad3c1ea4f.png)
 
 ## Installation
 
 GoAlert is distributed as a single binary with release notes available from the [GitHub Releases](https://github.com/target/goalert/releases) page.
+Additionally, images are published on [Docker Hub](https://hub.docker.com/r/goalert/goalert) for each release. The `latest` tag is the most recent release, and `nightly` is the latest build from the `master` branch.
 
 See our [Getting Started Guide](./docs/getting-started.md) for running GoAlert in a production environment.
 
 ### Quick Start
 
 ```bash
-docker run -it --rm -p 8081:8081 goalert/all-in-one-demo
+docker run -it --rm -p 8081:8081 goalert/demo
 ```
 
-GoAlert will be running at [localhost:8081](http://localhost:8081). You can login with `admin/admin123`.
+GoAlert will be running at [localhost:8081](http://localhost:8081). You can log in with `admin`/`admin123`.
 
-## Contributing
+If you're using the demo container for integration testing:
+
+- A non-admin user is available as `user`/`user1234`.
+- You can specify the ENV variable `SKIP_SEED=1` to skip the initial seed data step.
+- You can get a session token via `curl -XPOST -H 'Referer: http://localhost:8081' -d 'username=admin&password=admin123' 'http://localhost:8081/api/v2/identity/providers/basic?noRedirect=1'`.
+
+## Contributing (Local Development)
 
 If you'd like to contribute to GoAlert, please see our [Contributing Guidelines](./CONTRIBUTING.md) and the [Development Setup Guide](./docs/development-setup.md).
 
-Please also see our [Code of Conduct](./CODE_OF_CONDUCT.md).
+Please also see our [Code of Conduct](https://github.com/target/.github/blob/main/CODE_OF_CONDUCT.md).
+
+For most purposes, you can use `make start` from the root of this repo to start a development server.
+
+- It will be running at `http://localhost:3030`
+- Default login is `admin`/`admin123`
+- Changes you make locally, UI and backend, should be reflected in the running server within a few seconds (no need to restart the server).
 
 ## Contact Us
 

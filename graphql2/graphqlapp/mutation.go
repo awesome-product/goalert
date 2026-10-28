@@ -3,14 +3,19 @@ package graphqlapp
 import (
 	context "context"
 	"database/sql"
-	"fmt"
+	"encoding/json"
+	"time"
 
 	"github.com/target/goalert/assignment"
+	"github.com/target/goalert/expflag"
+	"github.com/target/goalert/gadb"
 	"github.com/target/goalert/graphql2"
-	"github.com/target/goalert/notificationchannel"
+	"github.com/target/goalert/keyring"
 	"github.com/target/goalert/permission"
+	"github.com/target/goalert/retry"
 	"github.com/target/goalert/schedule"
 	"github.com/target/goalert/user"
+	"github.com/target/goalert/util/sqlutil"
 	"github.com/target/goalert/validation"
 	"github.com/target/goalert/validation/validate"
 
@@ -21,18 +26,74 @@ type Mutation App
 
 func (a *App) Mutation() graphql2.MutationResolver { return (*Mutation)(a) }
 
+func (a *Mutation) ReEncryptKeyringsAndConfig(ctx context.Context) (bool, error) {
+	err := permission.LimitCheckAny(ctx, permission.Admin)
+	if err != nil {
+		return false, err
+	}
+
+	err = keyring.ReEncryptAll(ctx, a.DB, a.EncryptionKeys)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func (a *Mutation) SendSignal(ctx context.Context, input graphql2.SendSignalInput) (bool, error) {
+	err := permission.LimitCheckAny(ctx, permission.User)
+	if err != nil {
+		return false, err
+	}
+
+	if !expflag.ContextHas(ctx, expflag.UnivKeys) {
+		return false, errors.New("feature not enabled")
+	}
+
+	svcID, err := validate.ParseUUID("ServiceID", input.ServiceID)
+	if err != nil {
+		return false, err
+	}
+
+	destID, err := a.NCStore.MapDestToID(ctx, a.DB, *input.Dest)
+	if err != nil {
+		return false, err
+	}
+
+	data, err := json.Marshal(input.Params)
+	if err != nil {
+		return false, err
+	}
+
+	err = gadb.New(a.DB).IntKeyInsertSignalMessage(ctx, gadb.IntKeyInsertSignalMessageParams{
+		DestID:    destID,
+		ServiceID: svcID,
+		Params:    data,
+	})
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
 func (a *Mutation) SetFavorite(ctx context.Context, input graphql2.SetFavoriteInput) (bool, error) {
 	var err error
 	if input.Favorite {
-		err = a.FavoriteStore.Set(ctx, permission.UserID(ctx), input.Target)
+		err = a.FavoriteStore.Set(ctx, a.DB, permission.UserID(ctx), input.Target)
 	} else {
-		err = a.FavoriteStore.Unset(ctx, permission.UserID(ctx), input.Target)
+		err = a.FavoriteStore.Unset(ctx, a.DB, permission.UserID(ctx), input.Target)
 	}
 
 	if err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+func (a *Mutation) LinkAccount(ctx context.Context, token string) (bool, error) {
+	err := a.AuthLinkStore.LinkAccount(ctx, token)
+	return err == nil, err
 }
 
 func (a *Mutation) SetScheduleOnCallNotificationRules(ctx context.Context, input graphql2.SetScheduleOnCallNotificationRulesInput) (bool, error) {
@@ -43,25 +104,22 @@ func (a *Mutation) SetScheduleOnCallNotificationRules(ctx context.Context, input
 
 	err = withContextTx(ctx, a.DB, func(ctx context.Context, tx *sql.Tx) error {
 		rules := make([]schedule.OnCallNotificationRule, 0, len(input.Rules))
-		for i, r := range input.Rules {
-			err := validate.OneOf(fmt.Sprintf("Rules[%d].Target.Type", i), r.Target.Type, assignment.TargetTypeSlackChannel)
+		for _, r := range input.Rules {
+			info, err := a.DestReg.TypeInfo(ctx, r.Dest.Type)
+			if err != nil {
+				return err
+			}
+			if !info.IsSchedOnCallNotify() {
+				return validation.NewFieldError("Rules[%d].Dest.Type", "unsupported destination type")
+			}
+
+			// MapDestToID handles the appropriate validation checks, outside of the IsSchedOnCallNotify check done above.
+			chID, err := a.NCStore.MapDestToID(ctx, tx, r.Dest)
 			if err != nil {
 				return err
 			}
 
-			ch, err := a.SlackStore.Channel(ctx, r.Target.ID)
-			if err != nil {
-				return err
-			}
-
-			r.ChannelID, err = a.NCStore.MapToID(ctx, tx, &notificationchannel.Channel{
-				Type:  notificationchannel.TypeSlack,
-				Name:  ch.Name,
-				Value: ch.ID,
-			})
-			if err != nil {
-				return err
-			}
+			r.ChannelID = chID
 			rules = append(rules, r.OnCallNotificationRule)
 		}
 
@@ -77,16 +135,34 @@ func (a *Mutation) SetTemporarySchedule(ctx context.Context, input graphql2.SetT
 		return false, err
 	}
 
+	tmp := schedule.TemporarySchedule{
+		Start:  input.Start,
+		End:    input.End,
+		Shifts: input.Shifts,
+	}
+
+	var clearSet bool
+	if input.ClearStart != nil || input.ClearEnd != nil {
+		if input.ClearStart == nil {
+			return false, validation.NewFieldError("ClearStart", "must be set if ClearEnd is set")
+		}
+		if input.ClearEnd == nil {
+			return false, validation.NewFieldError("ClearEnd", "must be set if ClearStart is set")
+		}
+		clearSet = true
+	}
+
 	err = withContextTx(ctx, a.DB, func(ctx context.Context, tx *sql.Tx) error {
-		return a.ScheduleStore.SetTemporarySchedule(ctx, tx, schedID, schedule.TemporarySchedule{
-			Start:  input.Start,
-			End:    input.End,
-			Shifts: input.Shifts,
-		})
+		if clearSet {
+			return a.ScheduleStore.SetClearTemporarySchedule(ctx, tx, schedID, tmp, *input.ClearStart, *input.ClearEnd)
+		}
+
+		return a.ScheduleStore.SetTemporarySchedule(ctx, tx, schedID, tmp)
 	})
 
 	return err == nil, err
 }
+
 func (a *Mutation) ClearTemporarySchedules(ctx context.Context, input graphql2.ClearTemporarySchedulesInput) (bool, error) {
 	schedID, err := parseUUID("ScheduleID", input.ScheduleID)
 	if err != nil {
@@ -134,11 +210,25 @@ func (a *Mutation) EndAllAuthSessionsByCurrentUser(ctx context.Context) (bool, e
 }
 
 func (a *Mutation) DeleteAll(ctx context.Context, input []assignment.RawTarget) (bool, error) {
+	// Retry because deleting frequently can cause a deadlock
+	// under heavy load.
+	err := retry.DoTemporaryError(func(int) error {
+		return a.tryDeleteAll(ctx, input)
+	},
+		retry.Log(ctx),
+		retry.Limit(5),
+		retry.FibBackoff(time.Second),
+	)
+
+	return err == nil, err
+}
+
+func (a *Mutation) tryDeleteAll(ctx context.Context, input []assignment.RawTarget) error {
 	tx, err := a.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return err
 	}
-	defer tx.Rollback()
+	defer sqlutil.Rollback(ctx, "graphql: delete all", tx)
 
 	m := make(map[assignment.TargetType][]string)
 	for _, tgt := range input {
@@ -175,7 +265,7 @@ func (a *Mutation) DeleteAll(ctx context.Context, input []assignment.RawTarget) 
 		case assignment.TargetTypeEscalationPolicy:
 			err = errors.Wrap(a.PolicyStore.DeleteManyPoliciesTx(ctx, tx, ids), "delete escalation policies")
 		case assignment.TargetTypeIntegrationKey:
-			err = errors.Wrap(a.IntKeyStore.DeleteManyTx(ctx, tx, ids), "delete integration keys")
+			err = errors.Wrap(a.IntKeyStore.DeleteMany(ctx, tx, ids), "delete integration keys")
 		case assignment.TargetTypeSchedule:
 			err = errors.Wrap(a.ScheduleStore.DeleteManyTx(ctx, tx, ids), "delete schedules")
 		case assignment.TargetTypeCalendarSubscription:
@@ -183,7 +273,7 @@ func (a *Mutation) DeleteAll(ctx context.Context, input []assignment.RawTarget) 
 		case assignment.TargetTypeRotation:
 			err = errors.Wrap(a.RotationStore.DeleteManyTx(ctx, tx, ids), "delete rotations")
 		case assignment.TargetTypeContactMethod:
-			err = errors.Wrap(a.CMStore.DeleteTx(ctx, tx, ids...), "delete contact methods")
+			err = errors.Wrap(a.CMStore.Delete(ctx, tx, ids...), "delete contact methods")
 		case assignment.TargetTypeNotificationRule:
 			err = errors.Wrap(a.NRStore.DeleteTx(ctx, tx, ids...), "delete notification rules")
 		case assignment.TargetTypeHeartbeatMonitor:
@@ -191,17 +281,17 @@ func (a *Mutation) DeleteAll(ctx context.Context, input []assignment.RawTarget) 
 		case assignment.TargetTypeUserSession:
 			err = errors.Wrap(a.AuthHandler.EndUserSessionTx(ctx, tx, ids...), "end user sessions")
 		default:
-			return false, validation.NewFieldError("type", "unsupported type "+typ.String())
+			return validation.NewFieldError("type", "unsupported type "+typ.String())
 		}
 		if err != nil {
-			return false, err
+			return err
 		}
 	}
 
 	err = tx.Commit()
 	if err != nil {
-		return false, err
+		return err
 	}
 
-	return true, nil
+	return nil
 }

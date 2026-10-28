@@ -1,34 +1,65 @@
 package graphqlapp
 
 import (
-	context "context"
+	"context"
+	"database/sql"
+	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"github.com/target/goalert/alert"
-	alertlog "github.com/target/goalert/alert/log"
+	"github.com/target/goalert/alert/alertlog"
+	"github.com/target/goalert/alert/alertmetrics"
 	"github.com/target/goalert/assignment"
+	"github.com/target/goalert/gadb"
 	"github.com/target/goalert/graphql2"
 	"github.com/target/goalert/notification"
 	"github.com/target/goalert/permission"
 	"github.com/target/goalert/search"
 	"github.com/target/goalert/service"
+	"github.com/target/goalert/util/log"
+	"github.com/target/goalert/util/timeutil"
+	"github.com/target/goalert/validation"
 	"github.com/target/goalert/validation/validate"
 )
 
-type Alert App
-type AlertLogEntry App
-type AlertLogEntryState App
+type (
+	Alert              App
+	AlertMetric        App
+	AlertLogEntry      App
+	AlertLogEntryState App
+)
 
-func (a *App) Alert() graphql2.AlertResolver { return (*Alert)(a) }
-
+func (a *App) Alert() graphql2.AlertResolver                 { return (*Alert)(a) }
+func (a *App) AlertMetric() graphql2.AlertMetricResolver     { return (*AlertMetric)(a) }
 func (a *App) AlertLogEntry() graphql2.AlertLogEntryResolver { return (*AlertLogEntry)(a) }
+
+func (a *AlertLogEntry) MessageID(ctx context.Context, obj *alertlog.Entry) (*string, error) {
+	id := obj.MessageID(ctx)
+	if id == "" {
+		return nil, nil
+	}
+
+	return &id, nil
+}
 
 func (a *AlertLogEntry) ID(ctx context.Context, obj *alertlog.Entry) (int, error) {
 	e := *obj
 	return e.ID(), nil
+}
+
+func (a *AlertMetric) TimeToAck(ctx context.Context, obj *alertmetrics.Metric) (*timeutil.ISODuration, error) {
+	dur := timeutil.ISODurationFromTime(obj.TimeToAck)
+	return &dur, nil
+}
+
+func (a *AlertMetric) TimeToClose(ctx context.Context, obj *alertmetrics.Metric) (*timeutil.ISODuration, error) {
+	dur := timeutil.ISODurationFromTime(obj.TimeToClose)
+	return &dur, nil
 }
 
 func (a *AlertLogEntry) Timestamp(ctx context.Context, obj *alertlog.Entry) (*time.Time, error) {
@@ -39,10 +70,10 @@ func (a *AlertLogEntry) Timestamp(ctx context.Context, obj *alertlog.Entry) (*ti
 
 func (a *AlertLogEntry) Message(ctx context.Context, obj *alertlog.Entry) (string, error) {
 	e := *obj
-	return e.String(), nil
+	return e.String(ctx), nil
 }
 
-func notificationStateFromStatus(s notification.Status) *graphql2.NotificationState {
+func notificationStateFromSendResult(s notification.Status, formattedSrc string) *graphql2.NotificationState {
 	var status graphql2.NotificationStatus
 	switch s.State {
 	case notification.StateFailedTemp, notification.StateFailedPerm:
@@ -61,6 +92,8 @@ func notificationStateFromStatus(s notification.Status) *graphql2.NotificationSt
 		prefix = "Sent"
 	case notification.StateDelivered:
 		prefix = "Delivered"
+	case notification.StateRead:
+		prefix = "Read"
 	case notification.StateFailedTemp, notification.StateFailedPerm:
 		prefix = "Failed"
 	default:
@@ -74,15 +107,36 @@ func notificationStateFromStatus(s notification.Status) *graphql2.NotificationSt
 		details = prefix + ": " + details
 	}
 
-	return &graphql2.NotificationState{
-		Details: details,
-		Status:  &status,
+	if s.Age >= 2*time.Minute {
+		details += fmt.Sprintf(" (after %s)", friendlyDuration(s.Age.Truncate(time.Minute)))
 	}
+
+	return &graphql2.NotificationState{
+		Details:           details,
+		Status:            &status,
+		FormattedSrcValue: formattedSrc,
+	}
+}
+
+func friendlyDuration(dur time.Duration) string {
+	var parts []string
+	hr := dur / time.Hour
+	if hr > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hr))
+		dur -= hr * time.Hour
+	}
+	min := dur / time.Minute
+	if min > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", min))
+	}
+
+	return strings.Join(parts, " ")
 }
 
 func (a *AlertLogEntry) escalationState(ctx context.Context, obj *alertlog.Entry) (*graphql2.NotificationState, error) {
 	e := *obj
-	meta, ok := e.Meta().(*alertlog.EscalationMetaData)
+
+	meta, ok := e.Meta(ctx).(*alertlog.EscalationMetaData)
 	if !ok || meta == nil || !meta.NoOneOnCall {
 		return nil, nil
 	}
@@ -96,7 +150,7 @@ func (a *AlertLogEntry) escalationState(ctx context.Context, obj *alertlog.Entry
 
 func (a *AlertLogEntry) notificationSentState(ctx context.Context, obj *alertlog.Entry) (*graphql2.NotificationState, error) {
 	e := *obj
-	meta, ok := e.Meta().(*alertlog.NotificationMetaData)
+	meta, ok := e.Meta(ctx).(*alertlog.NotificationMetaData)
 	if !ok || meta == nil {
 		return nil, nil
 	}
@@ -109,12 +163,12 @@ func (a *AlertLogEntry) notificationSentState(ctx context.Context, obj *alertlog
 		return nil, nil
 	}
 
-	return notificationStateFromStatus(*s), nil
+	return notificationStateFromSendResult(s.Status, s.SrcValue), nil
 }
 
 func (a *AlertLogEntry) createdState(ctx context.Context, obj *alertlog.Entry) (*graphql2.NotificationState, error) {
 	e := *obj
-	meta, ok := e.Meta().(*alertlog.CreatedMetaData)
+	meta, ok := e.Meta(ctx).(*alertlog.CreatedMetaData)
 	if !ok || meta == nil || !meta.EPNoSteps {
 		return nil, nil
 	}
@@ -146,7 +200,7 @@ func (q *Query) Alert(ctx context.Context, alertID int) (*alert.Alert, error) {
  * Merges favorites and user-specified serviceIDs in opts.FilterByServiceID
  */
 func (q *Query) mergeFavorites(ctx context.Context, svcs []string) ([]string, error) {
-	targets, err := q.FavoriteStore.FindAll(ctx, permission.UserID(ctx), []assignment.TargetType{assignment.TargetTypeService})
+	targets, err := q.FavoriteStore.FindAll(ctx, q.DB, permission.UserID(ctx), []assignment.TargetType{assignment.TargetTypeService})
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +252,7 @@ func (q *Query) Alerts(ctx context.Context, opts *graphql2.AlertSearchOptions) (
 
 	err = validate.Many(
 		validate.Range("ServiceIDs", len(opts.FilterByServiceID), 0, 50),
-		validate.Range("First", s.Limit, 1, 100),
+		validate.Range("First", s.Limit, 1, 1000),
 	)
 	if err != nil {
 		return nil, err
@@ -252,6 +306,12 @@ func (q *Query) Alerts(ctx context.Context, opts *graphql2.AlertSearchOptions) (
 		if opts.NotCreatedBefore != nil {
 			s.NotBefore = *opts.NotCreatedBefore
 		}
+		if opts.ClosedBefore != nil {
+			s.ClosedBefore = *opts.ClosedBefore
+		}
+		if opts.NotClosedBefore != nil {
+			s.NotClosedBefore = *opts.NotClosedBefore
+		}
 	}
 
 	s.Limit++
@@ -285,6 +345,7 @@ func (q *Query) Alerts(ctx context.Context, opts *graphql2.AlertSearchOptions) (
 func (a *Alert) ID(ctx context.Context, raw *alert.Alert) (string, error) {
 	return strconv.Itoa(raw.ID), nil
 }
+
 func (a *Alert) Status(ctx context.Context, raw *alert.Alert) (graphql2.AlertStatus, error) {
 	switch raw.Status {
 	case alert.StatusTriggered:
@@ -296,6 +357,7 @@ func (a *Alert) Status(ctx context.Context, raw *alert.Alert) (graphql2.AlertSta
 	}
 	return "", errors.New("unknown alert status " + string(raw.Status))
 }
+
 func (a *Alert) AlertID(ctx context.Context, raw *alert.Alert) (int, error) {
 	return raw.ID, nil
 }
@@ -306,6 +368,30 @@ func (a *Alert) State(ctx context.Context, raw *alert.Alert) (*alert.State, erro
 
 func (a *Alert) Service(ctx context.Context, raw *alert.Alert) (*service.Service, error) {
 	return (*App)(a).FindOneService(ctx, raw.ServiceID)
+}
+
+func (a *Alert) Metrics(ctx context.Context, raw *alert.Alert) (*alertmetrics.Metric, error) {
+	return (*App)(a).FindOneAlertMetric(ctx, raw.ID)
+}
+
+func (m *Mutation) CloseMatchingAlert(ctx context.Context, input graphql2.CloseMatchingAlertInput) (bool, error) {
+	a := &alert.Alert{
+		ServiceID: input.ServiceID,
+		Status:    alert.StatusClosed,
+	}
+
+	if input.Summary != nil {
+		a.Summary = validate.SanitizeText(*input.Summary, alert.MaxSummaryLength)
+	}
+	if input.Details != nil {
+		a.Details = validate.SanitizeText(*input.Details, alert.MaxDetailsLength)
+	}
+	if input.Dedup != nil {
+		a.Dedup = alert.NewUserDedup(*input.Dedup)
+	}
+
+	a, _, err := m.AlertStore.CreateOrUpdate(ctx, a)
+	return a != nil, err
 }
 
 func (m *Mutation) CreateAlert(ctx context.Context, input graphql2.CreateAlertInput) (*alert.Alert, error) {
@@ -325,16 +411,81 @@ func (m *Mutation) CreateAlert(ctx context.Context, input graphql2.CreateAlertIn
 		a.Details = validate.SanitizeText(a.Details, alert.MaxDetailsLength)
 	}
 
-	return m.AlertStore.Create(ctx, a)
+	if input.Dedup != nil {
+		a.Dedup = alert.NewUserDedup(*input.Dedup)
+	}
+
+	var meta map[string]string
+	if input.Meta != nil {
+		meta = make(map[string]string, len(input.Meta))
+		for _, m := range input.Meta {
+			meta[m.Key] = m.Value
+		}
+
+		// early validation of metadata, not required, but prevents starting a transaction and holding the service lock if we know metadata is invalid
+		err := alert.ValidateMetadata(meta)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var newAlert *alert.Alert
+	err := withContextTx(ctx, m.DB, func(ctx context.Context, tx *sql.Tx) error {
+		var err error
+		newAlert, err = m.AlertStore.CreateTx(ctx, tx, a)
+		if err != nil {
+			return err
+		}
+
+		if meta != nil {
+			err = m.AlertStore.SetMetadataTx(ctx, tx, newAlert.ID, meta)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return newAlert, nil
+}
+
+func (a *Alert) NoiseReason(ctx context.Context, raw *alert.Alert) (*string, error) {
+	am, err := (*App)(a).FindOneAlertFeedback(ctx, raw.ID)
+	if err != nil {
+		return nil, err
+	}
+	if am == nil {
+		return nil, nil
+	}
+	if am.NoiseReason == "" {
+		return nil, nil
+	}
+	return &am.NoiseReason, nil
+}
+
+func (m *Mutation) SetAlertNoiseReason(ctx context.Context, input graphql2.SetAlertNoiseReasonInput) (bool, error) {
+	err := m.AlertStore.UpdateFeedback(ctx, &alert.Feedback{
+		ID:          input.AlertID,
+		NoiseReason: input.NoiseReason,
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (a *Alert) RecentEvents(ctx context.Context, obj *alert.Alert, opts *graphql2.AlertRecentEventsOptions) (*graphql2.AlertLogEntryConnection, error) {
+	return (*App)(a).RecentAlertEvents(ctx, opts, alertlog.SearchOptions{FilterAlertIDs: []int{obj.ID}})
+}
+
+func (a *App) RecentAlertEvents(ctx context.Context, opts *graphql2.AlertRecentEventsOptions, s alertlog.SearchOptions) (*graphql2.AlertLogEntryConnection, error) {
 	if opts == nil {
 		opts = new(graphql2.AlertRecentEventsOptions)
 	}
-
-	var s alertlog.SearchOptions
-	s.FilterAlertIDs = append(s.FilterAlertIDs, obj.ID)
 
 	if opts.After != nil && *opts.After != "" {
 		err := search.ParseCursor(*opts.After, &s)
@@ -349,6 +500,7 @@ func (a *Alert) RecentEvents(ctx context.Context, obj *alert.Alert, opts *graphq
 	if s.Limit == 0 {
 		s.Limit = search.DefaultMaxResults
 	}
+	s.Since = opts.Since
 
 	s.Limit++
 
@@ -375,6 +527,69 @@ func (a *Alert) RecentEvents(ctx context.Context, obj *alert.Alert, opts *graphq
 	return conn, err
 }
 
+// PendingNotifications returns a list of notifications that are waiting to be sent
+func (a *Alert) PendingNotifications(ctx context.Context, obj *alert.Alert) ([]graphql2.AlertPendingNotification, error) {
+	err := permission.LimitCheckAny(ctx, permission.User)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := gadb.New(a.DB).AllPendingMsgDests(ctx, gadb.AllPendingMsgDestsParams{
+		AlertID:   int64(obj.ID),
+		ServiceID: uuid.MustParse(obj.ServiceID),
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var result []graphql2.AlertPendingNotification
+	for _, r := range rows {
+		switch {
+		case r.CmDest.Valid && r.UserName.Valid:
+			typeInfo, err := a.DestReg.TypeInfo(ctx, r.CmDest.DestV1.Type)
+			if err != nil {
+				log.Log(ctx, errors.Wrap(err, "lookup type info"))
+				result = append(result, graphql2.AlertPendingNotification{
+					Destination: fmt.Sprintf("%s (unknown)", r.UserName.String),
+				})
+				break
+			}
+
+			result = append(result, graphql2.AlertPendingNotification{
+				Destination: fmt.Sprintf("%s (%s)", r.UserName.String, typeInfo.Name),
+			})
+		case r.NcName.Valid && r.NcDest.Valid:
+			typeInfo, err := a.DestReg.TypeInfo(ctx, r.NcDest.DestV1.Type)
+			if err != nil {
+				log.Log(ctx, errors.Wrap(err, "lookup type info"))
+				result = append(result, graphql2.AlertPendingNotification{
+					Destination: fmt.Sprintf("%s (unknown)", r.NcName.String),
+				})
+				break
+			}
+			dispInfo, err := a.DestReg.DisplayInfo(ctx, r.NcDest.DestV1)
+			if err != nil {
+				log.Log(ctx, errors.Wrap(err, "lookup display info"))
+				result = append(result, graphql2.AlertPendingNotification{
+					Destination: fmt.Sprintf("unknown (%s)", typeInfo.Name),
+				})
+				break
+			}
+
+			result = append(result, graphql2.AlertPendingNotification{
+				Destination: fmt.Sprintf("%s (%s)", dispInfo.Text, typeInfo.Name),
+			})
+		default:
+			log.Debugf(ctx, "unknown destination type for pending notification for alert %d", obj.ID)
+		}
+	}
+
+	return result, nil
+}
+
 func (m *Mutation) EscalateAlerts(ctx context.Context, ids []int) ([]alert.Alert, error) {
 	ids, err := m.AlertStore.EscalateMany(ctx, ids)
 	if err != nil {
@@ -385,24 +600,37 @@ func (m *Mutation) EscalateAlerts(ctx context.Context, ids []int) ([]alert.Alert
 }
 
 func (m *Mutation) UpdateAlerts(ctx context.Context, args graphql2.UpdateAlertsInput) ([]alert.Alert, error) {
-	var status alert.Status
-
-	err := validate.OneOf("Status", args.NewStatus, graphql2.AlertStatusStatusAcknowledged, graphql2.AlertStatusStatusClosed)
-	if err != nil {
-		return nil, err
-	}
-
-	switch args.NewStatus {
-	case graphql2.AlertStatusStatusAcknowledged:
-		status = alert.StatusActive
-	case graphql2.AlertStatusStatusClosed:
-		status = alert.StatusClosed
+	if args.NewStatus != nil && args.NoiseReason != nil {
+		return nil, validation.NewGenericError("cannot set both 'newStatus' and 'noiseReason'")
 	}
 
 	var updatedIDs []int
-	updatedIDs, err = m.AlertStore.UpdateManyAlertStatus(ctx, status, args.AlertIDs)
-	if err != nil {
-		return nil, err
+	if args.NewStatus != nil {
+		err := validate.OneOf("Status", *args.NewStatus, graphql2.AlertStatusStatusAcknowledged, graphql2.AlertStatusStatusClosed)
+		if err != nil {
+			return nil, err
+		}
+
+		var status alert.Status
+		switch *args.NewStatus {
+		case graphql2.AlertStatusStatusAcknowledged:
+			status = alert.StatusActive
+		case graphql2.AlertStatusStatusClosed:
+			status = alert.StatusClosed
+		}
+
+		updatedIDs, err = m.AlertStore.UpdateManyAlertStatus(ctx, status, args.AlertIDs, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if args.NoiseReason != nil {
+		var err error
+		updatedIDs, err = m.AlertStore.UpdateManyAlertFeedback(ctx, *args.NoiseReason, args.AlertIDs)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return m.AlertStore.FindMany(ctx, updatedIDs)
@@ -424,4 +652,28 @@ func (m *Mutation) UpdateAlertsByService(ctx context.Context, args graphql2.Upda
 	}
 
 	return true, nil
+}
+
+func (a *Alert) Meta(ctx context.Context, alert *alert.Alert) ([]graphql2.AlertMetadata, error) {
+	md, err := (*App)(a).FindOneAlertMetadata(ctx, alert.ID)
+	if err != nil {
+		return nil, err
+	}
+	var alertMeta []graphql2.AlertMetadata
+	for k, v := range md {
+		alertMeta = append(alertMeta, graphql2.AlertMetadata{Key: k, Value: v})
+	}
+	sort.Slice(alertMeta, func(i, j int) bool {
+		return alertMeta[i].Key < alertMeta[j].Key
+	})
+	return alertMeta, nil
+}
+
+func (a *Alert) MetaValue(ctx context.Context, alert *alert.Alert, key string) (string, error) {
+	md, err := (*App)(a).FindOneAlertMetadata(ctx, alert.ID)
+	if err != nil {
+		return "", err
+	}
+
+	return md[key], nil
 }

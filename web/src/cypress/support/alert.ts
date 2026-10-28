@@ -3,12 +3,61 @@ import { DateTime } from 'luxon'
 
 const c = new Chance()
 
+declare global {
+  namespace Cypress {
+    interface Chainable {
+      createAlert: typeof createAlert
+      createManyAlerts: typeof createManyAlerts
+      closeAlert: typeof closeAlert
+      createAlertLogs: typeof createAlertLogs
+      ackAlert: typeof ackAlert
+      escalateAlert: typeof escalateAlert
+      setAlertNoise: typeof setAlertNoise
+    }
+  }
+
+  interface Alert {
+    id: number
+    alertID: number
+    summary: string
+    details: string
+    serviceID: string
+    service: Service
+  }
+
+  interface AlertOptions {
+    summary?: string
+    details?: string
+    serviceID?: string
+
+    service?: ServiceOptions
+  }
+
+  interface AlertLogOptions {
+    count?: number
+    alertID?: number
+    alert?: AlertOptions
+  }
+
+  interface AlertLogs {
+    alert: Alert
+    logs: Array<AlertLog>
+  }
+
+  interface AlertLog {
+    id: number
+    timestamp: string
+    message: string
+  }
+}
+
 function getAlertLogs(id: number): Cypress.Chainable<Array<AlertLog>> {
   const query = `
     query GetLogs($id: Int!, $after: String!) {
       alert(id: $id) {
         recentEvents(input: { limit: 149, after: $after }) {
           nodes {
+            id
             timestamp
             message
           }
@@ -187,17 +236,68 @@ function createManyAlerts(
   return cy.sql(query)
 }
 
-function closeAlert(id: number): Cypress.Chainable<Alert> {
+function ackAlert(id: number): Cypress.Chainable<void> {
   const query = `
-    mutation {
-      updateAlertStatus(input: $input) { id }
+    mutation ($id: Int!) {
+      updateAlerts(input: {
+        newStatus: StatusAcknowledged
+        alertIDs: [$id]
+      }) { id }
     }
   `
 
-  return cy.graphql(query, { input: { id } })
+  return cy.graphqlVoid(query, { id })
+}
+
+function closeAlert(id: number): Cypress.Chainable<void> {
+  const query = `
+    mutation ($id: Int!) {
+      updateAlerts(input: {
+        newStatus: StatusClosed
+        alertIDs: [$id]
+      }) { id }
+    }
+  `
+
+  return cy.graphqlVoid(query, { id })
+}
+
+function escalateAlert(id: number): Cypress.Chainable<Alert> {
+  const query = `
+    mutation ($id: Int!) {
+      escalateAlerts(input: [$id]) { id }
+    }
+  `
+
+  return cy
+    .graphql(query, { id })
+    .then((res: GraphQLResponse) => res.escalateAlerts)
+}
+
+function setAlertNoise(
+  id: number,
+  noiseReason: string,
+): Cypress.Chainable<boolean> {
+  const query = `
+    mutation($input: SetAlertNoiseReasonInput!) {
+      setAlertNoiseReason(input: $input)
+    }
+  `
+
+  return cy
+    .graphql(query, {
+      input: {
+        alertID: id,
+        noiseReason,
+      },
+    })
+    .then((res: GraphQLResponse) => Boolean(res))
 }
 
 Cypress.Commands.add('createAlert', createAlert)
 Cypress.Commands.add('createManyAlerts', createManyAlerts)
 Cypress.Commands.add('createAlertLogs', createAlertLogs)
 Cypress.Commands.add('closeAlert', closeAlert)
+Cypress.Commands.add('ackAlert', ackAlert)
+Cypress.Commands.add('escalateAlert', escalateAlert)
+Cypress.Commands.add('setAlertNoise', setAlertNoise)

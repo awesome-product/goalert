@@ -2,17 +2,97 @@ package graphqlapp
 
 import (
 	context "context"
+	"database/sql"
 
+	"github.com/target/goalert/expflag"
+	"github.com/target/goalert/gadb"
 	"github.com/target/goalert/graphql2"
+	"github.com/target/goalert/notification"
 	"github.com/target/goalert/search"
 	"github.com/target/goalert/validation/validate"
 
 	"github.com/pkg/errors"
 )
 
-type Query App
+type (
+	Query        App
+	DebugMessage App
+)
 
 func (a *App) Query() graphql2.QueryResolver { return (*Query)(a) }
+
+func (q *Query) MessageStatusHistory(ctx context.Context, idStr string) ([]graphql2.MessageStatusHistory, error) {
+	id, err := validate.ParseUUID("ID", idStr)
+	if err != nil {
+		return nil, err
+	}
+
+	msgs, err := gadb.New(q.DB).GraphQL_MessageStatusHistory(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	hist := make([]graphql2.MessageStatusHistory, len(msgs))
+	for i, m := range msgs {
+		hist[i].Status = string(m.Status)
+		hist[i].Details = m.StatusDetails
+		hist[i].Timestamp = m.Timestamp
+	}
+	return hist, nil
+}
+
+func (q *Query) ListGQLFields(ctx context.Context, query *string) ([]string, error) {
+	if query == nil || *query == "" {
+		// List all fields if no query is provided.
+		return graphql2.SchemaFields(), nil
+	}
+
+	return graphql2.QueryFields(*query)
+}
+
+func (a *Query) ExperimentalFlags(ctx context.Context) ([]string, error) {
+	var flags []string
+	for _, f := range expflag.AllFlags() {
+		if !expflag.ContextHas(ctx, f) {
+			continue
+		}
+
+		flags = append(flags, string(f))
+	}
+
+	return flags, nil
+}
+
+func (a *Query) LinkAccountInfo(ctx context.Context, token string) (*graphql2.LinkAccountInfo, error) {
+	m, err := a.AuthLinkStore.FindLinkMetadata(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	if m == nil {
+		return nil, nil
+	}
+
+	info := &graphql2.LinkAccountInfo{
+		UserDetails: m.UserDetails,
+	}
+	if m.AlertID > 0 {
+		info.AlertID = &m.AlertID
+	}
+	var s graphql2.AlertStatus
+	switch m.AlertAction {
+	case notification.ResultAcknowledge.String():
+		s = graphql2.AlertStatusStatusAcknowledged
+		info.AlertNewStatus = &s
+	case notification.ResultResolve.String():
+		s = graphql2.AlertStatusStatusClosed
+		info.AlertNewStatus = &s
+	}
+
+	return info, nil
+}
 
 func (a *Query) AuthSubjectsForProvider(ctx context.Context, _first *int, _after *string, providerID string) (conn *graphql2.AuthSubjectConnection, err error) {
 	var first int

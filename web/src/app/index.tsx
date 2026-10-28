@@ -1,29 +1,40 @@
-// set webpack public path for loading additional assets
-import { GOALERT_VERSION } from './env'
-
-import React from 'react'
-import ReactDOM from 'react-dom'
+import React, { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
 import { Provider as ReduxProvider } from 'react-redux'
-import { ConnectedRouter } from 'connected-react-router'
 import { ApolloProvider } from '@apollo/client'
-import { MuiThemeProvider } from '@material-ui/core/styles'
-import { theme } from './mui'
+import { StyledEngineProvider } from '@mui/material/styles'
+import { GOALERT_VERSION as version, nonce, pathPrefix } from './env'
+import { ThemeProvider } from './theme/themeConfig'
 import { GraphQLClient } from './apollo'
 import './styles'
 import App from './main/App'
-import MuiPickersUtilsProvider from './mui-pickers'
-import history from './history'
 import store from './reduxStore'
-import GoogleAnalytics from './util/GoogleAnalytics'
-import { Config, ConfigProvider, ConfigData } from './util/RequireConfig'
+import { ConfigProvider } from './util/RequireConfig'
 import { warn } from './util/debug'
 import NewVersionCheck from './NewVersionCheck'
+import { Provider as URQLProvider } from 'urql'
+import { client as urqlClient } from './urql'
+import { Router } from 'wouter'
+
+import { Settings } from 'luxon'
+import RequireAuth from './main/RequireAuth'
+import Login from './main/components/Login'
+import createCache from '@emotion/cache'
+import { CacheProvider } from '@emotion/react'
+
+Settings.throwOnInvalid = true
+
+declare module 'luxon' {
+  interface TSSettings {
+    throwOnInvalid: true
+  }
+}
 
 // version check
 if (
   document
     .querySelector('meta[http-equiv=x-goalert-version]')
-    ?.getAttribute('content') !== GOALERT_VERSION
+    ?.getAttribute('content') !== version
 ) {
   warn(
     'app.js version does not match HTML version',
@@ -31,49 +42,41 @@ if (
       document
         .querySelector('meta[http-equiv=x-goalert-version]')
         ?.getAttribute('content'),
-    'app.js=' + GOALERT_VERSION,
+    'app.js=' + version,
   )
 }
 
-const LazyGARouteTracker = React.memo((props: { trackingID?: string }) => {
-  if (!props.trackingID) {
-    return null
-  }
+const rootElement = document.getElementById('app')
+const root = createRoot(rootElement as HTMLElement)
 
-  const GAOptions = {
-    titleCase: true,
-    debug: false,
-  }
-
-  if (!GoogleAnalytics.init(props.trackingID, GAOptions)) {
-    return null
-  }
-
-  return <GoogleAnalytics.RouteTracker />
+const cache = createCache({
+  key: 'mui',
+  prepend: true,
+  nonce,
+  speedy: true,
 })
-LazyGARouteTracker.displayName = 'LazyGARouteTracker'
 
-ReactDOM.render(
-  <MuiThemeProvider theme={theme}>
-    <ApolloProvider client={GraphQLClient}>
-      <ReduxProvider store={store}>
-        <ConnectedRouter history={history}>
-          <MuiPickersUtilsProvider>
-            <ConfigProvider>
-              <NewVersionCheck />
-              <Config>
-                {(config: ConfigData) => (
-                  <LazyGARouteTracker
-                    trackingID={config['General.GoogleAnalyticsID'] as string}
-                  />
-                )}
-              </Config>
-              <App />
-            </ConfigProvider>
-          </MuiPickersUtilsProvider>
-        </ConnectedRouter>
-      </ReduxProvider>
-    </ApolloProvider>
-  </MuiThemeProvider>,
-  document.getElementById('app'),
+root.render(
+  <StrictMode>
+    <StyledEngineProvider injectFirst>
+      <ThemeProvider>
+        <CacheProvider value={cache}>
+          <ApolloProvider client={GraphQLClient}>
+            <ReduxProvider store={store}>
+              <Router base={pathPrefix}>
+                <URQLProvider value={urqlClient}>
+                  <NewVersionCheck />
+                  <RequireAuth fallback={<Login />}>
+                    <ConfigProvider>
+                      <App />
+                    </ConfigProvider>
+                  </RequireAuth>
+                </URQLProvider>
+              </Router>
+            </ReduxProvider>
+          </ApolloProvider>
+        </CacheProvider>
+      </ThemeProvider>
+    </StyledEngineProvider>
+  </StrictMode>,
 )

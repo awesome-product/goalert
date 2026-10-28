@@ -25,12 +25,13 @@ import (
 	"github.com/target/goalert/util/sqlutil"
 	"github.com/target/goalert/validation"
 	"github.com/target/goalert/validation/validate"
-	"go.opencensus.io/trace"
 )
 
 // CookieName is the name of the auth session cookie.
-const CookieName = "goalert_session.2"
-const v1CookieName = "goalert_session"
+const (
+	CookieName   = "goalert_session.2"
+	v1CookieName = "goalert_session"
+)
 
 type registeredProvider struct {
 	// ID is the unique identifier of the provider.
@@ -158,7 +159,7 @@ func (h *Handler) EndUserSessionTx(ctx context.Context, tx *sql.Tx, id ...string
 	if permission.Admin(ctx) {
 		_, err = tx.StmtContext(ctx, h.endSession).ExecContext(ctx, sqlutil.UUIDArray(id))
 	} else {
-		_, err = tx.StmtContext(ctx, h.endSessionUser).ExecContext(ctx, permission.UserID(ctx), sqlutil.UUIDArray(id))
+		_, err = tx.StmtContext(ctx, h.endSessionUser).ExecContext(ctx, permission.UserNullUUID(ctx), sqlutil.UUIDArray(id))
 	}
 	return err
 }
@@ -177,7 +178,7 @@ func (h *Handler) EndAllUserSessionsTx(ctx context.Context, tx *sql.Tx) error {
 	if tx != nil {
 		stmt = tx.StmtContext(ctx, stmt)
 	}
-	_, err = stmt.ExecContext(ctx, permission.UserID(ctx), src.ID)
+	_, err = stmt.ExecContext(ctx, permission.UserNullUUID(ctx), src.ID)
 
 	return err
 }
@@ -209,16 +210,38 @@ func (h *Handler) FindAllUserSessions(ctx context.Context, userID string) ([]Use
 	return sessions, nil
 }
 
-// ServeLogout will clear the current session cookie and end the session (if any).
+// ServeLogout will clear the current session cookie and end the session(s) (if any).
 func (h *Handler) ServeLogout(w http.ResponseWriter, req *http.Request) {
-	h.setSessionCookie(w, req, "")
+	ClearCookie(w, req, CookieName, true)
+	var sessionIDs []string
+	for _, c := range req.Cookies() {
+		switch c.Name {
+		case CookieName, v1CookieName:
+		default:
+			// only interested in cookies with one of the names above
+			continue
+		}
+
+		tok, _, _ := authtoken.Parse(c.Value, nil)
+		if tok == nil {
+			continue
+		}
+		sessionIDs = append(sessionIDs, tok.ID.String())
+	}
 	ctx := req.Context()
 	src := permission.Source(ctx)
 	if src != nil && src.Type == permission.SourceTypeAuthProvider {
-		_, err := h.endSession.ExecContext(context.Background(), sqlutil.UUIDArray([]string{src.ID}))
-		if err != nil {
-			log.Log(ctx, errors.Wrap(err, "end session"))
-		}
+		sessionIDs = append(sessionIDs, src.ID)
+	}
+
+	if len(sessionIDs) == 0 {
+		// no session to end
+		return
+	}
+
+	_, err := h.endSession.ExecContext(log.FromContext(ctx).BackgroundContext(), sqlutil.UUIDArray(sessionIDs))
+	if err != nil {
+		log.Log(ctx, errors.Wrap(err, "end session(s)"))
 	}
 }
 
@@ -255,7 +278,7 @@ func (h *Handler) ServeProviders(w http.ResponseWriter, req *http.Request) {
 	if errutil.HTTPError(req.Context(), w, err) {
 		return
 	}
-	w.Write(data)
+	_, _ = w.Write(data)
 }
 
 // IdentityProviderHandler will return a handler for the given provider ID.
@@ -268,18 +291,28 @@ func (h *Handler) IdentityProviderHandler(id string) http.HandlerFunc {
 	}
 
 	return func(w http.ResponseWriter, req *http.Request) {
-		ctx, sp := trace.StartSpan(req.Context(), "Auth.Provider/"+id)
-		defer sp.End()
-
-		req = req.WithContext(ctx)
+		ctx := req.Context()
+		cfg := config.FromContext(ctx)
 
 		var refU *url.URL
 		if req.Method == "POST" {
-			var ok bool
-			refU, ok = h.refererURL(w, req)
-			if !ok {
-				errutil.HTTPError(ctx, w, validation.NewFieldError("referer", "failed to resolve referer"))
-				return
+			if cfg.ShouldUsePublicURL() {
+				refU, _ = url.Parse(req.Header.Get("referer"))
+				if refU == nil || !cfg.ValidReferer("", req.Header.Get("referer")) {
+					// redirect with err
+					q := make(url.Values)
+					q.Set("login_error", "invalid referer")
+					http.Redirect(w, req, cfg.CallbackURL("", q), http.StatusTemporaryRedirect)
+					return
+				}
+			} else {
+				// fallback to old method
+				var ok bool
+				refU, ok = h.refererURL(w, req)
+				if !ok {
+					errutil.HTTPError(ctx, w, validation.NewFieldError("referer", "failed to resolve referer"))
+					return
+				}
 			}
 		} else {
 			c, err := req.Cookie("login_redir")
@@ -287,9 +320,12 @@ func (h *Handler) IdentityProviderHandler(id string) http.HandlerFunc {
 				errutil.HTTPError(ctx, w, validation.NewFieldError("login_redir", err.Error()))
 				return
 			}
-			refU, err = url.Parse(c.Value)
-			if err != nil {
-				errutil.HTTPError(ctx, w, validation.NewFieldError("login_redir", err.Error()))
+			refU, _ = url.Parse(c.Value)
+			if refU == nil || !cfg.ValidReferer(req.URL.String(), c.Value) {
+				// redirect with err
+				q := make(url.Values)
+				q.Set("login_error", "invalid referer")
+				http.Redirect(w, req, cfg.CallbackURL("", q), http.StatusTemporaryRedirect)
 				return
 			}
 		}
@@ -298,7 +334,6 @@ func (h *Handler) IdentityProviderHandler(id string) http.HandlerFunc {
 		if !info.Enabled {
 			err := Error(info.Title + " auth disabled")
 			q := refU.Query()
-			sp.Annotate([]trace.Attribute{trace.BoolAttribute("error", true)}, "error: "+err.Error())
 			q.Set("login_error", err.Error())
 			refU.RawQuery = q.Encode()
 			http.Redirect(w, req, refU.String(), http.StatusFound)
@@ -351,7 +386,6 @@ func (h *Handler) canCreateUser(ctx context.Context, providerID string) bool {
 
 func (h *Handler) handleProvider(id string, p IdentityProvider, refU *url.URL, w http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
-	sp := trace.FromContext(ctx)
 
 	var route RouteInfo
 	route.RelativePath = strings.TrimPrefix(req.URL.Path, "/v1/identity/providers/"+id)
@@ -360,14 +394,18 @@ func (h *Handler) handleProvider(id string, p IdentityProvider, refU *url.URL, w
 		route.RelativePath = "/"
 	}
 
-	u := *req.URL
-	u.RawQuery = "" // strip query params
-	route.CurrentURL = u.String()
+	cfg := config.FromContext(ctx)
+	if cfg.ShouldUsePublicURL() {
+		route.CurrentURL = cfg.CallbackURL(req.URL.Path)
+	} else {
+		u := *req.URL
+		u.RawQuery = "" // strip query params
+		route.CurrentURL = u.String()
+	}
 
 	sub, err := p.ExtractIdentity(&route, w, req)
 	var r Redirector
 	if errors.As(err, &r) {
-		sp.Annotate([]trace.Attribute{trace.StringAttribute("auth.redirectURL", r.RedirectURL())}, "Redirected.")
 		http.Redirect(w, req, r.RedirectURL(), http.StatusFound)
 		return
 	}
@@ -375,7 +413,6 @@ func (h *Handler) handleProvider(id string, p IdentityProvider, refU *url.URL, w
 
 	errRedirect := func(err error) {
 		q := refU.Query()
-		sp.Annotate([]trace.Attribute{trace.BoolAttribute("error", true)}, "error: "+err.Error())
 		old := err
 		_, err = errutil.ScrubError(err)
 		if err != old {
@@ -389,7 +426,7 @@ func (h *Handler) handleProvider(id string, p IdentityProvider, refU *url.URL, w
 			} else {
 				w.WriteHeader(400)
 			}
-			io.WriteString(w, err.Error())
+			_, _ = io.WriteString(w, err.Error())
 			return
 		}
 		http.Redirect(w, req, refU.String(), http.StatusFound)
@@ -426,7 +463,8 @@ func (h *Handler) handleProvider(id string, p IdentityProvider, refU *url.URL, w
 			errRedirect(err)
 			return
 		}
-		defer tx.Rollback()
+		defer sqlutil.Rollback(ctx, "auth: create user", tx)
+
 		u := &user.User{
 			Role:  permission.RoleUser,
 			Name:  validate.SanitizeName(sub.Name),
@@ -450,12 +488,6 @@ func (h *Handler) handleProvider(id string, p IdentityProvider, refU *url.URL, w
 			errRedirect(err)
 			return
 		}
-		sp.Annotate([]trace.Attribute{
-			trace.BoolAttribute("user.new", true),
-			trace.StringAttribute("user.name", u.Name),
-			trace.StringAttribute("user.email", u.Email),
-			trace.StringAttribute("user.id", u.ID),
-		}, "Created new user.")
 	} else {
 		_, err = h.updateUser.ExecContext(ctx, userID, validate.SanitizeName(sub.Name),
 			validate.SanitizeEmail(sub.Email))
@@ -475,14 +507,8 @@ func (h *Handler) handleProvider(id string, p IdentityProvider, refU *url.URL, w
 		return
 	}
 
-	sp.Annotate([]trace.Attribute{
-		trace.BoolAttribute("auth.login", true),
-		trace.StringAttribute("auth.userID", userID),
-		trace.StringAttribute("auth.sessionID", tok.ID.String()),
-	}, "User authenticated.")
-
 	if noRedirect {
-		io.WriteString(w, tokStr)
+		_, _ = io.WriteString(w, tokStr)
 		return
 	}
 
@@ -513,12 +539,7 @@ func (h *Handler) CreateSession(ctx context.Context, userAgent, userID string) (
 }
 
 func (h *Handler) setSessionCookie(w http.ResponseWriter, req *http.Request, val string) {
-	ClearCookie(w, req, "login_redir")
-	if val == "" {
-		ClearCookie(w, req, CookieName)
-	} else {
-		SetCookieAge(w, req, CookieName, val, 30*24*time.Hour)
-	}
+	SetCookieAge(w, req, CookieName, val, 30*24*time.Hour, true)
 }
 
 func (h *Handler) authWithToken(w http.ResponseWriter, req *http.Request, next http.Handler) bool {
@@ -533,6 +554,26 @@ func (h *Handler) authWithToken(w http.ResponseWriter, req *http.Request, next h
 		return false
 	}
 
+	ctx := req.Context()
+	if req.URL.Path == "/api/graphql" && strings.HasPrefix(tokStr, "ey") {
+		ctx, err = h.cfg.APIKeyStore.AuthorizeGraphQL(ctx, tokStr, req.UserAgent(), req.RemoteAddr)
+		if errutil.HTTPError(req.Context(), w, err) {
+			return true
+		}
+
+		next.ServeHTTP(w, req.WithContext(ctx))
+		return true
+	}
+	if req.URL.Path == "/api/v2/uik" && strings.HasPrefix(tokStr, "ey") {
+		ctx, err = h.cfg.IntKeyStore.AuthorizeUIK(ctx, tokStr)
+		if errutil.HTTPError(req.Context(), w, err) {
+			return true
+		}
+
+		next.ServeHTTP(w, req.WithContext(ctx))
+		return true
+	}
+
 	tok, _, err := authtoken.Parse(tokStr, func(t authtoken.Type, p, sig []byte) (bool, bool) {
 		if t == authtoken.TypeSession {
 			return h.cfg.SessionKeyring.Verify(p, sig)
@@ -544,8 +585,6 @@ func (h *Handler) authWithToken(w http.ResponseWriter, req *http.Request, next h
 		return true
 	}
 
-	// TODO: update once scopes are implemented
-	ctx := req.Context()
 	switch req.URL.Path {
 	case "/v1/api/alerts", "/api/v2/generic/incoming":
 		ctx, err = h.cfg.IntKeyStore.Authorize(ctx, *tok, integrationkey.TypeGeneric)
@@ -569,12 +608,57 @@ func (h *Handler) authWithToken(w http.ResponseWriter, req *http.Request, next h
 	return true
 }
 
+func (h *Handler) tryAuthUser(ctx context.Context, w http.ResponseWriter, req *http.Request, tokenStr string, isCookie bool) (context.Context, error) {
+	tok, isOld, err := authtoken.Parse(tokenStr, func(t authtoken.Type, p, sig []byte) (bool, bool) {
+		// only session tokens are supported for cookies
+		return h.cfg.SessionKeyring.Verify(p, sig)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var userID uuid.UUID
+	var userRole permission.Role
+	err = h.fetchSession.QueryRowContext(ctx, tok.ID.String()).Scan(&userID, &userRole)
+	if err != nil {
+		return nil, err
+	}
+
+	if isCookie && isOld {
+		// send new signature back if it was signed with an old key
+		newSignedToken, err := tok.Encode(h.cfg.SessionKeyring.Sign)
+		if err != nil {
+			log.Log(ctx, errors.Wrap(err, "failed to sign/issue new session token"))
+		} else {
+			h.setSessionCookie(w, req, newSignedToken)
+			_, err = h.updateUA.ExecContext(ctx, tok.ID.String(), req.UserAgent())
+			if err != nil {
+				log.Log(ctx, errors.Wrap(err, "update user agent (session key refresh)"))
+			}
+		}
+	}
+
+	return permission.UserSourceContext(
+		ctx,
+		userID.String(),
+		userRole,
+		&permission.SourceInfo{
+			Type: permission.SourceTypeAuthProvider,
+			ID:   tok.ID.String(),
+		},
+	), nil
+}
+
 // WrapHandler will wrap an existing http.Handler so the Context of the request
 // includes authentication information (if the request is authorized).
 //
 // Updating and clearing the session cookie is automatically handled.
 func (h *Handler) WrapHandler(wrapped http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasPrefix(req.URL.Path, "/api/v2/slack") {
+			wrapped.ServeHTTP(w, req)
+			return
+		}
 		if req.URL.Path == "/api/v2/mailgun/incoming" || req.URL.Path == "/v1/webhooks/mailgun" {
 			// Mailgun handles it's own auth and has special
 			// requirements on status codes, so we pass it through
@@ -587,80 +671,36 @@ func (h *Handler) WrapHandler(wrapped http.Handler) http.Handler {
 		}
 
 		// User session flow
-		ctx := req.Context()
+
 		tokStr := GetToken(req)
-		var fromCookie bool
-		if tokStr == "" {
-			c, err := req.Cookie(CookieName)
-			if err == nil {
-				fromCookie = true
-				tokStr = c.Value
-			}
-		}
-		if tokStr == "" {
-			c, err := req.Cookie(v1CookieName)
-			if err == nil {
-				fromCookie = true
-				tokStr = c.Value
-			}
-		}
-
-		if tokStr == "" {
-			// no cookie value
-			wrapped.ServeHTTP(w, req)
-			return
-		}
-		tok, isOld, err := authtoken.Parse(tokStr, func(t authtoken.Type, p, sig []byte) (bool, bool) {
-			// only session tokens are supported for cookies
-			return h.cfg.SessionKeyring.Verify(p, sig)
-		})
-		if err != nil {
-			if fromCookie {
-				h.setSessionCookie(w, req, "")
-			}
-			wrapped.ServeHTTP(w, req)
-			return
-		}
-
-		if fromCookie && isOld {
-			// send new signature back if it was signed with an old key
-			newSignedToken, err := tok.Encode(h.cfg.SessionKeyring.Sign)
+		// explicit token always takes precedence
+		if tokStr != "" {
+			ctx, err := h.tryAuthUser(req.Context(), w, req, tokStr, false)
 			if err != nil {
-				log.Log(ctx, errors.Wrap(err, "failed to sign/issue new session token"))
-			} else {
-				h.setSessionCookie(w, req, newSignedToken)
-				_, err = h.updateUA.ExecContext(ctx, tok.ID.String(), req.UserAgent())
-				if err != nil {
-					log.Log(ctx, errors.Wrap(err, "update user agent (session key refresh)"))
-				}
+				wrapped.ServeHTTP(w, req)
+				return
 			}
-		}
 
-		var userID string
-		var userRole permission.Role
-		err = h.fetchSession.QueryRowContext(ctx, tok.ID.String()).Scan(&userID, &userRole)
-		if errors.Is(err, sql.ErrNoRows) {
-			if fromCookie {
-				h.setSessionCookie(w, req, "")
-			}
-			wrapped.ServeHTTP(w, req)
-			return
-		}
-		if err != nil {
-			errutil.HTTPError(ctx, w, err)
+			wrapped.ServeHTTP(w, req.WithContext(ctx))
 			return
 		}
 
-		ctx = permission.UserSourceContext(
-			ctx,
-			userID,
-			userRole,
-			&permission.SourceInfo{
-				Type: permission.SourceTypeAuthProvider,
-				ID:   tok.ID.String(),
-			},
-		)
-		req = req.WithContext(ctx)
+		for _, c := range req.Cookies() {
+			switch c.Name {
+			case CookieName, v1CookieName:
+			default:
+				// only interested in cookies with one of the names above
+				continue
+			}
+
+			ctx, err := h.tryAuthUser(req.Context(), w, req, c.Value, true)
+			if err != nil {
+				continue
+			}
+
+			wrapped.ServeHTTP(w, req.WithContext(ctx))
+			return
+		}
 
 		wrapped.ServeHTTP(w, req)
 	})
@@ -693,8 +733,9 @@ func (h *Handler) refererURL(w http.ResponseWriter, req *http.Request) (*url.URL
 	refU.RawQuery = q.Encode()
 	return refU, true
 }
+
 func (h *Handler) serveProviderPost(id string, p IdentityProvider, refU *url.URL, w http.ResponseWriter, req *http.Request) {
-	SetCookie(w, req, "login_redir", refU.String())
+	SetCookie(w, req, "login_redir", refU.String(), false)
 
 	h.handleProvider(id, p, refU, w, req)
 }

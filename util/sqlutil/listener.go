@@ -2,247 +2,127 @@ package sqlutil
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"sync"
-	"time"
 
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/stdlib"
-	"github.com/pkg/errors"
-)
-
-// Connector will return a new *pgx.Conn.
-type Connector interface {
-	Connect(context.Context) (*pgx.Conn, error)
-}
-
-// Releaser is an optional interface with a Release method to be called
-// after a connection is closed.
-type Releaser interface {
-	Release(*pgx.Conn) error
-}
-
-// DBConnector implements the Connector and Releaser interfaces for
-// a *sql.DB.
-type DBConnector sql.DB
-
-// Connect will return a *pgx.Conn from the underlying *sql.DB pool.
-func (db *DBConnector) Connect(context.Context) (*pgx.Conn, error) {
-	return stdlib.AcquireConn((*sql.DB)(db))
-}
-
-// Release will release a *pgx.Conn to the underlying *sql.DB pool.
-func (db *DBConnector) Release(conn *pgx.Conn) error {
-	return stdlib.ReleaseConn((*sql.DB)(db), conn)
-}
-
-// ConfigConnector implements the Connector interface for a `pgx.ConnConfig`.
-type ConfigConnector pgx.ConnConfig
-
-// Connect will get a new connection using the underlying `pgx.ConnConfig`.
-func (cfg ConfigConnector) Connect(ctx context.Context) (*pgx.Conn, error) {
-	return pgx.ConnectConfig(ctx, (*pgx.ConnConfig)(&cfg))
-}
-
-var (
-	_ = Connector(&DBConnector{})
-	_ = Releaser(&DBConnector{})
-	_ = Connector(ConfigConnector{})
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgxlisten"
+	"github.com/target/goalert/util/log"
 )
 
 // Listener will listen for NOTIFY commands on a set of channels.
 type Listener struct {
-	notifCh chan *pgconn.Notification
+	l      *pgxlisten.Listener
+	cancel context.CancelCauseFunc
 
-	ctx      context.Context
-	db       Connector
-	channels []string
+	mx sync.Mutex
+	c  *sync.Cond
 
-	stopFn    func()
-	stoppedCh chan struct{}
-	errCh     chan error
-
-	mx      sync.Mutex
-	conn    *pgx.Conn
-	running bool
+	isStopped  bool
+	isShutdown bool
+	resume     chan struct{}
 }
 
-// NewListener will create and initialize a Listener which will automatically reconnect and listen to the provided channels.
-func NewListener(ctx context.Context, db Connector, channels ...string) (*Listener, error) {
+// NewListener will create and initialize a Listener which will automatically reconnect and listen to the provided channels when running.
+func NewListener(p *pgxpool.Pool) *Listener {
 	l := &Listener{
-		notifCh:  make(chan *pgconn.Notification, 32),
-		ctx:      ctx,
-		channels: channels,
-		db:       db,
-		errCh:    make(chan error),
+		l: &pgxlisten.Listener{
+			Connect: func(ctx context.Context) (*pgx.Conn, error) {
+				// We use the same connection config as the pool, but without the pool. This is because we can't reuse the same connection for both listening and querying.
+				return pgx.ConnectConfig(ctx, p.Config().ConnConfig)
+			},
+			LogError: log.Log,
+		},
+		cancel:    func(error) {},
+		isStopped: true,
+		resume:    make(chan struct{}),
 	}
+	l.c = sync.NewCond(&l.mx)
 
-	err := l.connect(ctx)
-	if err != nil {
-		return nil, err
+	return l
+}
+
+// Handle will register a handler for a specific channel.
+func (l *Listener) Handle(channel string, fn func(context.Context, string) error) {
+	l.l.Handle(channel, pgxlisten.HandlerFunc(func(ctx context.Context, n *pgconn.Notification, conn *pgx.Conn) error {
+		return fn(ctx, n.Payload)
+	}))
+}
+
+var (
+	errPause = errors.New("pause")
+	errStop  = errors.New("stop")
+)
+
+// Run will start the listener and begin listening for notifications.
+func (l *Listener) Run(ctx context.Context) {
+	defer close(l.resume)
+
+	for {
+		l.mx.Lock()
+		if l.isShutdown {
+			l.mx.Unlock()
+			return
+		}
+		cancelCtx, cancel := context.WithCancelCause(ctx)
+		l.cancel = cancel
+		l.isStopped = false
+		l.c.Broadcast()
+		l.mx.Unlock()
+
+		err := l.l.Listen(cancelCtx)
+
+		l.mx.Lock()
+		l.isStopped = true
+		l.c.Broadcast()
+		l.mx.Unlock()
+
+		if errors.Is(context.Cause(cancelCtx), errStop) {
+			return
+		}
+		if errors.Is(context.Cause(cancelCtx), errPause) {
+			select {
+			case <-ctx.Done():
+				return
+			case l.resume <- struct{}{}:
+			}
+			continue
+		}
+
+		log.Log(ctx, err)
+		return
 	}
-
-	l.Start()
-
-	return l, nil
 }
 
 // Start will enable reconnections and messages.
-func (l *Listener) Start() {
-	l.mx.Lock()
-	defer l.mx.Unlock()
-
-	if l.running {
-		return
-	}
-
-	ctx, cancel := context.WithCancel(l.ctx)
-	l.stopFn = cancel
-	l.stoppedCh = make(chan struct{}, 1)
-
-	go l.run(ctx)
-
-	l.running = true
-}
-func (l *Listener) run(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			l.stoppedCh <- struct{}{}
-			return
-		default:
-		}
-		err := l.handleNotifications(ctx)
-		if errors.Is(err, context.Canceled) {
-			err = nil
-		}
-		if err != nil {
-			l.errCh <- err
-		}
-	}
-}
+func (l *Listener) Start() { <-l.resume }
 
 // Stop will end all current connections and stop reconnecting.
 func (l *Listener) Stop() {
 	l.mx.Lock()
 	defer l.mx.Unlock()
 
-	if !l.running {
-		return
+	l.cancel(errPause)
+
+	for !l.isStopped {
+		l.c.Wait()
 	}
-
-	l.stopFn()
-	<-l.stoppedCh
-
-	l.running = false
-}
-
-// Close performs a shutdown with a background context.
-func (l *Listener) Close() error {
-	return l.Shutdown(context.Background())
 }
 
 // Shutdown will shut down the listener and returns after all connections have been completed.
 // It is not necessary to call Stop() before Close().
 func (l *Listener) Shutdown(context.Context) error {
-	l.Stop()
-	close(l.notifCh)
-	close(l.errCh)
-	return nil
-}
+	l.mx.Lock()
+	defer l.mx.Unlock()
 
-func (l *Listener) handleNotifications(ctx context.Context) error {
-	defer l.disconnect()
-	t := time.NewTicker(3 * time.Second)
-	defer t.Stop()
-	for {
-		err := l.connect(l.ctx)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		if err != nil {
-			l.errCh <- err
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-t.C:
-				continue
-			}
-		}
-		break
+	l.isShutdown = true
+	l.cancel(errStop)
+
+	for !l.isStopped {
+		l.c.Wait()
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		n, err := l.conn.WaitForNotification(ctx)
-		if err != nil && ctx.Err() == nil {
-			return errors.Wrap(err, "wait for notifications")
-		}
-
-		if n == nil {
-			continue
-		}
-		select {
-		// Writing to channel
-		case l.notifCh <- n:
-		default:
-		}
-	}
-}
-
-// Errors will return a channel that will be fed errors from this listener.
-func (l *Listener) Errors() <-chan error { return l.errCh }
-
-// Notifications returns the notification channel for this listener.
-// Nil values will not be returned until the listener is closed.
-func (l *Listener) Notifications() <-chan *pgconn.Notification { return l.notifCh }
-
-func (l *Listener) disconnect() {
-	if l.conn == nil {
-		return
-	}
-	l.conn.Close(l.ctx)
-	if r, ok := l.db.(Releaser); ok {
-		r.Release(l.conn)
-	}
-	l.conn = nil
-}
-func (l *Listener) connect(ctx context.Context) error {
-	if l.conn != nil {
-		return nil
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-	conn, err := l.db.Connect(ctx)
-	if err != nil {
-		return err
-	}
-	l.conn = conn
-
-	for _, name := range l.channels {
-		select {
-		case <-ctx.Done():
-			l.disconnect()
-			return ctx.Err()
-		default:
-		}
-
-		_, err = conn.Exec(ctx, "listen "+QuoteID(name))
-		if err != nil {
-			l.disconnect()
-			return err
-		}
-	}
-	l.conn = conn
 	return nil
 }

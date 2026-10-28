@@ -1,5 +1,7 @@
 package app
 
+import "time"
+
 // Defaults returns the default app config.
 func Defaults() Config {
 	return Config{
@@ -9,6 +11,7 @@ func Defaults() Config {
 		MaxReqBodyBytes:   256 * 1024,
 		MaxReqHeaderBytes: 4096,
 		RegionName:        "default",
-		TraceProbability:  0.01,
+		EngineCycleTime:   5 * time.Second,
+		SMTPMaxRecipients: 1,
 	}
 }

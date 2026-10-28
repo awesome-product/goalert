@@ -1,6 +1,7 @@
 package retry
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"net"
@@ -35,6 +36,14 @@ func IsTemporaryError(err error) bool {
 	if err == nil {
 		return false
 	}
+
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
 	var cliErr clientErr
 	if errors.As(err, &cliErr) && cliErr.ClientError() {
 		return false
@@ -65,6 +74,8 @@ func IsTemporaryError(err error) bool {
 		// https://www.postgresql.org/docs/10/static/errcodes-appendix.html
 		case strings.HasPrefix(e.Code, "40"), strings.HasPrefix(e.Code, "08"):
 			return true
+		case e.Code == "55P03": // lock_timeout
+			return true
 		}
 	}
 	return false
@@ -75,7 +86,7 @@ type DoTempFunc func(int) error
 
 // DoTemporaryError will retry as long as the error returned from fn is
 // temporary as defined by IsTemporaryError.
-func DoTemporaryError(fn DoTempFunc, opts ...Option) error {
+func DoTemporaryError(fn func(attempt int) error, opts ...Option) error {
 	return Do(func(n int) (bool, error) {
 		err := fn(n)
 		return IsTemporaryError(err), err

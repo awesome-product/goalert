@@ -4,12 +4,18 @@ import {
   Collapse,
   Grid,
   IconButton,
-  makeStyles,
-} from '@material-ui/core'
-import ExpandIcon from '@material-ui/icons/KeyboardArrowDown'
-import CollapseIcon from '@material-ui/icons/KeyboardArrowUp'
-import { Alert, AlertTitle, AlertProps } from '@material-ui/lab'
+  Alert,
+  AlertTitle,
+  AlertColor,
+} from '@mui/material'
+import makeStyles from '@mui/styles/makeStyles'
+import ExpandIcon from '@mui/icons-material/KeyboardArrowDown'
+import CollapseIcon from '@mui/icons-material/KeyboardArrowUp'
 import toTitleCase from '../util/toTitleCase'
+import {
+  NoticeType as SchemaNoticeType,
+  NotificationStatus,
+} from '../../schema'
 
 const useStyles = makeStyles({
   alertAction: {
@@ -29,21 +35,44 @@ const useStyles = makeStyles({
   },
 })
 
-export interface Notice {
-  type: NoticeType
-  message: string
-  details: string
+export type NoticeType = SchemaNoticeType | AlertColor | NotificationStatus
+function assertNever(x: never): never {
+  throw new Error('Unexpected value: ' + x)
+}
+export function toSeverity(notice: NoticeType): AlertColor {
+  switch (notice) {
+    case 'success':
+    case 'OK':
+      return 'success'
+    case 'warning':
+    case 'WARNING':
+    case 'WARN':
+      return 'warning'
+    case 'error':
+    case 'ERROR':
+      return 'error'
+    case 'info':
+    case 'INFO':
+      return 'info'
+    default:
+      assertNever(notice)
+  }
 }
 
-export type NoticeType = 'WARNING' | 'ERROR' | 'INFO' | 'OK'
-
+export interface Notice {
+  type: NoticeType
+  message: string | JSX.Element
+  details?: string | JSX.Element
+  endNote?: string | JSX.Element
+  action?: React.JSX.Element
+}
 interface NoticesProps {
   notices?: Notice[]
 }
 
 export default function Notices({
   notices = [],
-}: NoticesProps): JSX.Element | null {
+}: NoticesProps): React.JSX.Element | null {
   const classes = useStyles()
   const [noticesExpanded, setNoticesExpanded] = useState(false)
 
@@ -51,24 +80,31 @@ export default function Notices({
     return null
   }
 
-  function renderShowAllToggle(): ReactNode {
+  function renderShowAllToggle(action?: React.JSX.Element): ReactNode {
     if (notices.length <= 1) return null
     return (
-      <Badge
-        color='primary'
-        badgeContent={notices.length - 1}
-        invisible={noticesExpanded}
-      >
-        <IconButton onClick={() => setNoticesExpanded(!noticesExpanded)}>
-          {noticesExpanded ? <CollapseIcon /> : <ExpandIcon />}
-        </IconButton>
-      </Badge>
+      <React.Fragment>
+        {action}
+        <Badge
+          color='primary'
+          badgeContent={notices.length - 1}
+          invisible={noticesExpanded}
+        >
+          <IconButton
+            onClick={() => setNoticesExpanded(!noticesExpanded)}
+            size='large'
+            sx={{ pl: 1 }}
+          >
+            {noticesExpanded ? <CollapseIcon /> : <ExpandIcon />}
+          </IconButton>
+        </Badge>
+      </React.Fragment>
     )
   }
 
   /*
-   * Spacing set manually on grid items to accomadate manual
-   * accordian transitions for multiple notices
+   * Spacing set manually on grid items to accommodate manual
+   * accordion transitions for multiple notices
    */
   function getGridClassName(index: number): string {
     switch (index) {
@@ -83,22 +119,33 @@ export default function Notices({
     }
   }
 
-  function renderNotice(notice: Notice, index: number): JSX.Element {
+  function renderNotice(notice: Notice, index: number): React.JSX.Element {
     return (
       <Grid key={index} className={getGridClassName(index)} item xs={12}>
         <Alert
-          severity={notice.type.toLowerCase() as AlertProps['severity']}
+          severity={toSeverity(notice.type)}
           classes={{
             message: classes.alertMessage,
             action: classes.alertAction,
           }}
           elevation={1}
-          action={index === 0 ? renderShowAllToggle() : null}
+          action={
+            <div
+              style={{ display: 'flex', alignItems: 'center', height: '100%' }}
+            >
+              {index === 0 && notices.length > 1
+                ? renderShowAllToggle(notice.action)
+                : notice.action}
+            </div>
+          }
         >
           <AlertTitle>
             {toTitleCase(notice.type)}: {notice.message}
           </AlertTitle>
           {notice.details}
+          {notice.endNote && (
+            <div style={{ float: 'right' }}>{notice.endNote}</div>
+          )}
         </Alert>
       </Grid>
     )

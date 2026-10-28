@@ -11,6 +11,44 @@
 | `details` | _optional_   | Additional information about the alert, supports markdown.                                                                                                          |
 | `action`  | _optional_   | If set to `close`, it will close any matching alerts.                                                                                                               |
 | `dedup`   | _optional_   | All calls for the same service with the same `dedup` string will update the same alert (if open) or create a new one. Defaults to using summary & details together. |
+| `meta`    | _optional_   | Additional key/value metadata to attach to the alert.                                                                                                               |
+
+#### Metadata
+
+Metadata can be used to attach additional information to the alert, form or query parameters can specify the metadata like this:
+
+```url
+/api/v2/generic/incomming?token=<token>&meta=example_key=example_value&meta=example_key2=example_value2
+```
+
+Or as a map for JSON requests:
+```json
+{
+   "summary": "test",
+   "details": "test",
+   "meta": {
+      "example_key": "example_value",
+      "example_key2": "example_value2"
+   }
+}
+```
+
+
+### Response:
+
+Default response is a `204` with no content. Set the `Accept` header to `application/json` for information on the created alert.
+
+Example:
+
+```json
+{
+  "AlertID": 10,
+  "ServiceID": "00000000-0000-0000-0000-000000000001",
+  "IsNew": true
+}
+```
+
+`IsNew` will be false if the call was de-duplicated.
 
 ### Examples:
 
@@ -86,13 +124,13 @@ To trigger an alert using Prometheus Alertmanager, follow these steps:
 
 2. In Prometheus Alertmanager, enable a webhook by adding a webhook receiver in the alertmanager configuration file:
 
-    ```yaml
-    receivers:
-    - name: 'service'
-      webhook_configs:
-      - url: '<prometheus_alertmanager_webhook_url_from_previous_step>'
-        send_resolved: true
-    ```
+   ```yaml
+   receivers:
+     - name: 'service'
+       webhook_configs:
+         - url: '<prometheus_alertmanager_webhook_url_from_previous_step>'
+           send_resolved: true
+   ```
 
 ---
 

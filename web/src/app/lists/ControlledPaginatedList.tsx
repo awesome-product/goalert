@@ -1,32 +1,27 @@
-import React, { ReactElement, useState } from 'react'
+import React, { ReactElement, ReactNode, useState } from 'react'
 import {
+  Button,
+  Card,
   Checkbox,
   Grid,
-  Icon,
   IconButton,
-  makeStyles,
   Tooltip,
-} from '@material-ui/core'
+} from '@mui/material'
+import { Add, ArrowDropDown } from '@mui/icons-material'
+import makeStyles from '@mui/styles/makeStyles'
 import {
   PaginatedList,
   PaginatedListItemProps,
   PaginatedListProps,
 } from './PaginatedList'
-import { useSelector } from 'react-redux'
-import { urlKeySelector } from '../selectors/url'
+import { ListHeaderProps } from './ListHeader'
 import classnames from 'classnames'
 import OtherActions from '../util/OtherActions'
-import { ArrowDropDown } from '@material-ui/icons'
 import Search from '../util/Search'
+import { useURLKey } from '../actions'
+import { useIsWidthDown } from '../util/useWidth'
 
 const useStyles = makeStyles({
-  actionsContainer: {
-    alignItems: 'center',
-    display: 'flex',
-    marginRight: 'auto',
-    paddingLeft: '1em', // align with listItem icons
-    width: 'fit-content',
-  },
   checkbox: {
     marginTop: 4,
     marginBottom: 4,
@@ -43,12 +38,13 @@ const useStyles = makeStyles({
   popper: {
     opacity: 1,
   },
-  search: {
-    paddingLeft: '0.5em',
-  },
 })
 
-export interface ControlledPaginatedListProps extends PaginatedListProps {
+export interface ControlledPaginatedListProps
+  extends PaginatedListProps,
+    ListHeaderProps {
+  listHeader?: ReactNode
+
   checkboxActions?: ControlledPaginatedListAction[]
   secondaryActions?: ReactElement
 
@@ -59,6 +55,12 @@ export interface ControlledPaginatedListProps extends PaginatedListProps {
   searchAdornment?: ReactElement
 
   items: CheckboxItemsProps[] | PaginatedListItemProps[]
+
+  renderCreateDialog?: (onClose: () => void) => JSX.Element | undefined
+
+  createLabel?: string
+  hideCreate?: boolean
+  onSelectionChange?: (selectedIDs: (string | number)[]) => void
 }
 
 export interface ControlledPaginatedListAction {
@@ -88,16 +90,23 @@ export interface CheckboxItemsProps extends PaginatedListItemProps {
 
 export default function ControlledPaginatedList(
   props: ControlledPaginatedListProps,
-): JSX.Element {
+): React.JSX.Element {
   const classes = useStyles()
   const {
     checkboxActions,
+    createLabel,
     secondaryActions,
     noSearch,
+    renderCreateDialog,
     searchAdornment,
     items,
+    listHeader,
+    hideCreate,
     ...listProps
   } = props
+
+  const [showCreate, setShowCreate] = useState(false)
+  const isMobile = useIsWidthDown('md')
 
   /*
    * ensures item type is of CheckboxItemsProps and not PaginatedListItemProps
@@ -119,12 +128,16 @@ export default function ControlledPaginatedList(
     return []
   }
 
-  const [_checkedItems, setCheckedItems] = useState<Array<string | number>>([])
+  const [_checkedItems, _setCheckedItems] = useState<Array<string | number>>([])
+  const setCheckedItems = (ids: Array<string | number>): void => {
+    _setCheckedItems(ids)
+    if (props.onSelectionChange) props.onSelectionChange(ids)
+  }
   // covers the use case where an item may no longer be selectable after an update
   const checkedItems = _checkedItems.filter((id) =>
     getSelectableIDs().includes(id),
   )
-  const urlKey = useSelector(urlKeySelector)
+  const urlKey = useURLKey()
 
   function setAll(): void {
     setCheckedItems(getSelectableIDs())
@@ -150,10 +163,13 @@ export default function ControlledPaginatedList(
     return (
       <Grid
         aria-label='List Checkbox Controls'
-        className={classes.actionsContainer}
         item
         container
-        spacing={2}
+        sx={{
+          alignItems: 'center',
+          display: 'flex',
+          width: 'fit-content',
+        }}
       >
         <Grid item>
           <Checkbox
@@ -166,6 +182,10 @@ export default function ControlledPaginatedList(
               checkedItems.length > 0 && itemIDs.length !== checkedItems.length
             }
             onChange={handleToggleSelectAll}
+            disabled={items.length === 0}
+            sx={{
+              ml: '1em', // align with listItem icons
+            }}
           />
         </Grid>
 
@@ -175,11 +195,8 @@ export default function ControlledPaginatedList(
           data-cy='checkboxes-menu'
         >
           <OtherActions
-            icon={
-              <Icon>
-                <ArrowDropDown />
-              </Icon>
-            }
+            IconComponent={ArrowDropDown}
+            disabled={items.length === 0}
             actions={[
               {
                 label: 'All',
@@ -207,6 +224,7 @@ export default function ControlledPaginatedList(
                     a.onClick(checkedItems)
                     setNone()
                   }}
+                  size='large'
                 >
                   {a.icon}
                 </IconButton>
@@ -217,7 +235,9 @@ export default function ControlledPaginatedList(
     )
   }
 
-  function getItemIcon(item: CheckboxItemsProps): JSX.Element | undefined {
+  function getItemIcon(
+    item: CheckboxItemsProps,
+  ): React.JSX.Element | undefined {
     if (!checkboxActions) return item.icon
 
     const checked = checkedItems.includes(item.id)
@@ -251,18 +271,41 @@ export default function ControlledPaginatedList(
 
   return (
     <React.Fragment>
-      <Grid container item xs={12} justify='flex-end' alignItems='center'>
+      <Grid
+        container
+        item
+        xs={12}
+        spacing={2}
+        justifyContent='flex-start'
+        alignItems='center'
+      >
         {renderActions()}
-        {secondaryActions}
         {!noSearch && (
-          <Grid item className={classes.search}>
+          <Grid item>
             <Search endAdornment={searchAdornment} />
+          </Grid>
+        )}
+        {secondaryActions && <Grid item>{secondaryActions}</Grid>}
+
+        {!hideCreate && renderCreateDialog && !isMobile && (
+          <Grid item sx={{ ml: 'auto' }}>
+            <Button
+              variant='contained'
+              startIcon={<Add />}
+              onClick={() => setShowCreate(true)}
+            >
+              Create {createLabel}
+            </Button>
+            {showCreate && renderCreateDialog(() => setShowCreate(false))}
           </Grid>
         )}
       </Grid>
 
       <Grid item xs={12}>
-        <PaginatedList key={urlKey} {...listProps} items={getItems()} />
+        <Card>
+          {listHeader}
+          <PaginatedList key={urlKey} {...listProps} items={getItems()} />
+        </Card>
       </Grid>
     </React.Fragment>
   )

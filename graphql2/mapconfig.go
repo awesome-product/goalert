@@ -18,24 +18,29 @@ func MapConfigHints(cfg config.Hints) []ConfigHint {
 		{ID: "Mailgun.ForwardURL", Value: cfg.Mailgun.ForwardURL},
 		{ID: "Twilio.MessageWebhookURL", Value: cfg.Twilio.MessageWebhookURL},
 		{ID: "Twilio.VoiceWebhookURL", Value: cfg.Twilio.VoiceWebhookURL},
+		{ID: "Slack.InteractivityResponseURL", Value: cfg.Slack.InteractivityResponseURL},
 	}
 }
 
 // MapConfigValues will map a Config struct into a flat list of ConfigValue structs.
 func MapConfigValues(cfg config.Config) []ConfigValue {
 	return []ConfigValue{
-		{ID: "General.PublicURL", Type: ConfigTypeString, Description: "Publicly routable URL for UI links and API calls.", Value: cfg.General.PublicURL},
-		{ID: "General.GoogleAnalyticsID", Type: ConfigTypeString, Description: "", Value: cfg.General.GoogleAnalyticsID},
+		{ID: "General.ApplicationName", Type: ConfigTypeString, Description: "The name used in messaging and page titles. Defaults to \"GoAlert\".", Value: cfg.General.ApplicationName},
+		{ID: "General.PublicURL", Type: ConfigTypeString, Description: "Publicly routable URL for UI links and API calls.", Value: cfg.General.PublicURL, Deprecated: "Use --public-url flag instead, which takes precedence."},
+		{ID: "General.GoogleAnalyticsID", Type: ConfigTypeString, Description: "If set, will post user metrics to the corresponding data stream in Google Analytics 4.", Value: cfg.General.GoogleAnalyticsID},
 		{ID: "General.NotificationDisclaimer", Type: ConfigTypeString, Description: "Disclaimer text for receiving pre-recorded notifications (appears on profile page).", Value: cfg.General.NotificationDisclaimer},
-		{ID: "General.MessageBundles", Type: ConfigTypeBoolean, Description: "Enables bundling status updates and alert notifications. Also allows 'ack/close all' responses to bundled alerts.", Value: fmt.Sprintf("%t", cfg.General.MessageBundles)},
+		{ID: "General.DisableMessageBundles", Type: ConfigTypeBoolean, Description: "Disable bundling status updates and alert notifications.", Value: fmt.Sprintf("%t", cfg.General.DisableMessageBundles)},
 		{ID: "General.ShortURL", Type: ConfigTypeString, Description: "If set, messages will contain a shorter URL using this as a prefix (e.g. http://example.com). It should point to GoAlert and can be the same as the PublicURL.", Value: cfg.General.ShortURL},
 		{ID: "General.DisableSMSLinks", Type: ConfigTypeBoolean, Description: "If set, SMS messages will not contain a URL pointing to GoAlert.", Value: fmt.Sprintf("%t", cfg.General.DisableSMSLinks)},
 		{ID: "General.DisableLabelCreation", Type: ConfigTypeBoolean, Description: "Disables the ability to create new labels for services.", Value: fmt.Sprintf("%t", cfg.General.DisableLabelCreation)},
 		{ID: "General.DisableCalendarSubscriptions", Type: ConfigTypeBoolean, Description: "If set, disables all active calendar subscriptions as well as the ability to create new calendar subscriptions.", Value: fmt.Sprintf("%t", cfg.General.DisableCalendarSubscriptions)},
-		{ID: "General.EnableV1GraphQL", Type: ConfigTypeBoolean, Description: "Enables the deprecated /v1/graphql endpoint (replaced by /api/graphql).", Value: fmt.Sprintf("%t", cfg.General.EnableV1GraphQL)},
+		{ID: "Services.RequiredLabels", Type: ConfigTypeStringList, Description: "List of label names to require new services to define.", Value: strings.Join(cfg.Services.RequiredLabels, "\n")},
 		{ID: "Maintenance.AlertCleanupDays", Type: ConfigTypeInteger, Description: "Closed alerts will be deleted after this many days (0 means disable cleanup).", Value: fmt.Sprintf("%d", cfg.Maintenance.AlertCleanupDays)},
+		{ID: "Maintenance.AlertAutoCloseDays", Type: ConfigTypeInteger, Description: "Unacknowledged alerts will automatically be closed after this many days of inactivity. (0 means disable auto-close).", Value: fmt.Sprintf("%d", cfg.Maintenance.AlertAutoCloseDays)},
+		{ID: "Maintenance.AutoCloseAckedAlerts", Type: ConfigTypeBoolean, Description: "If set, alerts that are acknowledged will also be automatically closed after the configured number of days of inactivity.", Value: fmt.Sprintf("%t", cfg.Maintenance.AutoCloseAckedAlerts)},
 		{ID: "Maintenance.APIKeyExpireDays", Type: ConfigTypeInteger, Description: "Unused calendar API keys will be disabled after this many days (0 means disable cleanup).", Value: fmt.Sprintf("%d", cfg.Maintenance.APIKeyExpireDays)},
-		{ID: "Auth.RefererURLs", Type: ConfigTypeStringList, Description: "Allowed referer URLs for auth and redirects.", Value: strings.Join(cfg.Auth.RefererURLs, "\n")},
+		{ID: "Maintenance.ScheduleCleanupDays", Type: ConfigTypeInteger, Description: "Schedule on-call history will be deleted after this many days (0 means disable cleanup).", Value: fmt.Sprintf("%d", cfg.Maintenance.ScheduleCleanupDays)},
+		{ID: "Auth.RefererURLs", Type: ConfigTypeStringList, Description: "Allowed referer URLs for auth and redirects.", Value: strings.Join(cfg.Auth.RefererURLs, "\n"), Deprecated: "Use --public-url flag instead, which takes precedence."},
 		{ID: "Auth.DisableBasic", Type: ConfigTypeBoolean, Description: "Disallow username/password login.", Value: fmt.Sprintf("%t", cfg.Auth.DisableBasic)},
 		{ID: "GitHub.Enable", Type: ConfigTypeBoolean, Description: "Enable GitHub authentication.", Value: fmt.Sprintf("%t", cfg.GitHub.Enable)},
 		{ID: "GitHub.NewUsers", Type: ConfigTypeBoolean, Description: "Allow new user creation via GitHub authentication.", Value: fmt.Sprintf("%t", cfg.GitHub.NewUsers)},
@@ -55,26 +60,37 @@ func MapConfigValues(cfg config.Config) []ConfigValue {
 		{ID: "OIDC.UserInfoEmailVerifiedPath", Type: ConfigTypeString, Description: "JMESPath expression to find email verification state in UserInfo. If set, the email_verified claim will be ignored in favor of this. (suggestion: email_verified).", Value: cfg.OIDC.UserInfoEmailVerifiedPath},
 		{ID: "OIDC.UserInfoNamePath", Type: ConfigTypeString, Description: "JMESPath expression to find full name in UserInfo. If set, the name claim will be ignored in favor of this. (suggestion: name || cn || join(' ', [firstname, lastname]))", Value: cfg.OIDC.UserInfoNamePath},
 		{ID: "Mailgun.Enable", Type: ConfigTypeBoolean, Description: "", Value: fmt.Sprintf("%t", cfg.Mailgun.Enable)},
-		{ID: "Mailgun.APIKey", Type: ConfigTypeString, Description: "", Value: cfg.Mailgun.APIKey, Password: true},
+		{ID: "Mailgun.APIKey", Type: ConfigTypeString, Description: "Set this to the HTTP webhook signing key.", Value: cfg.Mailgun.APIKey, Password: true},
 		{ID: "Mailgun.EmailDomain", Type: ConfigTypeString, Description: "The TO address for all incoming alerts.", Value: cfg.Mailgun.EmailDomain},
 		{ID: "Slack.Enable", Type: ConfigTypeBoolean, Description: "", Value: fmt.Sprintf("%t", cfg.Slack.Enable)},
 		{ID: "Slack.ClientID", Type: ConfigTypeString, Description: "", Value: cfg.Slack.ClientID},
 		{ID: "Slack.ClientSecret", Type: ConfigTypeString, Description: "", Value: cfg.Slack.ClientSecret, Password: true},
 		{ID: "Slack.AccessToken", Type: ConfigTypeString, Description: "Slack app bot user OAuth access token (should start with xoxb-).", Value: cfg.Slack.AccessToken, Password: true},
+		{ID: "Slack.SigningSecret", Type: ConfigTypeString, Description: "Signing secret to verify requests from slack.", Value: cfg.Slack.SigningSecret, Password: true},
+		{ID: "Slack.InteractiveMessages", Type: ConfigTypeBoolean, Description: "Enable interactive messages (e.g. buttons).", Value: fmt.Sprintf("%t", cfg.Slack.InteractiveMessages)},
+		{ID: "Slack.DisableBroadcastThreadReplies", Type: ConfigTypeBoolean, Description: "Disable broadcasting alert status updates in threads to the main channel.", Value: fmt.Sprintf("%t", cfg.Slack.DisableBroadcastThreadReplies)},
 		{ID: "Twilio.Enable", Type: ConfigTypeBoolean, Description: "Enables sending and processing of Voice and SMS messages through the Twilio notification provider.", Value: fmt.Sprintf("%t", cfg.Twilio.Enable)},
+		{ID: "Twilio.VoiceName", Type: ConfigTypeString, Description: "The Twilio voice to use for Text To Speech for phone calls. See https://www.twilio.com/docs/voice/twiml/say/text-speech#polly-standard-and-neural-voices", Value: cfg.Twilio.VoiceName},
+		{ID: "Twilio.VoiceLanguage", Type: ConfigTypeString, Description: "The Twilio voice language to use for Text To Speech for phone calls. See https://www.twilio.com/docs/voice/twiml/say/text-speech#polly-standard-and-neural-voices", Value: cfg.Twilio.VoiceLanguage},
 		{ID: "Twilio.AccountSID", Type: ConfigTypeString, Description: "", Value: cfg.Twilio.AccountSID},
-		{ID: "Twilio.AuthToken", Type: ConfigTypeString, Description: "The primary Auth Token for Twilio. Must be primary (not secondary) for request valiation.", Value: cfg.Twilio.AuthToken, Password: true},
+		{ID: "Twilio.AuthToken", Type: ConfigTypeString, Description: "The primary Auth Token for Twilio. Must be primary unless Alternate Auth Token is set. This token is used for outgoing requests.", Value: cfg.Twilio.AuthToken, Password: true},
+		{ID: "Twilio.AlternateAuthToken", Type: ConfigTypeString, Description: "An alternate Auth Token for validating incoming requests. During a key change, set this to the Primary, and Auth Token to the Secondary, then promote and clear this field.", Value: cfg.Twilio.AlternateAuthToken, Password: true},
 		{ID: "Twilio.FromNumber", Type: ConfigTypeString, Description: "The Twilio number to use for outgoing notifications.", Value: cfg.Twilio.FromNumber},
+		{ID: "Twilio.MessagingServiceSID", Type: ConfigTypeString, Description: "If set, replaces the use of From Number for SMS notifications.", Value: cfg.Twilio.MessagingServiceSID},
+		{ID: "Twilio.RCSSenderID", Type: ConfigTypeString, Description: "The sender ID for RCS messages. Required if RCS is enabled for the MessagingServiceSID.", Value: cfg.Twilio.RCSSenderID},
 		{ID: "Twilio.DisableTwoWaySMS", Type: ConfigTypeBoolean, Description: "Disables SMS reply codes for alert messages.", Value: fmt.Sprintf("%t", cfg.Twilio.DisableTwoWaySMS)},
 		{ID: "Twilio.SMSCarrierLookup", Type: ConfigTypeBoolean, Description: "Perform carrier lookup of SMS contact methods (required for SMSFromNumberOverride). Extra charges may apply.", Value: fmt.Sprintf("%t", cfg.Twilio.SMSCarrierLookup)},
 		{ID: "Twilio.SMSFromNumberOverride", Type: ConfigTypeStringList, Description: "List of 'carrier=number' pairs, SMS messages to numbers of the provided carrier string (exact match) will use the alternate From Number.", Value: strings.Join(cfg.Twilio.SMSFromNumberOverride, "\n")},
 		{ID: "SMTP.Enable", Type: ConfigTypeBoolean, Description: "Enables email as a contact method.", Value: fmt.Sprintf("%t", cfg.SMTP.Enable)},
 		{ID: "SMTP.From", Type: ConfigTypeString, Description: "The email address messages should be sent from.", Value: cfg.SMTP.From},
-		{ID: "SMTP.Address", Type: ConfigTypeString, Description: "The server address to use for sending email. Port is optional.", Value: cfg.SMTP.Address},
+		{ID: "SMTP.Address", Type: ConfigTypeString, Description: "The server address to use for sending email. Port is optional and defaults to 465, or 25 if Disable TLS is set. Common ports are: 25 or 587 for STARTTLS (or unencrypted) and 465 for TLS.", Value: cfg.SMTP.Address},
 		{ID: "SMTP.DisableTLS", Type: ConfigTypeBoolean, Description: "Disables TLS on the connection (STARTTLS will still be used if supported).", Value: fmt.Sprintf("%t", cfg.SMTP.DisableTLS)},
 		{ID: "SMTP.SkipVerify", Type: ConfigTypeBoolean, Description: "Disables certificate validation for TLS/STARTTLS (insecure).", Value: fmt.Sprintf("%t", cfg.SMTP.SkipVerify)},
 		{ID: "SMTP.Username", Type: ConfigTypeString, Description: "Username for authentication.", Value: cfg.SMTP.Username},
 		{ID: "SMTP.Password", Type: ConfigTypeString, Description: "Password for authentication.", Value: cfg.SMTP.Password, Password: true},
+		{ID: "Webhook.Enable", Type: ConfigTypeBoolean, Description: "Enables webhook as a contact method.", Value: fmt.Sprintf("%t", cfg.Webhook.Enable)},
+		{ID: "Webhook.AllowedURLs", Type: ConfigTypeStringList, Description: "If set, allows webhooks for these domains only. If empty, any URL is allowed, including internal/private network addresses.", Value: strings.Join(cfg.Webhook.AllowedURLs, "\n")},
+		{ID: "Webhook.BlockPrivateAddresses", Type: ConfigTypeBoolean, Description: "If enabled, webhook requests to private, loopback, and link-local addresses (e.g., 10.0.0.0/8, 127.0.0.1, 169.254.169.254) are rejected. The check is applied at connection time, so it also covers DNS names and redirects that resolve to such addresses. If requests are routed through an HTTP proxy, destination policy must be enforced at the proxy.", Value: fmt.Sprintf("%t", cfg.Webhook.BlockPrivateAddresses)},
 		{ID: "Feedback.Enable", Type: ConfigTypeBoolean, Description: "Enables Feedback link in nav bar.", Value: fmt.Sprintf("%t", cfg.Feedback.Enable)},
 		{ID: "Feedback.OverrideURL", Type: ConfigTypeString, Description: "Use a custom URL for Feedback link in nav bar.", Value: cfg.Feedback.OverrideURL},
 	}
@@ -83,25 +99,34 @@ func MapConfigValues(cfg config.Config) []ConfigValue {
 // MapPublicConfigValues will map a Config struct into a flat list of ConfigValue structs.
 func MapPublicConfigValues(cfg config.Config) []ConfigValue {
 	return []ConfigValue{
-		{ID: "General.PublicURL", Type: ConfigTypeString, Description: "Publicly routable URL for UI links and API calls.", Value: cfg.General.PublicURL},
-		{ID: "General.GoogleAnalyticsID", Type: ConfigTypeString, Description: "", Value: cfg.General.GoogleAnalyticsID},
+		{ID: "General.ApplicationName", Type: ConfigTypeString, Description: "The name used in messaging and page titles. Defaults to \"GoAlert\".", Value: cfg.General.ApplicationName},
+		{ID: "General.PublicURL", Type: ConfigTypeString, Description: "Publicly routable URL for UI links and API calls.", Value: cfg.General.PublicURL, Deprecated: "Use --public-url flag instead, which takes precedence."},
+		{ID: "General.GoogleAnalyticsID", Type: ConfigTypeString, Description: "If set, will post user metrics to the corresponding data stream in Google Analytics 4.", Value: cfg.General.GoogleAnalyticsID},
 		{ID: "General.NotificationDisclaimer", Type: ConfigTypeString, Description: "Disclaimer text for receiving pre-recorded notifications (appears on profile page).", Value: cfg.General.NotificationDisclaimer},
-		{ID: "General.MessageBundles", Type: ConfigTypeBoolean, Description: "Enables bundling status updates and alert notifications. Also allows 'ack/close all' responses to bundled alerts.", Value: fmt.Sprintf("%t", cfg.General.MessageBundles)},
+		{ID: "General.DisableMessageBundles", Type: ConfigTypeBoolean, Description: "Disable bundling status updates and alert notifications.", Value: fmt.Sprintf("%t", cfg.General.DisableMessageBundles)},
 		{ID: "General.ShortURL", Type: ConfigTypeString, Description: "If set, messages will contain a shorter URL using this as a prefix (e.g. http://example.com). It should point to GoAlert and can be the same as the PublicURL.", Value: cfg.General.ShortURL},
 		{ID: "General.DisableSMSLinks", Type: ConfigTypeBoolean, Description: "If set, SMS messages will not contain a URL pointing to GoAlert.", Value: fmt.Sprintf("%t", cfg.General.DisableSMSLinks)},
 		{ID: "General.DisableLabelCreation", Type: ConfigTypeBoolean, Description: "Disables the ability to create new labels for services.", Value: fmt.Sprintf("%t", cfg.General.DisableLabelCreation)},
 		{ID: "General.DisableCalendarSubscriptions", Type: ConfigTypeBoolean, Description: "If set, disables all active calendar subscriptions as well as the ability to create new calendar subscriptions.", Value: fmt.Sprintf("%t", cfg.General.DisableCalendarSubscriptions)},
+		{ID: "Services.RequiredLabels", Type: ConfigTypeStringList, Description: "List of label names to require new services to define.", Value: strings.Join(cfg.Services.RequiredLabels, "\n")},
 		{ID: "Maintenance.AlertCleanupDays", Type: ConfigTypeInteger, Description: "Closed alerts will be deleted after this many days (0 means disable cleanup).", Value: fmt.Sprintf("%d", cfg.Maintenance.AlertCleanupDays)},
+		{ID: "Maintenance.AlertAutoCloseDays", Type: ConfigTypeInteger, Description: "Unacknowledged alerts will automatically be closed after this many days of inactivity. (0 means disable auto-close).", Value: fmt.Sprintf("%d", cfg.Maintenance.AlertAutoCloseDays)},
+		{ID: "Maintenance.AutoCloseAckedAlerts", Type: ConfigTypeBoolean, Description: "If set, alerts that are acknowledged will also be automatically closed after the configured number of days of inactivity.", Value: fmt.Sprintf("%t", cfg.Maintenance.AutoCloseAckedAlerts)},
 		{ID: "Maintenance.APIKeyExpireDays", Type: ConfigTypeInteger, Description: "Unused calendar API keys will be disabled after this many days (0 means disable cleanup).", Value: fmt.Sprintf("%d", cfg.Maintenance.APIKeyExpireDays)},
+		{ID: "Maintenance.ScheduleCleanupDays", Type: ConfigTypeInteger, Description: "Schedule on-call history will be deleted after this many days (0 means disable cleanup).", Value: fmt.Sprintf("%d", cfg.Maintenance.ScheduleCleanupDays)},
 		{ID: "Auth.DisableBasic", Type: ConfigTypeBoolean, Description: "Disallow username/password login.", Value: fmt.Sprintf("%t", cfg.Auth.DisableBasic)},
 		{ID: "GitHub.Enable", Type: ConfigTypeBoolean, Description: "Enable GitHub authentication.", Value: fmt.Sprintf("%t", cfg.GitHub.Enable)},
 		{ID: "OIDC.Enable", Type: ConfigTypeBoolean, Description: "Enable OpenID Connect authentication.", Value: fmt.Sprintf("%t", cfg.OIDC.Enable)},
 		{ID: "Mailgun.Enable", Type: ConfigTypeBoolean, Description: "", Value: fmt.Sprintf("%t", cfg.Mailgun.Enable)},
 		{ID: "Slack.Enable", Type: ConfigTypeBoolean, Description: "", Value: fmt.Sprintf("%t", cfg.Slack.Enable)},
+		{ID: "Slack.DisableBroadcastThreadReplies", Type: ConfigTypeBoolean, Description: "Disable broadcasting alert status updates in threads to the main channel.", Value: fmt.Sprintf("%t", cfg.Slack.DisableBroadcastThreadReplies)},
 		{ID: "Twilio.Enable", Type: ConfigTypeBoolean, Description: "Enables sending and processing of Voice and SMS messages through the Twilio notification provider.", Value: fmt.Sprintf("%t", cfg.Twilio.Enable)},
 		{ID: "Twilio.FromNumber", Type: ConfigTypeString, Description: "The Twilio number to use for outgoing notifications.", Value: cfg.Twilio.FromNumber},
+		{ID: "Twilio.MessagingServiceSID", Type: ConfigTypeString, Description: "If set, replaces the use of From Number for SMS notifications.", Value: cfg.Twilio.MessagingServiceSID},
 		{ID: "SMTP.Enable", Type: ConfigTypeBoolean, Description: "Enables email as a contact method.", Value: fmt.Sprintf("%t", cfg.SMTP.Enable)},
 		{ID: "SMTP.From", Type: ConfigTypeString, Description: "The email address messages should be sent from.", Value: cfg.SMTP.From},
+		{ID: "Webhook.Enable", Type: ConfigTypeBoolean, Description: "Enables webhook as a contact method.", Value: fmt.Sprintf("%t", cfg.Webhook.Enable)},
+		{ID: "Webhook.AllowedURLs", Type: ConfigTypeStringList, Description: "If set, allows webhooks for these domains only. If empty, any URL is allowed, including internal/private network addresses.", Value: strings.Join(cfg.Webhook.AllowedURLs, "\n")},
 		{ID: "Feedback.Enable", Type: ConfigTypeBoolean, Description: "Enables Feedback link in nav bar.", Value: fmt.Sprintf("%t", cfg.Feedback.Enable)},
 		{ID: "Feedback.OverrideURL", Type: ConfigTypeString, Description: "Use a custom URL for Feedback link in nav bar.", Value: cfg.Feedback.OverrideURL},
 	}
@@ -119,7 +144,7 @@ func ApplyConfigValues(cfg config.Config, vals []ConfigValueInput) (config.Confi
 		if v == "" {
 			return 0, nil
 		}
-		val, err := strconv.ParseInt(v, 10, 64)
+		val, err := strconv.ParseInt(v, 10, 32)
 		if err != nil {
 			return 0, validation.NewFieldError("\""+id+"\".Value", "integer value invalid: "+err.Error())
 		}
@@ -137,18 +162,20 @@ func ApplyConfigValues(cfg config.Config, vals []ConfigValueInput) (config.Confi
 	}
 	for _, v := range vals {
 		switch v.ID {
+		case "General.ApplicationName":
+			cfg.General.ApplicationName = v.Value
 		case "General.PublicURL":
 			cfg.General.PublicURL = v.Value
 		case "General.GoogleAnalyticsID":
 			cfg.General.GoogleAnalyticsID = v.Value
 		case "General.NotificationDisclaimer":
 			cfg.General.NotificationDisclaimer = v.Value
-		case "General.MessageBundles":
+		case "General.DisableMessageBundles":
 			val, err := parseBool(v.ID, v.Value)
 			if err != nil {
 				return cfg, err
 			}
-			cfg.General.MessageBundles = val
+			cfg.General.DisableMessageBundles = val
 		case "General.ShortURL":
 			cfg.General.ShortURL = v.Value
 		case "General.DisableSMSLinks":
@@ -169,24 +196,38 @@ func ApplyConfigValues(cfg config.Config, vals []ConfigValueInput) (config.Confi
 				return cfg, err
 			}
 			cfg.General.DisableCalendarSubscriptions = val
-		case "General.EnableV1GraphQL":
-			val, err := parseBool(v.ID, v.Value)
-			if err != nil {
-				return cfg, err
-			}
-			cfg.General.EnableV1GraphQL = val
+		case "Services.RequiredLabels":
+			cfg.Services.RequiredLabels = parseStringList(v.Value)
 		case "Maintenance.AlertCleanupDays":
 			val, err := parseInt(v.ID, v.Value)
 			if err != nil {
 				return cfg, err
 			}
 			cfg.Maintenance.AlertCleanupDays = val
+		case "Maintenance.AlertAutoCloseDays":
+			val, err := parseInt(v.ID, v.Value)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.Maintenance.AlertAutoCloseDays = val
+		case "Maintenance.AutoCloseAckedAlerts":
+			val, err := parseBool(v.ID, v.Value)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.Maintenance.AutoCloseAckedAlerts = val
 		case "Maintenance.APIKeyExpireDays":
 			val, err := parseInt(v.ID, v.Value)
 			if err != nil {
 				return cfg, err
 			}
 			cfg.Maintenance.APIKeyExpireDays = val
+		case "Maintenance.ScheduleCleanupDays":
+			val, err := parseInt(v.ID, v.Value)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.Maintenance.ScheduleCleanupDays = val
 		case "Auth.RefererURLs":
 			cfg.Auth.RefererURLs = parseStringList(v.Value)
 		case "Auth.DisableBasic":
@@ -267,18 +308,42 @@ func ApplyConfigValues(cfg config.Config, vals []ConfigValueInput) (config.Confi
 			cfg.Slack.ClientSecret = v.Value
 		case "Slack.AccessToken":
 			cfg.Slack.AccessToken = v.Value
+		case "Slack.SigningSecret":
+			cfg.Slack.SigningSecret = v.Value
+		case "Slack.InteractiveMessages":
+			val, err := parseBool(v.ID, v.Value)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.Slack.InteractiveMessages = val
+		case "Slack.DisableBroadcastThreadReplies":
+			val, err := parseBool(v.ID, v.Value)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.Slack.DisableBroadcastThreadReplies = val
 		case "Twilio.Enable":
 			val, err := parseBool(v.ID, v.Value)
 			if err != nil {
 				return cfg, err
 			}
 			cfg.Twilio.Enable = val
+		case "Twilio.VoiceName":
+			cfg.Twilio.VoiceName = v.Value
+		case "Twilio.VoiceLanguage":
+			cfg.Twilio.VoiceLanguage = v.Value
 		case "Twilio.AccountSID":
 			cfg.Twilio.AccountSID = v.Value
 		case "Twilio.AuthToken":
 			cfg.Twilio.AuthToken = v.Value
+		case "Twilio.AlternateAuthToken":
+			cfg.Twilio.AlternateAuthToken = v.Value
 		case "Twilio.FromNumber":
 			cfg.Twilio.FromNumber = v.Value
+		case "Twilio.MessagingServiceSID":
+			cfg.Twilio.MessagingServiceSID = v.Value
+		case "Twilio.RCSSenderID":
+			cfg.Twilio.RCSSenderID = v.Value
 		case "Twilio.DisableTwoWaySMS":
 			val, err := parseBool(v.ID, v.Value)
 			if err != nil {
@@ -319,6 +384,20 @@ func ApplyConfigValues(cfg config.Config, vals []ConfigValueInput) (config.Confi
 			cfg.SMTP.Username = v.Value
 		case "SMTP.Password":
 			cfg.SMTP.Password = v.Value
+		case "Webhook.Enable":
+			val, err := parseBool(v.ID, v.Value)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.Webhook.Enable = val
+		case "Webhook.AllowedURLs":
+			cfg.Webhook.AllowedURLs = parseStringList(v.Value)
+		case "Webhook.BlockPrivateAddresses":
+			val, err := parseBool(v.ID, v.Value)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.Webhook.BlockPrivateAddresses = val
 		case "Feedback.Enable":
 			val, err := parseBool(v.ID, v.Value)
 			if err != nil {

@@ -1,7 +1,7 @@
 package sqlutil
 
 import (
-	"github.com/jackc/pgconn"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pkg/errors"
 )
 
@@ -23,7 +23,6 @@ func (e Error) Error() string { return e.err.Error() }
 
 // MapError will return a Error from the given err object or nil otherwise.
 func MapError(err error) *Error {
-
 	var pgxErr *pgconn.PgError
 
 	if errors.As(err, &pgxErr) {
@@ -40,5 +39,11 @@ func MapError(err error) *Error {
 			Position:       int(pgxErr.Position),
 		}
 	}
+
+	var e Error
+	if errors.As(err, &e) {
+		return &e
+	}
+
 	return nil
 }

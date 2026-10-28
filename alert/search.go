@@ -3,6 +3,7 @@ package alert
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strconv"
 	"text/template"
 	"time"
@@ -61,6 +62,15 @@ type SearchOptions struct {
 
 	// Before will only include alerts that were created before the provided time.
 	Before time.Time `json:"b,omitempty"`
+
+	// serviceNameIDs is used internally to store IDs for services matching the query name.
+	serviceNameIDs []string
+
+	// ClosedBefore will only include alerts that were closed before the provided time.
+	ClosedBefore time.Time `json:"c,omitempty"`
+
+	// NotClosedBefore will omit any alerts closed any time before the provided time.
+	NotClosedBefore time.Time `json:"nc,omitempty"`
 }
 
 type IDFilter struct {
@@ -74,7 +84,13 @@ type SearchCursor struct {
 	Created time.Time `json:"c,omitempty"`
 }
 
-var searchTemplate = template.Must(template.New("search").Parse(`
+var serviceSearchTemplate = template.Must(template.New("alert-search-services").Funcs(search.Helpers()).Parse(`
+	SELECT id
+	FROM services
+	WHERE {{textSearch "search" "name"}}
+`))
+
+var searchTemplate = template.Must(template.New("alert-search").Funcs(search.Helpers()).Parse(`
 	SELECT
 		a.id,
 		a.summary,
@@ -85,18 +101,13 @@ var searchTemplate = template.Must(template.New("search").Parse(`
 		created_at,
 		a.dedup_key
 	FROM alerts a
-	{{ if .Search }}
-		JOIN services svc ON svc.id = a.service_id
-	{{ end }}
 	WHERE true
 	{{ if .Omit }}
 		AND not a.id = any(:omit)
 	{{ end }}
 	{{ if .Search }}
 		AND (
-			a.id = :searchID OR
-			a.summary ilike :search OR
-			svc.name ilike :search
+			a.id = :searchID OR {{textSearch "search" "a.summary"}} OR a.service_id = any(:svcNameMatchIDs)
 		)
 	{{ end }}
 	{{ if .Status }}
@@ -129,6 +140,12 @@ var searchTemplate = template.Must(template.New("search").Parse(`
 			{{ end }}
 		)
 	{{ end }}
+	{{ if not .ClosedBefore.IsZero }}
+		AND EXISTS (select 1 from alert_metrics where alert_id = a.id AND closed_at < :closedBeforeTime) 
+	{{ end }}
+	{{ if not .NotClosedBefore.IsZero }}
+		AND EXISTS (select 1 from alert_metrics where alert_id = a.id AND closed_at > :notClosedBeforeTime) 
+	{{ end }}
 	ORDER BY {{.SortStr}}
 	LIMIT {{.Limit}}
 `))
@@ -147,14 +164,6 @@ func (opts renderData) SortStr() string {
 	return "status, id DESC"
 }
 
-func (opts renderData) SearchStr() string {
-	if opts.Search == "" {
-		return ""
-	}
-
-	return "%" + search.Escape(opts.Search) + "%"
-}
-
 func (opts renderData) Normalize() (*renderData, error) {
 	if opts.Limit == 0 {
 		opts.Limit = search.DefaultMaxResults
@@ -162,7 +171,7 @@ func (opts renderData) Normalize() (*renderData, error) {
 
 	err := validate.Many(
 		validate.Search("Search", opts.Search),
-		validate.Range("Limit", opts.Limit, 0, search.MaxResults),
+		validate.Range("Limit", opts.Limit, 0, 1001),
 		validate.Range("Status", len(opts.Status), 0, 3),
 		validate.ManyUUID("Services", opts.ServiceFilter.IDs, 50),
 		validate.Range("Omit", len(opts.Omit), 0, 50),
@@ -198,10 +207,11 @@ func (opts renderData) QueryArgs() []sql.NamedArg {
 	}
 
 	return []sql.NamedArg{
-		sql.Named("search", opts.SearchStr()),
+		sql.Named("search", opts.Search),
 		sql.Named("searchID", searchID),
 		sql.Named("status", stat),
 		sql.Named("services", sqlutil.UUIDArray(opts.ServiceFilter.IDs)),
+		sql.Named("svcNameMatchIDs", sqlutil.UUIDArray(opts.serviceNameIDs)),
 		sql.Named("afterID", opts.After.ID),
 		sql.Named("afterStatus", opts.After.Status),
 		sql.Named("afterCreated", opts.After.Created),
@@ -209,10 +219,47 @@ func (opts renderData) QueryArgs() []sql.NamedArg {
 		sql.Named("notifiedUserID", opts.NotifiedUserID),
 		sql.Named("beforeTime", opts.Before),
 		sql.Named("notBeforeTime", opts.NotBefore),
+		sql.Named("closedBeforeTime", opts.ClosedBefore),
+		sql.Named("notClosedBeforeTime", opts.NotClosedBefore),
 	}
 }
 
-func (db *DB) Search(ctx context.Context, opts *SearchOptions) ([]Alert, error) {
+func (s *Store) serviceNameSearch(ctx context.Context, data *renderData) error {
+	if data.Search == "" {
+		data.serviceNameIDs = nil
+		return nil
+	}
+
+	query, args, err := search.RenderQuery(ctx, serviceSearchTemplate, data)
+	if err != nil {
+		return fmt.Errorf("render service-search query: %w", err)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if errors.Is(err, sql.ErrNoRows) {
+		data.serviceNameIDs = nil
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("search for services with '%s': %w", data.Search, err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("scan service-search query: %w", err)
+		}
+		ids = append(ids, id)
+	}
+
+	data.serviceNameIDs = ids
+
+	return nil
+}
+
+func (s *Store) Search(ctx context.Context, opts *SearchOptions) ([]Alert, error) {
 	err := permission.LimitCheckAny(ctx, permission.System, permission.User)
 	if err != nil {
 		return nil, err
@@ -226,12 +273,17 @@ func (db *DB) Search(ctx context.Context, opts *SearchOptions) ([]Alert, error) 
 		return nil, err
 	}
 
+	err = s.serviceNameSearch(ctx, data)
+	if err != nil {
+		return nil, err
+	}
+
 	query, args, err := search.RenderQuery(ctx, searchTemplate, data)
 	if err != nil {
 		return nil, errors.Wrap(err, "render query")
 	}
 
-	rows, err := db.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, errors.Wrap(err, "query")
 	}

@@ -1,15 +1,15 @@
 import React, { useEffect, useState } from 'react'
-import { useQuery, gql } from '@apollo/client'
-import TextField, { TextFieldProps } from '@material-ui/core/TextField'
-import { InputProps } from '@material-ui/core/Input'
-import { Check, Close } from '@material-ui/icons'
+import { useQuery, gql } from 'urql'
+import TextField, { TextFieldProps } from '@mui/material/TextField'
+import { InputProps } from '@mui/material/Input'
+import { Check, Close } from '@mui/icons-material'
 import _ from 'lodash'
-import InputAdornment from '@material-ui/core/InputAdornment'
-import { makeStyles } from '@material-ui/core'
+import InputAdornment from '@mui/material/InputAdornment'
+import makeStyles from '@mui/styles/makeStyles'
 import { DEBOUNCE_DELAY } from '../config'
 
 const isValidNumber = gql`
-  query ($number: String!) {
+  query PhoneNumberValidate($number: String!) {
     phoneNumberInfo(number: $number) {
       id
       valid
@@ -26,6 +26,8 @@ const useStyles = makeStyles({
   },
 })
 
+const noSuspense = { suspense: false }
+
 export default function TelTextField(
   props: TextFieldProps & { value: string },
 ): JSX.Element {
@@ -41,11 +43,12 @@ export default function TelTextField(
   }, [props.value])
 
   // check validation of the input phoneNumber through graphql
-  const { data } = useQuery(isValidNumber, {
-    pollInterval: 0,
-    variables: { number: '+' + phoneNumber },
-    fetchPolicy: 'cache-first',
-    skip: !phoneNumber || props.disabled,
+  const [{ data }] = useQuery({
+    query: isValidNumber,
+    variables: { number: phoneNumber },
+    requestPolicy: 'cache-first',
+    pause: !phoneNumber || props.disabled,
+    context: noSuspense,
   })
 
   // fetch validation
@@ -69,7 +72,7 @@ export default function TelTextField(
     ),
   }
 
-  // if has inputProps from parent commponent, spread it in the iprops
+  // if has inputProps from parent component, spread it in the iprops
   if (props.InputProps !== undefined) {
     iprops = {
       ...iprops,
@@ -89,6 +92,10 @@ export default function TelTextField(
   function handleChange(e: React.ChangeEvent<HTMLInputElement>): void {
     if (!props.onChange) return
     if (!e.target.value) return props.onChange(e)
+
+    // ignore SID being pasted in
+    if (e.target.value.toLowerCase().startsWith('mg')) return
+
     e.target.value = '+' + e.target.value.replace(/[^0-9]/g, '')
     return props.onChange(e)
   }
@@ -99,6 +106,10 @@ export default function TelTextField(
       {...props}
       InputProps={iprops}
       type={props.type || 'tel'}
+      helperText={
+        props.helperText ||
+        'Include country code e.g. +1 (USA), +91 (India), +44 (UK)'
+      }
       onChange={handleChange}
       value={(props.value || '').replace(/[^0-9]/g, '')}
     />

@@ -1,6 +1,6 @@
 import React from 'react'
-import Card from '@material-ui/core/Card'
-import { makeStyles } from '@material-ui/core/styles'
+import Card from '@mui/material/Card'
+import makeStyles from '@mui/styles/makeStyles'
 import FlatList, { FlatListListItem } from '../lists/FlatList'
 import _ from 'lodash'
 
@@ -14,7 +14,7 @@ interface PolicyServicesCardProps {
   services: { id: string; name: string }[]
 }
 
-function PolicyServicesCard(props: PolicyServicesCardProps): JSX.Element {
+function PolicyServicesCard(props: PolicyServicesCardProps): React.JSX.Element {
   const classes = useStyles()
 
   function getServicesItems(): FlatListListItem[] {

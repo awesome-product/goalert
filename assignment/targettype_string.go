@@ -18,21 +18,24 @@ func _() {
 	_ = x[TargetTypeUser-7]
 	_ = x[TargetTypeNotificationChannel-8]
 	_ = x[TargetTypeSlackChannel-9]
-	_ = x[TargetTypeIntegrationKey-10]
-	_ = x[TargetTypeUserOverride-11]
-	_ = x[TargetTypeNotificationRule-12]
-	_ = x[TargetTypeContactMethod-13]
-	_ = x[TargetTypeHeartbeatMonitor-14]
-	_ = x[TargetTypeUserSession-15]
+	_ = x[TargetTypeSlackUserGroup-10]
+	_ = x[TargetTypeChanWebhook-11]
+	_ = x[TargetTypeIntegrationKey-12]
+	_ = x[TargetTypeUserOverride-13]
+	_ = x[TargetTypeNotificationRule-14]
+	_ = x[TargetTypeContactMethod-15]
+	_ = x[TargetTypeHeartbeatMonitor-16]
+	_ = x[TargetTypeUserSession-17]
 }
 
-const _TargetType_name = "TargetTypeUnspecifiedTargetTypeEscalationPolicyTargetTypeNotificationPolicyTargetTypeRotationTargetTypeServiceTargetTypeScheduleTargetTypeCalendarSubscriptionTargetTypeUserTargetTypeNotificationChannelTargetTypeSlackChannelTargetTypeIntegrationKeyTargetTypeUserOverrideTargetTypeNotificationRuleTargetTypeContactMethodTargetTypeHeartbeatMonitorTargetTypeUserSession"
+const _TargetType_name = "TargetTypeUnspecifiedTargetTypeEscalationPolicyTargetTypeNotificationPolicyTargetTypeRotationTargetTypeServiceTargetTypeScheduleTargetTypeCalendarSubscriptionTargetTypeUserTargetTypeNotificationChannelTargetTypeSlackChannelTargetTypeSlackUserGroupTargetTypeChanWebhookTargetTypeIntegrationKeyTargetTypeUserOverrideTargetTypeNotificationRuleTargetTypeContactMethodTargetTypeHeartbeatMonitorTargetTypeUserSession"
 
-var _TargetType_index = [...]uint16{0, 21, 47, 75, 93, 110, 128, 158, 172, 201, 223, 247, 269, 295, 318, 344, 365}
+var _TargetType_index = [...]uint16{0, 21, 47, 75, 93, 110, 128, 158, 172, 201, 223, 247, 268, 292, 314, 340, 363, 389, 410}
 
 func (i TargetType) String() string {
-	if i < 0 || i >= TargetType(len(_TargetType_index)-1) {
+	idx := int(i) - 0
+	if i < 0 || idx >= len(_TargetType_index)-1 {
 		return "TargetType(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _TargetType_name[_TargetType_index[i]:_TargetType_index[i+1]]
+	return _TargetType_name[_TargetType_index[idx]:_TargetType_index[idx+1]]
 }

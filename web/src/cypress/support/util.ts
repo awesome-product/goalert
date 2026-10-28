@@ -1,39 +1,26 @@
 import { DateTime, Duration, Interval } from 'luxon'
 import { Chance } from 'chance'
+import users from '../fixtures/users.json'
+import profile from '../fixtures/profile.json'
+import profileAdmin from '../fixtures/profileAdmin.json'
+
+const allUsers = users.concat(profile, profileAdmin)
 const c = new Chance()
 
 declare global {
   type ScreenFormat = 'mobile' | 'tablet' | 'widescreen'
 }
+const ids = allUsers.map((u) => `'${u.id}'`).join(',')
+const userVals = allUsers
+  .map((u) => `('${u.id}','${u.name}','${u.email}','${u.role}')`)
+  .join(',\n')
 
-let _resetQuery = ''
-function resetQuery(): Cypress.Chainable<string> {
-  if (_resetQuery) return cy.wrap(_resetQuery)
-
-  let users: Profile[] = []
-  let profile: Profile
-  let profileAdmin: Profile
-  cy.fixture('users').then((u) => {
-    users = users.concat(u)
-  })
-  cy.fixture('profile').then((p) => {
-    profile = p
-    users = users.concat(p)
-  })
-  cy.fixture('profileAdmin').then((p) => {
-    profileAdmin = p
-    users = users.concat(p)
-  })
-  return cy.then(() => {
-    const ids = users.map((u) => `'${u.id}'`).join(',')
-    const userVals = users
-      .map((u) => `('${u.id}','${u.name}','${u.email}','${u.role}')`)
-      .join(',\n')
-
-    _resetQuery = `
-truncate table escalation_policies, rotations, schedules, users CASCADE;
+const resetQuery = `
+truncate table escalation_policies, rotations, schedules, alert_metrics, alert_logs, users CASCADE;
 select setval(pg_get_serial_sequence('alerts', 'id'), coalesce(max(id), 0)+10000 , false) from alerts;
 delete from users where id in (${ids});
+
+update engine_processing_versions set state = '{}' where type_id = 'metrics';
 
 insert into users (id, name, email, role)
 values
@@ -44,8 +31,12 @@ values
   ('${profile.id}', '${profile.username}', '${profile.passwordHash}'),
   ('${profileAdmin.id}', '${profileAdmin.username}', '${profileAdmin.passwordHash}');
 `
-    return _resetQuery
-  })
+
+// pathPrefix will return the path prefix for the current environment
+//
+// Trailing `/` is removed, so it is safe to use `pathPrefix + '/foo'`.
+export function pathPrefix(): string {
+  return new URL(Cypress.config().baseUrl || '').pathname.replace(/\/$/, '')
 }
 
 // randInterval creates a random interval in the future.
@@ -75,9 +66,13 @@ export function randDT({
   min,
   max,
 }: {
-  min?: DateTime
-  max?: DateTime
+  min?: DateTime | string | null
+  max?: DateTime | string | null
 }): DateTime {
+  if (typeof min === 'string') min = DateTime.fromISO(min)
+  if (typeof max === 'string') max = DateTime.fromISO(max)
+
+  if (!min && max) min = max.minus({ days: 7 })
   if (!min) min = DateTime.utc().plus({ minutes: 15 })
   if (!max) max = min.plus({ days: 7 })
 
@@ -133,32 +128,76 @@ export function screenName(): string {
   return 'Wide'
 }
 
+let testN = 0
+
+let loginFn: (() => void) | null = null
+
+export function login(): void {
+  if (!loginFn) throw new Error('only valid within a testScreen block')
+
+  loginFn()
+}
+
 export function testScreen(
   label: string,
   fn: (screen: ScreenFormat) => void,
   skipLogin = false,
   adminLogin = false,
+  expFlags: ExpFlag[] = [],
 ): void {
+  after(() => {
+    loginFn = null
+  })
+
+  if (!skipLogin) {
+    const sessID = { n: testN++, ts: new Date() }
+    loginFn = () => {
+      cy.session(sessID, () => {
+        cy.resetConfig()[adminLogin ? 'adminLogin' : 'login']()
+      })
+    }
+  } else {
+    loginFn = null
+  }
+
   describe(label, () => {
-    before(() => {
+    before(function () {
+      cy.task('check:abort').then((abort) => {
+        if (abort) {
+          this.skip()
+        }
+      })
       // Ensure we cancel any in-flight requests by navigating to a blank page before setup.
       //
       // Fixes issues with stale cookies being set from the previous test.
       cy.intercept('/_cy_test_reset', '<html></html>')
       cy.visit('/_cy_test_reset')
 
-      cy.clearCookie('goalert_session.2')
-      resetQuery().then((query) =>
-        cy.task('engine:stop').sql(query).task('engine:start'),
-      )
+      cy.task('engine:stop')
+        .sql(resetQuery)
+        .task('db:resettime')
+        .task('engine:setexpflags', expFlags)
+        .task('engine:start')
     })
     it('reset db', () => {}) // required due to mocha skip bug
 
     if (!skipLogin) {
-      before(() => cy.resetConfig()[adminLogin ? 'adminLogin' : 'login']())
-      it(adminLogin ? 'admin login' : 'login', () => {}) // required due to mocha skip bug
+      if (!loginFn) throw new Error('loginFn not set')
+      beforeEach(loginFn)
     }
 
     describe(screenName(), () => fn(screen()))
   })
+}
+
+// testScreenWithFlags is a convenience function for testing a screen with
+// different experimental flags.
+//
+// It is equivalent to calling testScreen(label, fn, false, false, expFlags)
+export function testScreenWithFlags(
+  label: string,
+  fn: (screen: ScreenFormat) => void,
+  expFlags: ExpFlag[],
+): void {
+  testScreen(label, fn, false, false, expFlags)
 }

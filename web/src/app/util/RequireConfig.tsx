@@ -1,21 +1,34 @@
-import React, { useContext } from 'react'
-import { gql, useQuery } from '@apollo/client'
-import { ConfigType, ConfigValue, ConfigID } from '../../schema'
+import React, { ReactChild, useContext } from 'react'
+import { gql, useQuery } from 'urql'
+import {
+  ConfigType,
+  ConfigValue,
+  ConfigID,
+  IntegrationKeyTypeInfo,
+  DestinationTypeInfo,
+  DestinationType,
+  ActionInput,
+  ExprStringExpression,
+} from '../../schema'
 
 type Value = boolean | number | string | string[] | null
 export type ConfigData = Record<ConfigID, Value>
 
 const ConfigContext = React.createContext({
+  integrationKeyTypes: [] as IntegrationKeyTypeInfo[],
   config: [] as ConfigValue[],
   isAdmin: false as boolean,
-  userID: null as string | null,
+  userID: '' as string,
+  userName: null as string | null,
+  destTypes: [] as DestinationTypeInfo[],
 })
 ConfigContext.displayName = 'ConfigContext'
 
 const query = gql`
-  query {
+  query RequireConfig {
     user {
       id
+      name
       role
     }
     config {
@@ -23,22 +36,66 @@ const query = gql`
       type
       value
     }
+    integrationKeyTypes {
+      id
+      name
+      label
+      enabled
+    }
+    destinationTypes {
+      type
+      name
+      enabled
+      userDisclaimer
+      supportsStatusUpdates
+      statusUpdatesRequired
+
+      isContactMethod
+      isEPTarget
+      isSchedOnCallNotify
+      isDynamicAction
+
+      requiredFields {
+        fieldID
+        label
+        hint
+        hintURL
+        placeholderText
+        prefix
+        inputType
+        supportsSearch
+        supportsValidation
+      }
+
+      dynamicParams {
+        paramID
+        label
+        hint
+        hintURL
+        defaultValue
+      }
+    }
   }
 `
 
 type ConfigProviderProps = {
-  children: JSX.Element | JSX.Element[]
+  children: ReactChild | ReactChild[]
 }
 
-export function ConfigProvider(props: ConfigProviderProps): JSX.Element {
-  const { data } = useQuery(query)
+export function ConfigProvider(props: ConfigProviderProps): React.ReactNode {
+  const [{ data }] = useQuery({
+    query,
+  })
 
   return (
     <ConfigContext.Provider
       value={{
+        integrationKeyTypes: data?.integrationKeyTypes || [],
         config: data?.config || [],
         isAdmin: data?.user?.role === 'admin',
         userID: data?.user?.id || null,
+        userName: data?.user?.name || null,
+        destTypes: data?.destinationTypes || [],
       }}
     >
       {props.children}
@@ -78,7 +135,8 @@ const mapConfig = (value: ConfigValue[]): ConfigData => {
 
 export type SessionInfo = {
   isAdmin: boolean
-  userID: string | null
+  userID: string
+  userName: string | null
   ready: boolean
 }
 
@@ -92,7 +150,24 @@ export function useSessionInfo(): SessionInfo {
   return {
     isAdmin: ctx.isAdmin,
     userID: ctx.userID,
+    userName: ctx.userName,
     ready: Boolean(ctx.userID),
+  }
+}
+
+export type FeatureInfo = {
+  // integrationKeyTypes is a list of integration key types available in the
+  // current environment.
+  integrationKeyTypes: IntegrationKeyTypeInfo[]
+}
+
+// useFeatures returns information about features available in the current
+// environment.
+export function useFeatures(): FeatureInfo {
+  const ctx = useContext(ConfigContext)
+
+  return {
+    integrationKeyTypes: ctx.integrationKeyTypes,
   }
 }
 
@@ -120,6 +195,57 @@ export function useConfigValue(...fields: ConfigID[]): Value[] {
   return fields.map((f) => config[f])
 }
 
+// useContactMethodTypes returns a list of contact method destination types.
+export function useContactMethodTypes(): DestinationTypeInfo[] {
+  const cfg = React.useContext(ConfigContext)
+  return cfg.destTypes.filter((t) => t.isContactMethod)
+}
+
+export function useEPTargetTypes(): DestinationTypeInfo[] {
+  const cfg = React.useContext(ConfigContext)
+  return cfg.destTypes.filter((t) => t.isEPTarget)
+}
+
+export function useDynamicActionTypes(): DestinationTypeInfo[] {
+  const cfg = React.useContext(ConfigContext)
+  return cfg.destTypes.filter((t) => t.isDynamicAction)
+}
+
+/** useDefaultAction returns the default action for the current environment. */
+export function useDefaultAction(): ActionInput {
+  const def = useDynamicActionTypes()[0]
+  return {
+    dest: {
+      type: def.type,
+      args: {},
+    },
+    params: def.dynamicParams.reduce(
+      (acc, p) => {
+        acc[p.paramID] =
+          (p.defaultValue as ExprStringExpression) || `req.body['${p.paramID}']`
+        return acc
+      },
+      {} as Record<string, ExprStringExpression>,
+    ),
+  }
+}
+
+/** useSchedOnCallNotifyTypes returns a list of schedule on-call notification destination types. */
+export function useSchedOnCallNotifyTypes(): DestinationTypeInfo[] {
+  const cfg = React.useContext(ConfigContext)
+  return cfg.destTypes.filter((t) => t.isSchedOnCallNotify)
+}
+
+// useDestinationType returns information about the given destination type.
+export function useDestinationType(type: DestinationType): DestinationTypeInfo {
+  const ctx = React.useContext(ConfigContext)
+  const typeInfo = ctx.destTypes.find((t) => t.type === type)
+
+  if (!typeInfo) throw new Error(`unknown destination type '${type}'`)
+
+  return typeInfo
+}
+
 export function Config(props: {
   children: (x: ConfigData, s?: SessionInfo) => JSX.Element
 }): JSX.Element {
@@ -127,14 +253,14 @@ export function Config(props: {
 }
 
 export type RequireConfigProps = {
-  configID: ConfigID
+  configID?: ConfigID
   // test to determine whether or not children or else is returned
   test?: (x: Value) => boolean
 
   // react element to render if checks failed
   else?: JSX.Element
   isAdmin?: boolean
-  children: React.ReactChildren
+  children?: ReactChild
 }
 
 export default function RequireConfig(

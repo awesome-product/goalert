@@ -10,11 +10,14 @@ import (
 	"github.com/target/goalert/config"
 	"github.com/target/goalert/permission"
 	"github.com/target/goalert/util/log"
+	"github.com/target/goalert/util/sqlutil"
 )
 
-func getSetConfig(setCfg bool, data []byte) error {
+func getSetConfig(ctx context.Context, setCfg bool, data []byte) error {
+	l := log.FromContext(ctx)
+	ctx = log.WithLogger(ctx, l)
 	if viper.GetBool("verbose") {
-		log.EnableVerbose()
+		l.EnableDebug()
 	}
 
 	err := viper.ReadInConfig()
@@ -23,7 +26,7 @@ func getSetConfig(setCfg bool, data []byte) error {
 		return errors.Wrap(err, "read config")
 	}
 
-	c, err := getConfig()
+	c, err := getConfig(ctx)
 	if err != nil {
 		return err
 	}
@@ -32,15 +35,18 @@ func getSetConfig(setCfg bool, data []byte) error {
 		return errors.Wrap(err, "connect to postgres")
 	}
 	defer db.Close()
-	ctx := context.Background()
 	ctx = permission.SystemContext(ctx, "SetConfig")
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return errors.Wrap(err, "start transaction")
 	}
-	defer tx.Rollback()
+	defer sqlutil.Rollback(ctx, "app: get/set config", tx)
 
-	s, err := config.NewStore(ctx, db, c.EncryptionKeys, "")
+	storeCfg := config.StoreConfig{
+		DB:   db,
+		Keys: c.EncryptionKeys,
+	}
+	s, err := config.NewStore(ctx, storeCfg)
 	if err != nil {
 		return errors.Wrap(err, "init config store")
 	}

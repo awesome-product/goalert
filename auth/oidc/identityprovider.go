@@ -11,14 +11,12 @@ import (
 	"sync"
 	"time"
 
-	oidc "github.com/coreos/go-oidc"
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/jmespath/go-jmespath"
 	"github.com/pkg/errors"
 	"github.com/target/goalert/auth"
 	"github.com/target/goalert/config"
 	"github.com/target/goalert/util/log"
-	"go.opencensus.io/plugin/ochttp"
-	"go.opencensus.io/trace"
 	"golang.org/x/oauth2"
 )
 
@@ -50,9 +48,8 @@ func (p *Provider) provider(ctx context.Context) (*oidc.Provider, error) {
 	// oidc keeps the context and uses it after auto-discover is complete.
 	// Giving it context.Background is a workaround to allow fetching keys
 	// after init.
-	oidcCtx, sp := trace.StartSpanWithRemoteParent(context.Background(), "Auth.OIDC.NewProvider", trace.FromContext(ctx).SpanContext())
-	provider, err := oidc.NewProvider(oidc.ClientContext(oidcCtx, &http.Client{Transport: &ochttp.Transport{}}), cfg.OIDC.IssuerURL)
-	sp.End()
+	oidcCtx := log.FromContext(ctx).BackgroundContext()
+	provider, err := oidc.NewProvider(oidcCtx, cfg.OIDC.IssuerURL)
 	if err != nil {
 		return nil, err
 	}
@@ -60,6 +57,7 @@ func (p *Provider) provider(ctx context.Context) (*oidc.Provider, error) {
 	p.providers[cfg.OIDC.IssuerURL] = provider
 	return provider, nil
 }
+
 func (p *Provider) oaConfig(ctx context.Context) (*oauth2.Config, *oidc.IDTokenVerifier, error) {
 	provider, err := p.provider(ctx)
 	if err != nil {
@@ -117,7 +115,9 @@ func (p *Provider) newStateToken(nonceBytes []byte) (state string, err error) {
 
 	buf.Write(nonceBytes[:])
 	buf.WriteByte('N')
-	binary.Write(buf, binary.BigEndian, time.Now().Unix())
+	if err := binary.Write(buf, binary.BigEndian, time.Now().Unix()); err != nil {
+		return "", err
+	}
 
 	sig, err := p.cfg.Keyring.Sign(buf.Bytes())
 	if err != nil {
@@ -194,7 +194,7 @@ func (p *Provider) ExtractIdentity(route *auth.RouteInfo, w http.ResponseWriter,
 			return nil, auth.Error("Failed to generate state token.")
 		}
 		nonceStr := b64enc.EncodeToString(nonce[:])
-		auth.SetCookie(w, req, nonceCookieName, nonceStr)
+		auth.SetCookie(w, req, nonceCookieName, nonceStr, false)
 
 		oaCfg, _, err := p.oaConfig(ctx)
 		if err != nil {
@@ -215,7 +215,7 @@ func (p *Provider) ExtractIdentity(route *auth.RouteInfo, w http.ResponseWriter,
 	if err != nil {
 		return nil, auth.Error("There was a problem recognizing this browser. You can try again")
 	}
-	auth.ClearCookie(w, req, nonceCookieName)
+	auth.ClearCookie(w, req, nonceCookieName, false)
 
 	nonce, err := b64enc.DecodeString(nonceC.Value)
 	if err != nil || len(nonce) != 16 {

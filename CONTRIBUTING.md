@@ -22,9 +22,11 @@ As an example, things like DB changes/migrations should preserve behavior across
 
 ## Pull Requests
 
-Patches are welcome, but we ask that any significant change start as an [issue](https://github.com/target/goalert/issues/new) in the tracker, prefereably before work is started.
+Patches are welcome, but we ask that any significant change start as an [issue](https://github.com/target/goalert/issues/new) in the tracker, preferably before work is started.
 
-Be sure to run `make check` and tests before opening a PR to catch common errors.
+More information is available for [complex features](./docs/complex-features.md).
+
+Be sure to run `make check` and `make test` before opening a PR to catch common errors.
 
 ### UI Change Guidelines
 
@@ -35,5 +37,15 @@ Be sure to run `make check` and tests before opening a PR to catch common errors
 ### Backend Change Guidelines
 
 - Use unit tests as a tool to validate complex logic. For [example](./schedule/rule/weekdayfilter_test.go).
-- New functionality should have a behavioral smoketest at a minimum. For [example](./smoketest/simplenotification_test.go). Documentation on our smoketest framework can be found [here](./smoketest/README.md).
+- New functionality should have a behavioral smoke test at a minimum. For [example](./test/smoke/simplenotification_test.go). Documentation on our smoke test framework can be found [here](./test/smoke/README.md).
 - Go code should [follow best practices](https://golang.org/doc/effective_go.html), exported functions/methods should be commented, etc..
+
+## Testing
+
+GoAlert utilizes 3 main types of testing as tools for different purposes:
+
+- Unit tests are used for complicated logic and exhaustive edge-case testing and benchmarking. They live with the code being tested:
+  - For backend code, a `_test.go` version of a file will contain relevant unit tests. More info [here](https://pkg.go.dev/testing)
+  - For UI code, a `.test.ts` version of a file will contain relevant unit tests. More info [here](https://jestjs.io/docs/getting-started).
+- Smoke tests (in `test/smoke`) are used to ensure main functionality and things like behavioral compatibility with future versions & DB migrations. These focus on hard guarantees like deliverability and preserving intent as the application and datastore evolves and changes over time.
+- Integration tests (currently under `web/src/cypress/integration`) are primarily used to validate happy-path flows work end-to-end, and any important/common error scenarios. They are focused on UX and high-level functionality.

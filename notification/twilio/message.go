@@ -21,6 +21,7 @@ const (
 	MessageStatusReceiving   = MessageStatus("receiving")
 	MessageStatusReceived    = MessageStatus("received")
 	MessageStatusDelivered   = MessageStatus("delivered")
+	MessageStatusRead        = MessageStatus("read")
 	MessageStatusUndelivered = MessageStatus("undelivered")
 	MessageStatusFailed      = MessageStatus("failed")
 )
@@ -67,6 +68,19 @@ type Message struct {
 	Status       MessageStatus
 	ErrorCode    *MessageErrorCode
 	ErrorMessage *string
+
+	MessagingServiceSID string `json:"messaging_service_sid"`
+}
+
+func (msg *Message) sentMessage() *notification.SentMessage {
+	stat := msg.messageStatus()
+
+	return &notification.SentMessage{
+		ExternalID:   msg.SID,
+		State:        stat.State,
+		StateDetails: stat.Details,
+		SrcValue:     msg.From,
+	}
 }
 
 func (msg *Message) messageStatus() *notification.Status {
@@ -90,10 +104,14 @@ func (msg *Message) messageStatus() *notification.Status {
 		status.State = notification.StateFailedPerm
 	case MessageStatusDelivered:
 		status.State = notification.StateDelivered
+	case MessageStatusRead:
+		status.State = notification.StateRead
 	case MessageStatusSent, MessageStatusUndelivered:
 		status.State = notification.StateSent
 	default:
 		status.State = notification.StateSending
 	}
+
+	status.SrcValue = msg.From
 	return &status
 }

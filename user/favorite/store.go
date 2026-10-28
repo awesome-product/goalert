@@ -3,86 +3,26 @@ package favorite
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"slices"
 
+	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"github.com/target/goalert/assignment"
+	"github.com/target/goalert/gadb"
 	"github.com/target/goalert/permission"
-	"github.com/target/goalert/util"
 	"github.com/target/goalert/validation/validate"
 )
 
 // Store allows the lookup and management of Favorites.
-type Store interface {
-	// Set will set a target as a favorite for the given userID. It is safe to call multiple times.
-	Set(ctx context.Context, userID string, tgt assignment.Target) error
+type Store struct{}
 
-	// SetTx will set a target as a favorite for the given userID. It is safe to call multiple times.
-	SetTx(ctx context.Context, tx *sql.Tx, userID string, tgt assignment.Target) error
-
-	// Unset will unset a target as a favorite for the given userID. It is safe to call multiple times.
-	Unset(ctx context.Context, userID string, tgt assignment.Target) error
-
-	FindAll(ctx context.Context, userID string, filter []assignment.TargetType) ([]assignment.Target, error)
-}
-
-// DB implements the Store interface using a postgres database.
-type DB struct {
-	db *sql.DB
-
-	insert  *sql.Stmt
-	delete  *sql.Stmt
-	findAll *sql.Stmt
-}
-
-// NewDB will create a DB backend from a sql.DB. An error will be returned if statements fail to prepare.
-func NewDB(ctx context.Context, db *sql.DB) (*DB, error) {
-	p := &util.Prepare{DB: db, Ctx: ctx}
-	return &DB{
-		db: db,
-		insert: p.P(`
-			INSERT INTO user_favorites (
-				user_id, tgt_service_id,
-				tgt_schedule_id,
-				tgt_rotation_id, 
-				tgt_escalation_policy_id
-			)
-			VALUES ($1, $2, $3, $4, $5)
-			ON CONFLICT DO NOTHING
-		`),
-		delete: p.P(`
-			DELETE FROM user_favorites
-			WHERE
-				user_id = $1 AND
-				tgt_service_id = $2 OR
-				tgt_schedule_id = $3 OR
-				tgt_rotation_id = $4 OR
-				tgt_escalation_policy_id = $5
-		`),
-		findAll: p.P(`
-			SELECT
-				tgt_service_id,
-				tgt_schedule_id,
-				tgt_rotation_id, 
-				tgt_escalation_policy_id
-			FROM user_favorites
-			WHERE user_id = $1
-				AND (
-					(tgt_service_id NOTNULL AND $2) OR
-					(tgt_schedule_id NOTNULL AND $3) OR
-					(tgt_rotation_id NOTNULL AND $4) OR
-					(tgt_escalation_policy_id NOTNULL AND $5)
-				)
-		`),
-	}, p.Err
-}
+// NewStore will create a new Store.
+func NewStore(ctx context.Context) (*Store, error) { return &Store{}, nil }
 
 // Set will store the target as a favorite of the given user. Must be authorized as System or the same user.
-func (db *DB) Set(ctx context.Context, userID string, tgt assignment.Target) error {
-	return db.SetTx(ctx, nil, userID, tgt)
-}
-
-// SetTx will store the target as a favorite of the given user. Must be authorized as System or the same user.
-func (db *DB) SetTx(ctx context.Context, tx *sql.Tx, userID string, tgt assignment.Target) error {
+// It is safe to call multiple times.
+func (s *Store) Set(ctx context.Context, tx gadb.DBTX, userID string, tgt assignment.Target) error {
 	err := permission.LimitCheckAny(ctx, permission.System, permission.MatchUser(userID))
 	if err != nil {
 		return err
@@ -91,41 +31,37 @@ func (db *DB) SetTx(ctx context.Context, tx *sql.Tx, userID string, tgt assignme
 		validate.UUID("TargetID", tgt.TargetID()),
 		validate.UUID("UserID", userID),
 		validate.OneOf("TargetType", tgt.TargetType(), assignment.TargetTypeService,
-			assignment.TargetTypeSchedule, assignment.TargetTypeRotation, assignment.TargetTypeEscalationPolicy),
+			assignment.TargetTypeSchedule, assignment.TargetTypeRotation, assignment.TargetTypeEscalationPolicy, assignment.TargetTypeUser),
 	)
 	if err != nil {
 		return err
 	}
-	stmt := db.insert
-	if tx != nil {
-		stmt = tx.StmtContext(ctx, stmt)
-	}
 
-	var serviceID, scheduleID, rotationID, epID sql.NullString
+	args := gadb.UserFavSetParams{UserID: uuid.MustParse(userID)}
 	switch tgt.TargetType() {
 	case assignment.TargetTypeService:
-		serviceID.Valid = true
-		serviceID.String = tgt.TargetID()
+		args.TgtServiceID = uuid.NullUUID{Valid: true, UUID: uuid.MustParse(tgt.TargetID())}
 	case assignment.TargetTypeSchedule:
-		scheduleID.Valid = true
-		scheduleID.String = tgt.TargetID()
+		args.TgtScheduleID = uuid.NullUUID{Valid: true, UUID: uuid.MustParse(tgt.TargetID())}
 	case assignment.TargetTypeRotation:
-		rotationID.Valid = true
-		rotationID.String = tgt.TargetID()
+		args.TgtRotationID = uuid.NullUUID{Valid: true, UUID: uuid.MustParse(tgt.TargetID())}
 	case assignment.TargetTypeEscalationPolicy:
-		epID.Valid = true
-		epID.String = tgt.TargetID()
+		args.TgtEscalationPolicyID = uuid.NullUUID{Valid: true, UUID: uuid.MustParse(tgt.TargetID())}
+	case assignment.TargetTypeUser:
+		args.TgtUserID = uuid.NullUUID{Valid: true, UUID: uuid.MustParse(tgt.TargetID())}
 	}
-	_, err = stmt.ExecContext(ctx, userID, serviceID, scheduleID, rotationID, epID)
+
+	err = gadb.New(tx).UserFavSet(ctx, args)
 	if err != nil {
-		return errors.Wrap(err, "set favorite")
+		return fmt.Errorf("set favorite: %w", err)
 	}
 
 	return nil
 }
 
 // Unset will remove the target as a favorite of the given user. Must be authorized as System or the same user.
-func (db *DB) Unset(ctx context.Context, userID string, tgt assignment.Target) error {
+// It is safe to call multiple times.
+func (s *Store) Unset(ctx context.Context, tx gadb.DBTX, userID string, tgt assignment.Target) error {
 	err := permission.LimitCheckAny(ctx, permission.System, permission.MatchUser(userID))
 	if err != nil {
 		return err
@@ -135,39 +71,39 @@ func (db *DB) Unset(ctx context.Context, userID string, tgt assignment.Target) e
 		validate.UUID("TargetID", tgt.TargetID()),
 		validate.UUID("UserID", userID),
 		validate.OneOf("TargetType", tgt.TargetType(), assignment.TargetTypeService,
-			assignment.TargetTypeSchedule, assignment.TargetTypeRotation, assignment.TargetTypeEscalationPolicy),
+			assignment.TargetTypeSchedule, assignment.TargetTypeRotation, assignment.TargetTypeEscalationPolicy, assignment.TargetTypeUser),
 	)
 	if err != nil {
 		return err
 	}
-	var serviceID, scheduleID, rotationID, epID sql.NullString
+
+	args := gadb.UserFavUnsetParams{UserID: uuid.MustParse(userID)}
 	switch tgt.TargetType() {
 	case assignment.TargetTypeService:
-		serviceID.Valid = true
-		serviceID.String = tgt.TargetID()
+		args.TgtServiceID = uuid.NullUUID{Valid: true, UUID: uuid.MustParse(tgt.TargetID())}
 	case assignment.TargetTypeSchedule:
-		scheduleID.Valid = true
-		scheduleID.String = tgt.TargetID()
+		args.TgtScheduleID = uuid.NullUUID{Valid: true, UUID: uuid.MustParse(tgt.TargetID())}
 	case assignment.TargetTypeRotation:
-		rotationID.Valid = true
-		rotationID.String = tgt.TargetID()
+		args.TgtRotationID = uuid.NullUUID{Valid: true, UUID: uuid.MustParse(tgt.TargetID())}
 	case assignment.TargetTypeEscalationPolicy:
-		epID.Valid = true
-		epID.String = tgt.TargetID()
+		args.TgtEscalationPolicyID = uuid.NullUUID{Valid: true, UUID: uuid.MustParse(tgt.TargetID())}
+	case assignment.TargetTypeUser:
+		args.TgtUserID = uuid.NullUUID{Valid: true, UUID: uuid.MustParse(tgt.TargetID())}
 	}
-	_, err = db.delete.ExecContext(ctx, userID, serviceID, scheduleID, rotationID, epID)
+
+	err = gadb.New(tx).UserFavUnset(ctx, args)
 	if errors.Is(err, sql.ErrNoRows) {
 		// ignoring since it is safe to unset favorite (with retries)
 		err = nil
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("unset favorite: %w", err)
 	}
 
 	return nil
 }
 
-func (db *DB) FindAll(ctx context.Context, userID string, filter []assignment.TargetType) ([]assignment.Target, error) {
+func (s *Store) FindAll(ctx context.Context, tx gadb.DBTX, userID string, filter []assignment.TargetType) ([]assignment.Target, error) {
 	err := permission.LimitCheckAny(ctx, permission.System, permission.MatchUser(userID))
 	if err != nil {
 		return nil, err
@@ -181,51 +117,38 @@ func (db *DB) FindAll(ctx context.Context, userID string, filter []assignment.Ta
 		return nil, err
 	}
 
-	var allowServices, allowSchedules, allowRotations, allowEscalationPolicies bool
-	if len(filter) == 0 {
-		allowServices = true
-	} else {
-		for _, f := range filter {
-			switch f {
-			case assignment.TargetTypeService:
-				allowServices = true
-			case assignment.TargetTypeSchedule:
-				allowSchedules = true
-			case assignment.TargetTypeRotation:
-				allowRotations = true
-			case assignment.TargetTypeEscalationPolicy:
-				allowEscalationPolicies = true
-			}
-		}
+	args := gadb.UserFavFindAllParams{
+		UserID:                  uuid.MustParse(userID),
+		AllowServices:           len(filter) == 0 || slices.Contains(filter, assignment.TargetTypeService),
+		AllowSchedules:          len(filter) == 0 || slices.Contains(filter, assignment.TargetTypeSchedule),
+		AllowRotations:          len(filter) == 0 || slices.Contains(filter, assignment.TargetTypeRotation),
+		AllowEscalationPolicies: len(filter) == 0 || slices.Contains(filter, assignment.TargetTypeEscalationPolicy),
+		AllowUsers:              len(filter) == 0 || slices.Contains(filter, assignment.TargetTypeUser),
 	}
 
-	rows, err := db.findAll.QueryContext(ctx, userID, allowServices, allowSchedules, allowRotations, allowEscalationPolicies)
+	favs, err := gadb.New(tx).UserFavFindAll(ctx, args)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("find all favorites: %w", err)
 	}
-	defer rows.Close()
 
-	var targets []assignment.Target
-
-	for rows.Next() {
-		var svc, sched, rot, escpolicy sql.NullString
-		err = rows.Scan(&svc, &sched, &rot, &escpolicy)
-		if err != nil {
-			return nil, err
-		}
+	targets := make([]assignment.Target, 0, len(favs))
+	for _, fav := range favs {
 		switch {
-		case svc.Valid:
-			targets = append(targets, assignment.ServiceTarget(svc.String))
-		case sched.Valid:
-			targets = append(targets, assignment.ScheduleTarget(sched.String))
-		case rot.Valid:
-			targets = append(targets, assignment.RotationTarget(rot.String))
-		case escpolicy.Valid:
-			targets = append(targets, assignment.EscalationPolicyTarget(escpolicy.String))
+		case fav.TgtServiceID.Valid:
+			targets = append(targets, assignment.ServiceTarget(fav.TgtServiceID.UUID.String()))
+		case fav.TgtScheduleID.Valid:
+			targets = append(targets, assignment.ScheduleTarget(fav.TgtScheduleID.UUID.String()))
+		case fav.TgtRotationID.Valid:
+			targets = append(targets, assignment.RotationTarget(fav.TgtRotationID.UUID.String()))
+		case fav.TgtEscalationPolicyID.Valid:
+			targets = append(targets, assignment.EscalationPolicyTarget(fav.TgtEscalationPolicyID.UUID.String()))
+		case fav.TgtUserID.Valid:
+			targets = append(targets, assignment.UserTarget(fav.TgtUserID.UUID.String()))
 		}
 	}
+
 	return targets, nil
 }

@@ -5,31 +5,29 @@ import (
 	"database/sql"
 
 	"github.com/target/goalert/engine"
+	"github.com/target/goalert/notification"
 
 	"github.com/pkg/errors"
 )
 
 func (app *App) initEngine(ctx context.Context) error {
-
 	var regionIndex int
 	err := app.db.QueryRowContext(ctx, `SELECT id FROM region_ids WHERE name = $1`, app.cfg.RegionName).Scan(&regionIndex)
 	if errors.Is(err, sql.ErrNoRows) {
 		// doesn't exist, try to create
-		err = app.db.QueryRowContext(ctx, `
-		WITH inserted AS (
-			INSERT INTO region_ids (name) VALUES ($1) 
-			ON CONFLICT DO NOTHING
-			RETURNING id
-		)
-		SELECT id FROM region_ids WHERE name = $1
-		UNION
-		SELECT id FROM inserted
-	`, app.cfg.RegionName).Scan(&regionIndex)
+		_, err = app.db.ExecContext(ctx, `
+		INSERT INTO region_ids (name) VALUES ($1) 
+		ON CONFLICT DO NOTHING`, app.cfg.RegionName)
+		if err != nil {
+			return errors.Wrap(err, "insert region")
+		}
+
+		err = app.db.QueryRowContext(ctx, `SELECT id FROM region_ids WHERE name = $1`, app.cfg.RegionName).Scan(&regionIndex)
 	}
 	if err != nil {
 		return errors.Wrap(err, "get region index")
 	}
-
+	app.notificationManager = notification.NewManager(app.DestRegistry)
 	app.Engine, err = engine.NewEngine(ctx, app.db, &engine.Config{
 		AlertStore:          app.AlertStore,
 		AlertLogStore:       app.AlertLogStore,
@@ -40,20 +38,26 @@ func (app *App) initEngine(ctx context.Context) error {
 		NCStore:             app.NCStore,
 		OnCallStore:         app.OnCallStore,
 		ScheduleStore:       app.ScheduleStore,
+		AuthLinkStore:       app.AuthLinkStore,
+		SlackStore:          app.slackChan,
+		DestRegistry:        app.DestRegistry,
 
 		ConfigSource: app.ConfigStore,
 
-		Keys: app.cfg.EncryptionKeys,
+		CycleTime: app.cfg.EngineCycleTime,
 
 		MaxMessages: 50,
 
 		DisableCycle: app.cfg.APIOnly,
+		LogCycles:    app.cfg.LogEngine,
+		River:        app.River,
+		RiverDBSQL:   app.RiverDBSQL,
+		RiverWorkers: app.RiverWorkers,
+		Logger:       app.Logger,
 	})
 	if err != nil {
 		return errors.Wrap(err, "init engine")
 	}
-
-	app.notificationManager.SetResultReceiver(app.Engine)
 
 	return nil
 }

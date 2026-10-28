@@ -4,38 +4,43 @@ import (
 	"context"
 	"flag"
 	"log"
-	"math/rand"
 	"time"
 
 	"github.com/target/goalert/alert"
 	"github.com/target/goalert/assignment"
 	"github.com/target/goalert/migrate"
+	galog "github.com/target/goalert/util/log"
 	"github.com/target/goalert/util/sqlutil"
 	"github.com/target/goalert/util/timeutil"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgtype"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pkg/errors"
 )
 
-var (
-	adminID string
-)
+var adminID string
+
+var logger = galog.NewLogger()
 
 func main() {
 	log.SetFlags(log.Lshortfile)
 	flag.StringVar(&adminID, "admin-id", "", "Generate an admin user with the given ID.")
 	seedVal := flag.Int64("seed", 1, "Change the random seed used to generate data.")
+	mult := flag.Float64("mult", 1, "Multiply base type counts (e.g., alerts, users, services).")
 	genData := flag.Bool("with-rand-data", false, "Repopulates the DB with random data.")
 	skipMigrate := flag.Bool("no-migrate", false, "Disables UP migration.")
 	skipDrop := flag.Bool("skip-drop", false, "Skip database drop/create step.")
 	adminURL := flag.String("admin-db-url", "postgres://goalert@localhost/postgres", "Admin DB URL to use (used to recreate DB).")
 	dbURL := flag.String("db-url", "postgres://goalert@localhost", "DB URL to use.")
+	verbose := flag.Bool("v", false, "Enable verbose logging.")
 	flag.Parse()
 
-	rand.Seed(*seedVal)
+	if !*verbose {
+		logger.ErrorsOnly()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -70,20 +75,21 @@ func main() {
 	if !*genData {
 		return
 	}
-
-	err = fillDB(ctx, *dbURL)
+	dataCfg := &datagenConfig{AdminID: adminID, Seed: *seedVal}
+	dataCfg.SetDefaults()
+	dataCfg.Multiply(*mult)
+	err = fillDB(ctx, dataCfg, *dbURL)
 	if err != nil {
 		log.Fatal("insert random data:", err)
 	}
-
 }
 
-func fillDB(ctx context.Context, url string) error {
+func fillDB(ctx context.Context, dataCfg *datagenConfig, url string) error {
 	s := time.Now()
 	defer func() {
 		log.Println("Completed in", time.Since(s))
 	}()
-	data := datagenConfig{AdminID: adminID}.Generate()
+	data := dataCfg.Generate()
 	log.Println("Generated random data in", time.Since(s))
 
 	cfg, err := pgxpool.ParseConfig(url)
@@ -92,13 +98,17 @@ func fillDB(ctx context.Context, url string) error {
 	}
 	cfg.MaxConns = 20
 
-	pool, err := pgxpool.ConnectConfig(ctx, cfg)
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return errors.Wrap(err, "connect to db")
 	}
 	defer pool.Close()
 
 	must := func(err error) {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			log.Printf("ERROR: %s\n%s\n%s\n", pgErr.Detail, pgErr.InternalQuery, pgErr.Where)
+		}
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -138,13 +148,13 @@ func fillDB(ctx context.Context, url string) error {
 		u := data.Users[n]
 		return []interface{}{asUUID(u.ID), u.Name, u.Role, u.Email}
 	})
-	copyFrom("user_contact_methods", []string{"id", "user_id", "name", "type", "value", "disabled"}, len(data.ContactMethods), func(n int) []interface{} {
+	copyFrom("user_contact_methods", []string{"id", "user_id", "name", "dest", "disabled", "pending", "private"}, len(data.ContactMethods), func(n int) []interface{} {
 		cm := data.ContactMethods[n]
-		return []interface{}{asUUID(cm.ID), asUUID(cm.UserID), cm.Name, cm.Type, cm.Value, cm.Disabled}
+		return []interface{}{cm.ID, asUUID(cm.UserID), cm.Name, cm.Dest, cm.Disabled, cm.Pending, cm.Private}
 	}, "users")
 	copyFrom("user_notification_rules", []string{"id", "user_id", "contact_method_id", "delay_minutes"}, len(data.NotificationRules), func(n int) []interface{} {
 		nr := data.NotificationRules[n]
-		return []interface{}{asUUID(nr.ID), asUUID(nr.UserID), asUUID(nr.ContactMethodID), nr.DelayMinutes}
+		return []interface{}{asUUID(nr.ID), asUUID(nr.UserID), nr.ContactMethodID, nr.DelayMinutes}
 	}, "user_contact_methods")
 	copyFrom("rotations", []string{"id", "name", "description", "type", "shift_length", "start_time", "time_zone"}, len(data.Rotations), func(n int) []interface{} {
 		r := data.Rotations[n]
@@ -202,7 +212,7 @@ func fillDB(ctx context.Context, url string) error {
 	})
 	copyFrom("escalation_policy_steps", []string{"id", "escalation_policy_id", "step_number", "delay"}, len(data.EscalationSteps), func(n int) []interface{} {
 		step := data.EscalationSteps[n]
-		return []interface{}{asUUID(step.ID), asUUID(step.PolicyID), step.StepNumber, step.DelayMinutes}
+		return []interface{}{step.ID, asUUID(step.PolicyID), step.StepNumber, step.DelayMinutes}
 	}, "escalation_policies")
 
 	copyFrom("escalation_policy_actions", []string{"id", "escalation_policy_step_id", "user_id", "rotation_id", "schedule_id", "channel_id"}, len(data.EscalationActions), func(n int) []interface{} {
@@ -260,18 +270,45 @@ func fillDB(ctx context.Context, url string) error {
 
 	_, err = pool.Exec(ctx, "alter table alerts disable trigger trg_enforce_alert_limit")
 	must(err)
-	copyFrom("alerts", []string{"status", "summary", "details", "dedup_key", "service_id", "source"}, len(data.Alerts), func(n int) []interface{} {
+	copyFrom("alerts", []string{"id", "created_at", "status", "summary", "details", "dedup_key", "service_id", "source"}, len(data.Alerts), func(n int) []interface{} {
 		a := data.Alerts[n]
 		var dedup *alert.DedupID
 		if a.Status != alert.StatusClosed {
 			dedup = a.DedupKey()
 		}
-		return []interface{}{a.Status, a.Summary, a.Details, dedup, asUUID(a.ServiceID), a.Source}
+		return []interface{}{a.ID, a.CreatedAt, a.Status, a.Summary, a.Details, dedup, asUUID(a.ServiceID), a.Source}
 	}, "services")
+
+	copyFrom("alert_logs", []string{"alert_id", "timestamp", "event", "message", "sub_type", "sub_user_id", "sub_classifier", "meta"}, len(data.AlertLogs), func(n int) []interface{} {
+		a := data.AlertLogs[n]
+		var subType interface{}
+		if a.UserID != "" {
+			subType = "user"
+		}
+		return []interface{}{a.AlertID, a.Timestamp, a.Event, a.Message, subType, asUUIDPtr(a.UserID), a.Class, a.Meta}
+	}, "alerts", "outgoing_messages", "users")
+
+	copyFrom("alert_feedback", []string{"alert_id", "noise_reason"}, len(data.AlertFeedback), func(n int) []interface{} {
+		f := data.AlertFeedback[n]
+		return []interface{}{f.ID, f.NoiseReason}
+	}, "alerts")
+
+	copyFrom("outgoing_messages", []string{"id", "created_at", "alert_id", "service_id", "escalation_policy_id", "contact_method_id", "user_id", "message_type", "last_status", "sent_at"}, len(data.AlertMessages), func(n int) []interface{} {
+		msg := data.AlertMessages[n]
+		return []interface{}{asUUID(msg.ID), msg.CreatedAt, msg.AlertID, asUUID(msg.ServiceID), asUUID(msg.EPID), asUUID(msg.CMID), asUUID(msg.UserID), "alert_notification", msg.Status, msg.SentAt}
+	}, "alerts", "services", "users", "user_contact_methods")
 
 	dt.Wait()
 	_, err = pool.Exec(ctx, "alter table alerts enable trigger all")
 	must(err)
+
+	// fix sequences
+	_, err = pool.Exec(ctx, "SELECT pg_catalog.setval('public.alerts_id_seq', (select max(id)+1 from public.alerts), true)")
+	must(err)
+
+	_, err = pool.Exec(ctx, "vacuum analyze")
+	must(err)
+
 	return nil
 }
 
@@ -291,6 +328,7 @@ func recreateDB(ctx context.Context, url, dbName string) error {
 }
 
 func resetDB(ctx context.Context, url string) (n int, err error) {
+	ctx = galog.WithLogger(ctx, logger)
 	if flag.Arg(0) != "" {
 		n, err = migrate.Up(ctx, url, flag.Arg(0))
 	} else {

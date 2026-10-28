@@ -3,37 +3,38 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/target/goalert/alert"
 	"github.com/target/goalert/app/lifecycle"
+	"github.com/target/goalert/auth/authlink"
 	"github.com/target/goalert/engine/cleanupmanager"
+	"github.com/target/goalert/engine/compatmanager"
 	"github.com/target/goalert/engine/escalationmanager"
 	"github.com/target/goalert/engine/heartbeatmanager"
 	"github.com/target/goalert/engine/message"
+	"github.com/target/goalert/engine/metricsmanager"
 	"github.com/target/goalert/engine/npcyclemanager"
 	"github.com/target/goalert/engine/processinglock"
 	"github.com/target/goalert/engine/rotationmanager"
 	"github.com/target/goalert/engine/schedulemanager"
-	"github.com/target/goalert/engine/statusupdatemanager"
+	"github.com/target/goalert/engine/signalmgr"
+	"github.com/target/goalert/engine/statusmgr"
 	"github.com/target/goalert/engine/verifymanager"
+	"github.com/target/goalert/expflag"
+	"github.com/target/goalert/gadb"
 	"github.com/target/goalert/notification"
 	"github.com/target/goalert/permission"
 	"github.com/target/goalert/user"
-	"github.com/target/goalert/user/contactmethod"
 	"github.com/target/goalert/util/log"
 	"github.com/target/goalert/util/sqlutil"
-	"go.opencensus.io/trace"
 )
 
-type updater interface {
-	Name() string
-	UpdateAll(context.Context) error
-}
-
-// Engine handles automatic escaltion of unacknowledged(triggered) alerts, as well as
+// Engine handles automatic escalation of unacknowledged(triggered) alerts, as well as
 // passing to-be-sent notifications to the notification.Sender.
 //
 // Care is taken to ensure only one attempt is made per contact-method
@@ -42,17 +43,20 @@ type Engine struct {
 	b   *backend
 	mgr *lifecycle.Manager
 
+	*cycleMonitor
+
 	shutdownCh  chan struct{}
-	triggerCh   chan chan struct{}
+	triggerCh   chan struct{}
 	runLoopExit chan struct{}
 
-	nextCycle chan chan struct{}
-
-	modules []updater
+	modules []processinglock.Module
 	msg     *message.DB
 
-	am  alert.Manager
+	a   *alert.Store
 	cfg *Config
+
+	// needed to re-start river during switchover
+	runCtx context.Context
 
 	triggerPauseCh chan *pauseReq
 }
@@ -74,12 +78,12 @@ func NewEngine(ctx context.Context, db *sql.DB, c *Config) (*Engine, error) {
 	p := &Engine{
 		cfg:            c,
 		shutdownCh:     make(chan struct{}),
-		triggerCh:      make(chan chan struct{}),
+		triggerCh:      make(chan struct{}),
 		triggerPauseCh: make(chan *pauseReq),
 		runLoopExit:    make(chan struct{}),
-		nextCycle:      make(chan chan struct{}),
+		cycleMonitor:   newCycleMonitor(),
 
-		am: c.AlertStore,
+		a: c.AlertStore,
 	}
 
 	p.mgr = lifecycle.NewManager(p._run, p._shutdown)
@@ -91,7 +95,7 @@ func NewEngine(ctx context.Context, db *sql.DB, c *Config) (*Engine, error) {
 		return nil, err
 	}
 
-	rotMgr, err := rotationmanager.NewDB(ctx, db)
+	rotMgr, err := rotationmanager.NewDB(ctx, db, c.RiverDBSQL)
 	if err != nil {
 		return nil, errors.Wrap(err, "rotation management backend")
 	}
@@ -107,7 +111,7 @@ func NewEngine(ctx context.Context, db *sql.DB, c *Config) (*Engine, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "notification cycle backend")
 	}
-	statMgr, err := statusupdatemanager.NewDB(ctx, db)
+	statMgr, err := statusmgr.NewDB(ctx, db, c.DestRegistry, c.ConfigSource)
 	if err != nil {
 		return nil, errors.Wrap(err, "status update backend")
 	}
@@ -119,12 +123,21 @@ func NewEngine(ctx context.Context, db *sql.DB, c *Config) (*Engine, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "heartbeat processing backend")
 	}
-	cleanMgr, err := cleanupmanager.NewDB(ctx, db)
+	cleanMgr, err := cleanupmanager.NewDB(ctx, db, c.AlertStore, c.Logger.With(slog.String("module", "cleanup")))
 	if err != nil {
 		return nil, errors.Wrap(err, "cleanup backend")
 	}
+	metricsMgr, err := metricsmanager.NewDB(ctx, db)
+	if err != nil {
+		return nil, errors.Wrap(err, "metrics management backend")
+	}
+	compatMgr, err := compatmanager.NewDB(ctx, db, c.SlackStore)
+	if err != nil {
+		return nil, errors.Wrap(err, "compatibility backend")
+	}
 
-	p.modules = []updater{
+	p.modules = []processinglock.Module{
+		compatMgr,
 		rotMgr,
 		schedMgr,
 		epMgr,
@@ -133,6 +146,15 @@ func NewEngine(ctx context.Context, db *sql.DB, c *Config) (*Engine, error) {
 		verifyMgr,
 		hbMgr,
 		cleanMgr,
+		metricsMgr,
+	}
+
+	if expflag.ContextHas(ctx, expflag.UnivKeys) {
+		signalMgr, err := signalmgr.NewDB(ctx, db)
+		if err != nil {
+			return nil, errors.Wrap(err, "signal manager backend")
+		}
+		p.modules = append(p.modules, signalMgr)
 	}
 
 	p.msg, err = message.NewDB(ctx, db, c.AlertLogStore, p.mgr)
@@ -145,25 +167,31 @@ func NewEngine(ctx context.Context, db *sql.DB, c *Config) (*Engine, error) {
 		return nil, errors.Wrap(err, "init backend")
 	}
 
+	args := processinglock.SetupArgs{
+		DB:      db,
+		Workers: c.RiverWorkers,
+		River:   c.River,
+	}
+	for _, m := range p.modules {
+		if s, ok := m.(processinglock.Setupable); ok {
+			err = s.Setup(ctx, args)
+			if err != nil {
+				return nil, errors.Wrap(err, "setup module")
+			}
+		}
+	}
+
 	return p, nil
 }
 
-// WaitNextCycle will return after the next engine cycle starts and then finishes.
-func (p *Engine) WaitNextCycle(ctx context.Context) error {
-	select {
-	case ch := <-p.nextCycle:
-		select {
-		case <-ch:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+func (p *Engine) AuthLinkURL(ctx context.Context, providerID, subjectID string, meta authlink.Metadata) (url string, err error) {
+	permission.SudoContext(ctx, func(ctx context.Context) {
+		url, err = p.cfg.AuthLinkStore.AuthLinkURL(ctx, providerID, subjectID, meta)
+	})
+	return url, err
 }
 
-func (p *Engine) processModule(ctx context.Context, m updater) {
+func (p *Engine) processModule(ctx context.Context, m processinglock.Updatable) {
 	defer recoverPanic(ctx, m.Name())
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -186,8 +214,6 @@ func (p *Engine) processModule(ctx context.Context, m updater) {
 }
 
 func (p *Engine) processMessages(ctx context.Context) {
-	ctx, sp := trace.StartSpan(ctx, "Engine.MessageManager")
-	defer sp.End()
 	defer recoverPanic(ctx, "MessageManager")
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
@@ -218,38 +244,20 @@ func recoverPanic(ctx context.Context, name string) {
 }
 
 // Trigger will force notifications to be processed immediately.
-func (p *Engine) Trigger() {
-	<-p.triggerCh
-}
-
-// TriggerAndWaitNextCycle will force notifications to be processed immediately
-// and will return after the next engine cycle starts and then finishes.
-func (p *Engine) TriggerAndWaitNextCycle(ctx context.Context) error {
-	var waitCh chan struct{}
-	select {
-	case waitCh = <-p.triggerCh: // cause new trigger
-	case waitCh = <-p.nextCycle: // cycle started for some other reason
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	select {
-	case <-waitCh:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
+func (p *Engine) Trigger() { <-p.triggerCh }
 
 // Pause will attempt to gracefully stop engine processing.
 func (p *Engine) Pause(ctx context.Context) error {
-	ctx, sp := trace.StartSpan(ctx, "Engine.Pause")
-	defer sp.End()
-
 	return p.mgr.Pause(ctx)
 }
+
 func (p *Engine) _pause(ctx context.Context) error {
 	ch := make(chan error, 1)
+
+	err := p.cfg.River.Stop(ctx)
+	if err != nil {
+		return errors.Wrap(err, "pause river")
+	}
 
 	select {
 	case <-p.shutdownCh:
@@ -259,7 +267,7 @@ func (p *Engine) _pause(ctx context.Context) error {
 	case p.triggerPauseCh <- &pauseReq{ch: ch, ctx: ctx}:
 		select {
 		case <-ctx.Done():
-			defer p.Resume(ctx)
+			defer func() { _ = p.Resume(ctx) }()
 			return ctx.Err()
 		case err := <-ch:
 			return err
@@ -271,9 +279,19 @@ func (p *Engine) _pause(ctx context.Context) error {
 func (p *Engine) Resume(ctx context.Context) error {
 	return p.mgr.Resume(ctx)
 }
+
 func (p *Engine) _resume(ctx context.Context) error {
-	// nothing to be done `p.mgr.IsPaused` will already
-	// return false
+	if p.cfg.DisableCycle {
+		return nil
+	}
+
+	err := p.cfg.River.QueueResume(ctx, "*", nil)
+	if err != nil {
+		return errors.Wrap(err, "resume river")
+	}
+
+	p.startRiver()
+
 	return nil
 }
 
@@ -287,15 +305,17 @@ func (p *Engine) Shutdown(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
-	ctx, sp := trace.StartSpan(ctx, "Engine.Shutdown")
-	defer sp.End()
 
 	return p.mgr.Shutdown(ctx)
 }
-func (p *Engine) _shutdown(ctx context.Context) error {
+
+func (p *Engine) _shutdown(ctx context.Context) (err error) {
 	close(p.shutdownCh)
 	<-p.runLoopExit
-	return nil
+	if !p.cfg.DisableCycle {
+		err = p.cfg.River.Stop(ctx)
+	}
+	return err
 }
 
 // SetSendResult will update the status of a message.
@@ -307,10 +327,8 @@ func (p *Engine) SetSendResult(ctx context.Context, res *notification.SendResult
 	return err
 }
 
-// Receive will process a notification result.
-func (p *Engine) Receive(ctx context.Context, callbackID string, result notification.Result) error {
-	ctx, sp := trace.StartSpan(ctx, "Engine.Receive")
-	defer sp.End()
+// ReceiveSubject will process a notification result.
+func (p *Engine) ReceiveSubject(ctx context.Context, providerID, subjectID, callbackID string, result notification.Result) error {
 	cb, err := p.b.FindOne(ctx, callbackID)
 	if err != nil {
 		return err
@@ -324,7 +342,64 @@ func (p *Engine) Receive(ctx context.Context, callbackID string, result notifica
 
 	var usr *user.User
 	permission.SudoContext(ctx, func(ctx context.Context) {
-		cm, serr := p.cfg.ContactMethodStore.FindOne(ctx, cb.ContactMethodID)
+		usr, err = p.cfg.UserStore.FindOneBySubject(ctx, providerID, subjectID)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to find user: %w", err)
+	}
+	if usr == nil {
+		return &notification.UnknownSubjectError{
+			AlertID: cb.AlertID,
+		}
+	}
+
+	ctx = permission.UserSourceContext(ctx, usr.ID, usr.Role, &permission.SourceInfo{
+		Type: permission.SourceTypeNotificationCallback,
+		ID:   callbackID,
+	})
+
+	var newStatus alert.Status
+	switch result {
+	case notification.ResultAcknowledge:
+		newStatus = alert.StatusActive
+	case notification.ResultResolve:
+		newStatus = alert.StatusClosed
+	case notification.ResultEscalate:
+		err = p.a.EscalateAsOf(ctx, cb.AlertID, cb.CreatedAt)
+		if err != nil {
+			return fmt.Errorf("escalate alert: %w", err)
+		}
+		return nil
+	default:
+		return errors.New("unknown result type")
+	}
+
+	if cb.AlertID != 0 {
+		return errors.Wrap(p.a.UpdateStatus(ctx, cb.AlertID, newStatus), "update alert")
+	}
+	if cb.ServiceID != "" {
+		return errors.Wrap(p.a.UpdateStatusByService(ctx, cb.ServiceID, newStatus), "update all alerts")
+	}
+
+	return errors.New("unknown callback type")
+}
+
+// Receive will process a notification result.
+func (p *Engine) Receive(ctx context.Context, callbackID string, result notification.Result) error {
+	cb, err := p.b.FindOne(ctx, callbackID)
+	if err != nil {
+		return err
+	}
+	if cb.ServiceID != "" {
+		ctx = log.WithField(ctx, "ServiceID", cb.ServiceID)
+	}
+	if cb.AlertID != 0 {
+		ctx = log.WithField(ctx, "AlertID", cb.AlertID)
+	}
+
+	var usr *user.User
+	permission.SudoContext(ctx, func(ctx context.Context) {
+		cm, serr := p.cfg.ContactMethodStore.FindOne(ctx, p.b.db, cb.ContactMethodID)
 		if serr != nil {
 			err = errors.Wrap(serr, "lookup contact method")
 			return
@@ -348,15 +423,21 @@ func (p *Engine) Receive(ctx context.Context, callbackID string, result notifica
 		newStatus = alert.StatusActive
 	case notification.ResultResolve:
 		newStatus = alert.StatusClosed
+	case notification.ResultEscalate:
+		err = p.a.EscalateAsOf(ctx, cb.AlertID, cb.CreatedAt)
+		if err != nil {
+			return fmt.Errorf("escalate alert: %w", err)
+		}
+		return nil
 	default:
 		return errors.New("unknown result type")
 	}
 
 	if cb.AlertID != 0 {
-		return errors.Wrap(p.am.UpdateStatus(ctx, cb.AlertID, newStatus), "update alert")
+		return errors.Wrap(p.a.UpdateStatus(ctx, cb.AlertID, newStatus), "update alert")
 	}
 	if cb.ServiceID != "" {
-		return errors.Wrap(p.am.UpdateStatusByService(ctx, cb.ServiceID, newStatus), "update all alerts")
+		return errors.Wrap(p.a.UpdateStatusByService(ctx, cb.ServiceID, newStatus), "update all alerts")
 	}
 
 	return errors.New("unknown callback type")
@@ -364,30 +445,32 @@ func (p *Engine) Receive(ctx context.Context, callbackID string, result notifica
 
 // Start will enable all associated contact methods of `value` with type `t`. This should
 // be invoked if a user, for example, responds with `START` via sms.
-func (p *Engine) Start(ctx context.Context, d notification.Dest) error {
-	if !d.Type.IsUserCM() {
-		return errors.New("START only supported on user contact methods")
-	}
-
+func (p *Engine) Start(ctx context.Context, d gadb.DestV1) error {
 	var err error
 	permission.SudoContext(ctx, func(ctx context.Context) {
-		err = p.cfg.ContactMethodStore.EnableByValue(ctx, contactmethod.TypeFromDestType(d.Type), d.Value)
+		err = p.cfg.ContactMethodStore.EnableByDest(ctx, p.b.db, d)
 	})
+
+	if errors.Is(err, sql.ErrNoRows) {
+		// no contact methods found, nothing to do
+		return nil
+	}
 
 	return err
 }
 
 // Stop will disable all associated contact methods of `value` with type `t`. This should
 // be invoked if a user, for example, responds with `STOP` via SMS.
-func (p *Engine) Stop(ctx context.Context, d notification.Dest) error {
-	if !d.Type.IsUserCM() {
-		return errors.New("STOP only supported on user contact methods")
-	}
-
+func (p *Engine) Stop(ctx context.Context, d gadb.DestV1) error {
 	var err error
 	permission.SudoContext(ctx, func(ctx context.Context) {
-		err = p.cfg.ContactMethodStore.DisableByValue(ctx, contactmethod.TypeFromDestType(d.Type), d.Value)
+		err = p.cfg.ContactMethodStore.DisableByDest(ctx, p.b.db, d)
 	})
+
+	if errors.Is(err, sql.ErrNoRows) {
+		// no contact methods found, nothing to do
+		return nil
+	}
 
 	return err
 }
@@ -397,44 +480,71 @@ func (p *Engine) processAll(ctx context.Context) bool {
 		if p.mgr.IsPausing() {
 			return true
 		}
-		ctx, sp := trace.StartSpan(ctx, m.Name())
+
+		up, ok := m.(processinglock.Updatable)
+		if !ok {
+			continue
+		}
+
 		start := time.Now()
-		p.processModule(ctx, m)
+		p.processModule(ctx, up)
 		metricModuleDuration.WithLabelValues(m.Name()).Observe(time.Since(start).Seconds())
-		sp.End()
 	}
 	return false
 }
-func (p *Engine) cycle(ctx context.Context) {
-	ctx, sp := trace.StartSpan(ctx, "Engine.Cycle")
-	defer sp.End()
 
-	ctx = p.cfg.ConfigSource.Config().Context(ctx)
+func monitorCycle(ctx context.Context, start time.Time) (cancel func()) {
+	ctx, cancel = context.WithCancel(ctx)
 
-	ch := make(chan struct{})
-	defer close(ch)
-passSignals:
-	for {
-		select {
-		case p.nextCycle <- ch:
-		default:
-			break passSignals
+	go func() {
+		watch := time.NewTicker(5 * time.Second)
+		defer watch.Stop()
+		watchErr := time.NewTicker(time.Minute)
+		defer watchErr.Stop()
+
+	loop:
+		for {
+			select {
+			case <-watchErr.C:
+				log.Log(log.WithField(ctx, "elapsedSec", time.Since(start).Seconds()), fmt.Errorf("engine possibly stuck"))
+			case <-watch.C:
+				log.Logf(log.WithField(ctx, "elapsedSec", time.Since(start).Seconds()), "long engine cycle")
+			case <-ctx.Done():
+				break loop
+			}
 		}
-	}
+
+		dur := time.Since(start)
+		if dur < 5*time.Second {
+			return
+		}
+
+		log.Log(log.WithField(ctx, "elapsedSec", dur.Seconds()), fmt.Errorf("slow cycle finished"))
+	}()
+
+	return cancel
+}
+
+func (p *Engine) cycle(ctx context.Context) {
+	// track start of next cycle, and defer the call to the returned sfinish function
+	defer p.startNextCycle()()
+	ctx = p.cfg.ConfigSource.Config().Context(ctx)
 
 	if p.mgr.IsPausing() {
 		log.Logf(ctx, "Engine cycle disabled (paused or shutting down).")
-		sp.AddAttributes(trace.BoolAttribute("cycle.skip", true))
 		return
 	}
 
-	log.Logf(ctx, "Engine cycle start.")
-	defer log.Logf(ctx, "Engine cycle end.")
+	if p.cfg.LogCycles {
+		log.Logf(ctx, "Engine cycle start.")
+		defer log.Logf(ctx, "Engine cycle end.")
+	}
 
 	startAll := time.Now()
+	defer monitorCycle(ctx, startAll)()
+
 	aborted := p.processAll(ctx)
 	if aborted || p.mgr.IsPausing() {
-		sp.Annotate([]trace.Attribute{trace.BoolAttribute("cycle.abort", true)}, "Cycle aborted.")
 		log.Logf(ctx, "Engine cycle aborted (paused or shutting down).")
 		return
 	}
@@ -444,9 +554,18 @@ passSignals:
 	metricModuleDuration.WithLabelValues("Engine").Observe(time.Since(startAll).Seconds())
 	metricCycleTotal.Inc()
 }
+
 func (p *Engine) handlePause(ctx context.Context, respCh chan error) {
 	// nothing special to do currently
 	respCh <- nil
+}
+
+func (p *Engine) startRiver() {
+	ctx := p.runCtx
+	err := p.cfg.River.Start(ctx)
+	if err != nil {
+		log.Log(ctx, errors.Wrap(err, "start river"))
+	}
 }
 
 func (p *Engine) _run(ctx context.Context) error {
@@ -464,13 +583,20 @@ func (p *Engine) _run(ctx context.Context) error {
 				return ctx.Err()
 			case <-p.shutdownCh:
 				return nil
-			case p.triggerCh <- ch:
+			case p.triggerCh <- struct{}{}:
 				log.Logf(ctx, "Ignoring engine trigger (API-only mode).")
 			}
 		}
 	}
 
-	alertTicker := time.NewTicker(5 * time.Second)
+	p.runCtx = ctx
+	p.startRiver()
+
+	dur := p.cfg.CycleTime
+	if dur == 0 {
+		dur = 5 * time.Second
+	}
+	alertTicker := time.NewTicker(dur)
 	defer alertTicker.Stop()
 
 	defer close(p.triggerCh)
@@ -493,13 +619,11 @@ func (p *Engine) _run(ctx context.Context) error {
 		default:
 		}
 
-		nextTrigger := make(chan struct{})
 		select {
 		case req := <-p.triggerPauseCh:
 			p.handlePause(req.ctx, req.ch)
-		case p.triggerCh <- nextTrigger:
+		case p.triggerCh <- struct{}{}:
 			p.cycle(log.WithField(ctx, "Trigger", "DIRECT"))
-			close(nextTrigger)
 		case <-alertTicker.C:
 			p.cycle(log.WithField(ctx, "Trigger", "INTERVAL"))
 		case <-ctx.Done():

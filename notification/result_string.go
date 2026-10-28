@@ -10,15 +10,17 @@ func _() {
 	var x [1]struct{}
 	_ = x[ResultAcknowledge-0]
 	_ = x[ResultResolve-1]
+	_ = x[ResultEscalate-2]
 }
 
-const _Result_name = "ResultAcknowledgeResultResolve"
+const _Result_name = "ResultAcknowledgeResultResolveResultEscalate"
 
-var _Result_index = [...]uint8{0, 17, 30}
+var _Result_index = [...]uint8{0, 17, 30, 44}
 
 func (i Result) String() string {
-	if i < 0 || i >= Result(len(_Result_index)-1) {
+	idx := int(i) - 0
+	if i < 0 || idx >= len(_Result_index)-1 {
 		return "Result(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _Result_name[_Result_index[i]:_Result_index[i+1]]
+	return _Result_name[_Result_index[idx]:_Result_index[idx+1]]
 }

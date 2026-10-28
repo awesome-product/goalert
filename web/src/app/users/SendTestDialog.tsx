@@ -1,8 +1,6 @@
-import React, { useEffect, useState, MouseEvent } from 'react'
-import { useQuery, useMutation, gql } from '@apollo/client'
-
+import React, { useEffect, MouseEvent, useState } from 'react'
+import { gql, useQuery, useMutation } from 'urql'
 import Spinner from '../loading/components/Spinner'
-
 import {
   Button,
   Dialog,
@@ -10,30 +8,31 @@ import {
   DialogTitle,
   DialogContent,
   DialogContentText,
-} from '@material-ui/core'
-import { makeStyles } from '@material-ui/core/styles'
+} from '@mui/material'
 import toTitleCase from '../util/toTitleCase'
-import DialogContentError from '../dialogs/components/DialogContentError'
-import { useConfigValue } from '../util/RequireConfig'
-import { textColors } from '../styles/statusStyles'
-
-import { DateTime } from 'luxon'
-import { ContactMethodType } from '../../schema'
+import { DateTime, Duration } from 'luxon'
+import {
+  DestinationInput,
+  NotificationState,
+  UserContactMethod,
+} from '../../schema'
+import DestinationInputChip from '../util/DestinationInputChip'
+import { Time } from '../util/Time'
 
 const query = gql`
-  query ($id: ID!, $number: String!) {
+  query ($id: ID!) {
     userContactMethod(id: $id) {
       id
-      type
-      formattedValue
+      dest {
+        type
+        args
+      }
       lastTestVerifyAt
       lastTestMessageState {
         details
         status
+        formattedSrcValue
       }
-    }
-    phoneNumberInfo(number: $number) {
-      formatted
     }
   }
 `
@@ -44,112 +43,137 @@ const mutation = gql`
   }
 `
 
-const useStyles = makeStyles({
-  ...textColors,
-})
+function getTestStatusColor(status?: string | null): string {
+  switch (status) {
+    case 'OK':
+      return 'success'
+    case 'ERROR':
+      return 'error'
+    default:
+      return 'warning'
+  }
+}
+
+type SendTestContentProps = {
+  dest: DestinationInput
+  isSending: boolean
+  isWaiting: boolean
+
+  sentTime?: string | null
+  sentState?: NotificationState | null
+}
+
+export function SendTestContent(props: SendTestContentProps): React.ReactNode {
+  return (
+    <React.Fragment>
+      <DialogContent>
+        <DialogContentText>
+          GoAlert is sending a test to{' '}
+          <DestinationInputChip value={props.dest} />.
+        </DialogContentText>
+
+        {props.sentTime && (
+          <DialogContentText style={{ marginTop: '1rem' }}>
+            The test message was scheduled for delivery at{' '}
+            <Time time={props.sentTime} />.
+          </DialogContentText>
+        )}
+        {props.sentState?.formattedSrcValue && (
+          <DialogContentText>
+            <b>Sender:</b> {props.sentState.formattedSrcValue}
+          </DialogContentText>
+        )}
+
+        {props.isWaiting && <Spinner text='Waiting to send (< 1 min)...' />}
+        {props.isSending && <Spinner text='Sending Test...' />}
+        {props.sentState?.details === 'Pending' ? (
+          <Spinner text='Waiting in queue...' />
+        ) : (
+          <DialogContentText
+            color={getTestStatusColor(props.sentState?.status)}
+          >
+            <b>Status:</b> {toTitleCase(props.sentState?.details || '')}
+          </DialogContentText>
+        )}
+      </DialogContent>
+    </React.Fragment>
+  )
+}
 
 export default function SendTestDialog(
   props: SendTestDialogProps,
 ): JSX.Element {
-  const classes = useStyles()
+  const { onClose, contactMethodID } = props
+  const [sendTestStatus, sendTest] = useMutation(mutation)
 
-  const { title = 'Test Delivery Status', onClose, messageID } = props
+  const [cmInfo, refreshCMInfo] = useQuery<{
+    userContactMethod: UserContactMethod
+  }>({
+    query,
+    variables: {
+      id: contactMethodID,
+    },
+    requestPolicy: 'network-only',
+  })
 
-  const [_twilioFrom, smtpFrom] = useConfigValue(
-    'Twilio.FromNumber',
-    'SMTP.From',
+  // Should not happen, but just in case.
+  if (cmInfo.error) throw cmInfo.error
+  const cm = cmInfo.data?.userContactMethod
+  if (!cm) throw new Error('missing contact method') // should be impossible (since we already checked the error)
+
+  // We expect the status to update over time, so we manually refresh
+  // as long as the dialog is open.
+  useEffect(() => {
+    const t = setInterval(refreshCMInfo, 3000)
+    return () => clearInterval(t)
+  }, [])
+
+  // We keep a stable timestamp to track how long the dialog has been open.
+  const [now] = useState(DateTime.utc())
+
+  const isWaitingToSend =
+    (cm.lastTestVerifyAt
+      ? now.diff(DateTime.fromISO(cm.lastTestVerifyAt))
+      : Duration.fromObject({ day: 1 })
+    ).as('seconds') < 60
+
+  // already sent a test message recently
+  const [alreadySent, setAlreadySent] = useState(
+    !!cm.lastTestMessageState && isWaitingToSend,
   )
 
-  const [now] = useState(DateTime.local())
-
-  const [sendTest, sendTestStatus] = useMutation(mutation, {
-    variables: {
-      id: messageID,
-    },
-  })
-
-  const { data, loading, error } = useQuery(query, {
-    variables: {
-      id: messageID,
-      number: _twilioFrom,
-    },
-    fetchPolicy: 'network-only',
-  })
-
-  const status = data?.userContactMethod?.lastTestMessageState?.status ?? ''
-  const cmDestValue = data?.userContactMethod?.formattedValue ?? ''
-  const cmType: ContactMethodType = data?.userContactMethod?.type ?? ''
-  const lastTestVerifyAt = data?.userContactMethod?.lastTestVerifyAt ?? ''
-  const timeSinceLastVerified = now.diff(DateTime.fromISO(lastTestVerifyAt))
-  const twilioFrom = data?.phoneNumberInfo?.formatted ?? ''
-  const errorMessage = error?.message ?? ''
-
   useEffect(() => {
-    if (loading || error || sendTestStatus.called) {
-      return
-    }
-    if (
-      data?.userContactMethod?.lastTestMessageState == null ||
-      !(timeSinceLastVerified.as('seconds') < 60)
-    ) {
-      sendTest()
-    }
-  }, [lastTestVerifyAt, loading])
+    if (alreadySent) return
 
-  let details
-  if (sendTestStatus.called && lastTestVerifyAt > now.toISO()) {
-    details = data?.userContactMethod?.lastTestMessageState?.details ?? ''
-  }
+    // wait until at least a minute has passed
+    if (isWaitingToSend) return
 
-  const getTestStatusClass = (status: string): string => {
-    switch (status) {
-      case 'OK':
-        return classes.statusOk
-      case 'ERROR':
-        return classes.statusError
-      default:
-        return classes.statusWarn
-    }
-  }
+    sendTest(
+      { id: contactMethodID },
+      {
+        additionalTypenames: ['UserContactMethod'],
+      },
+    )
 
-  if (loading || sendTestStatus.loading) return <Spinner text='Loading...' />
-
-  const msg = (): string => {
-    switch (cmType) {
-      case 'SMS':
-      case 'VOICE':
-        return `${
-          cmType === 'SMS' ? 'SMS message' : 'voice call'
-        } to ${cmDestValue} from ${twilioFrom}`
-      case 'EMAIL':
-        return `email to ${cmDestValue} from ${smtpFrom}`
-      default:
-        return `to ${cmDestValue}`
-    }
-  }
+    setAlreadySent(true)
+  }, [isWaitingToSend, alreadySent])
 
   return (
     <Dialog open onClose={onClose}>
-      <DialogTitle>{title}</DialogTitle>
-
-      <DialogContent>
-        <DialogContentText>
-          GoAlert is sending a test {msg()}.
-        </DialogContentText>
-        {details && (
-          <DialogContentText className={getTestStatusClass(status)}>
-            {toTitleCase(details)}
-          </DialogContentText>
-        )}
-        {!details && (
-          <DialogContentText className={classes.statusError}>
-            Couldn't send a message yet, please try again after about a minute.
-          </DialogContentText>
-        )}
-      </DialogContent>
-
-      {errorMessage && <DialogContentError error={errorMessage} />}
-
+      <DialogTitle>Test Contact Method</DialogTitle>
+      <SendTestContent
+        dest={cm.dest}
+        isWaiting={isWaitingToSend && !alreadySent}
+        isSending={sendTestStatus.fetching}
+        sentState={
+          cm.lastTestMessageState && alreadySent
+            ? cm.lastTestMessageState
+            : undefined
+        }
+        sentTime={
+          cm.lastTestMessageState && alreadySent ? cm.lastTestVerifyAt : null
+        }
+      />
       <DialogActions>
         <Button color='primary' variant='contained' onClick={onClose}>
           Done
@@ -160,9 +184,6 @@ export default function SendTestDialog(
 }
 
 interface SendTestDialogProps {
-  messageID: string
+  contactMethodID: string
   onClose: (event: MouseEvent) => void
-  disclaimer?: string
-  title?: string
-  subtitle?: string
 }

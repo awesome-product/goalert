@@ -1,3 +1,19 @@
+declare global {
+  namespace Cypress {
+    interface Chainable {
+      getConfig: typeof getConfig
+
+      /** Replaces the backend config entirely. */
+      setConfig: typeof setConfig
+
+      /** Merges new config values into existing backend config. */
+      updateConfig: typeof updateConfig
+
+      resetConfig: typeof resetConfig
+    }
+  }
+}
+
 interface General {
   PublicURL: string
   DisableLabelCreation: boolean
@@ -105,6 +121,12 @@ function resetConfig(): Cypress.Chainable<Config> {
 
   return setConfig({
     General: { PublicURL: base },
+    Twilio: {
+      Enable: true,
+      AccountSID: 'fake-for-testing',
+      AuthToken: 'fake-for-testing',
+      FromNumber: '+16125550123',
+    },
     Slack: {
       Enable: true,
       ClientID: '000000000000.000000000000',

@@ -3,15 +3,40 @@ import { DateTime, Interval } from 'luxon'
 import {
   OnCallNotificationRuleInput,
   Schedule,
-  ScheduleTarget,
   ScheduleTargetInput,
   SetScheduleShiftInput,
   SetTemporaryScheduleInput,
-  User,
+  TemporarySchedule,
+  WeekdayFilter,
 } from '../../schema'
 import { randDT, randSubInterval } from './util'
+import users from '../fixtures/users.json'
 
 const c = new Chance()
+
+declare global {
+  namespace Cypress {
+    interface Chainable {
+      /** Creates a new schedule. */
+      createSchedule: typeof createSchedule
+
+      /** Deletes a schedule with its specified ID */
+      deleteSchedule: typeof deleteSchedule
+
+      /** Configures a schedule target and rules. */
+      setScheduleTarget: typeof setScheduleTarget
+
+      /** Creates a new temporary schedule. */
+      createTemporarySchedule: typeof createTemporarySchedule
+
+      setScheduleNotificationRules: typeof setScheduleNotificationRules
+    }
+  }
+
+  type TemporaryScheduleOptions = Partial<TemporarySchedule> & {
+    shiftUserIDs?: string[]
+  }
+}
 
 const fmtTime = (num: number): string => {
   const s = num.toString()
@@ -24,11 +49,11 @@ const fmtTime = (num: number): string => {
 const randClock = (): string =>
   `${fmtTime(c.hour({ twentyfour: true }))}:${fmtTime(c.minute())}`
 
-const randWeekdayFilter = (): boolean[] =>
-  new Array(7).fill(0).map(() => c.bool())
+const randWeekdayFilter = (): WeekdayFilter =>
+  new Array(7).fill(0).map(() => c.bool()) as WeekdayFilter
 
 function setScheduleNotificationRules(
-  _rules: [Partial<OnCallNotificationRuleInput>],
+  _rules: Array<Partial<OnCallNotificationRuleInput>>,
   schedule?: string | Partial<Schedule>,
 ): Cypress.Chainable<Schedule> {
   if (typeof schedule !== 'string') {
@@ -61,12 +86,12 @@ function setScheduleNotificationRules(
     .getSlackChannels()
     .then((channels: SlackChannel[]) => {
       const rules = _rules.map((r) => {
-        let time: string | null | undefined = r.time
+        let time = r.time
         if (time === undefined) {
           time = c.bool() ? randClock() : null
         }
 
-        let weekdayFilter: boolean[] | null | undefined = r.weekdayFilter
+        let weekdayFilter = r.weekdayFilter
         if (weekdayFilter === undefined) {
           weekdayFilter = time && c.bool() ? randWeekdayFilter() : null
         }
@@ -87,14 +112,14 @@ function setScheduleNotificationRules(
         },
       })
     })
-    .then(() => cy.graphql(query, { id: schedule }) as { schedule: Schedule })
-    .then((sched: { schedule: Schedule }) => sched.schedule)
+    .then(() => cy.graphql(query, { id: schedule }))
+    .then((res: GraphQLResponse) => res.schedule)
 }
 
 function setScheduleTarget(
   scheduleTgt?: Partial<ScheduleTargetInput>,
   createScheduleInput?: Partial<Schedule>,
-): Cypress.Chainable<ScheduleTarget> {
+): Cypress.Chainable<Schedule> {
   if (!scheduleTgt) {
     scheduleTgt = {}
   }
@@ -162,11 +187,7 @@ function setScheduleTarget(
           tgt: params.target,
         })
         .then((res: GraphQLResponse) => {
-          const { target, ...schedule } = res.schedule
-          return {
-            ...target,
-            scheduleID: schedule.id,
-          }
+          return res.schedule
         })
     })
 }
@@ -205,7 +226,7 @@ function deleteSchedule(id: string): Cypress.Chainable<void> {
     }
   `
 
-  return cy.graphql(mutation, {
+  return cy.graphqlVoid(mutation, {
     input: [
       {
         type: 'schedule',
@@ -238,22 +259,19 @@ function genShifts(
 
 function shiftRange(
   shifts?: Partial<SetScheduleShiftInput>[],
-): [DateTime, DateTime] {
-  if (!shifts || !shifts.length)
-    return [DateTime.fromISO(''), DateTime.fromISO('')]
+): [DateTime | null, DateTime | null] {
+  if (!shifts || !shifts.length) return [null, null]
 
-  let min = DateTime.fromISO('')
-  let max = DateTime.fromISO('')
+  let min: DateTime | null = null
+  let max: DateTime | null = null
   shifts.forEach((s) => {
-    const start = DateTime.fromISO(s.start || '')
-    const end = DateTime.fromISO(s.end || '')
-
-    if ((start.isValid && !min.isValid) || start < min) {
-      min = start
+    if (s.start) {
+      const start = DateTime.fromISO(s.start)
+      if (!min || start < min) min = start
     }
-
-    if ((end.isValid && !max.isValid) || end > max) {
-      max = end
+    if (s.end) {
+      const end = DateTime.fromISO(s.end)
+      if (!max || end > max) max = end
     }
   })
 
@@ -277,6 +295,9 @@ function createTemporarySchedule(
     }
   `
 
+  if (!opts.start) opts.start = randDT({ max: opts.end }).toISO()
+  if (!opts.end) opts.end = randDT({ min: opts.start }).toISO()
+
   // create schedule if necessary
   if (!opts.scheduleID) {
     return cy
@@ -293,13 +314,13 @@ function createTemporarySchedule(
   let start = DateTime.fromISO(opts.start || '')
   let end = DateTime.fromISO(opts.end || '')
   if (start.isValid && !end.isValid) {
-    if (shiftEnd.isValid) {
+    if (shiftEnd) {
       end = randDT({ min: shiftEnd })
     } else {
       end = randDT({ min: start.plus({ day: 1 }) })
     }
   } else if (end.isValid && !start.isValid) {
-    if (shiftStart.isValid) {
+    if (shiftStart) {
       start = randDT({ min: now, max: shiftStart })
     } else {
       start = randDT({
@@ -314,19 +335,17 @@ function createTemporarySchedule(
   if (!start.isValid) throw new Error('invalid start time')
   if (!end.isValid) throw new Error('invalid end time')
 
-  return cy.fixture('users').then((users) => {
-    const userIDs: string[] = users.map((u: User) => u.id)
-    const shifts = genShifts(userIDs, start, end, opts.shifts)
+  const userIDs: string[] = users.map((u) => u.id)
+  const shifts = genShifts(userIDs, start, end, opts.shifts)
 
-    const input: SetTemporaryScheduleInput = {
-      scheduleID: opts.scheduleID as string, // checked above
-      start: start.toISO(),
-      end: end.toISO(),
-      shifts,
-    }
+  const input: SetTemporaryScheduleInput = {
+    scheduleID: opts.scheduleID as string, // checked above
+    start: start.toISO(),
+    end: end.toISO(),
+    shifts,
+  }
 
-    return cy.graphql(mutation, { input }) as void
-  })
+  return cy.graphqlVoid(mutation, { input })
 }
 
 Cypress.Commands.add('createSchedule', createSchedule)

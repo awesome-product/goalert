@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { gql, useMutation } from '@apollo/client'
+import { gql, useQuery, useMutation } from 'urql'
 import { Form } from '../forms'
 import {
   Button,
@@ -12,21 +12,34 @@ import {
   Grid,
   TextField,
   Typography,
-  makeStyles,
-} from '@material-ui/core'
-import OpenInNewIcon from '@material-ui/icons/OpenInNew'
+} from '@mui/material'
+import makeStyles from '@mui/styles/makeStyles'
+import OpenInNewIcon from '@mui/icons-material/OpenInNew'
 
 import { useConfigValue } from '../util/RequireConfig'
 import AppLink from '../util/AppLink'
 import TelTextField from '../util/TelTextField'
 import LoadingButton from '../loading/components/LoadingButton'
 import DialogContentError from '../dialogs/components/DialogContentError'
+import FromValueField from '../util/FromValueField'
 
+const debugMessageStatusQuery = gql`
+  query DebugMessageStatus($input: DebugMessageStatusInput!) {
+    debugMessageStatus(input: $input) {
+      state {
+        details
+        status
+        formattedSrcValue
+      }
+    }
+  }
+`
 const sendSMSMutation = gql`
   mutation DebugSendSMS($input: DebugSendSMSInput!) {
     debugSendSMS(input: $input) {
       id
       providerURL
+      fromNumber
     }
   }
 `
@@ -38,41 +51,67 @@ const useStyles = makeStyles({
   },
 })
 
-export default function AdminSMSSend(): JSX.Element {
+export default function AdminSMSSend(): React.JSX.Element {
   const classes = useStyles()
-  const [cfgFromNumber] = useConfigValue('Twilio.FromNumber')
-  const [fromNumber, setFromNumber] = useState(
-    (cfgFromNumber as string).replace(/^\+/, ''),
-  )
+  const [cfgFromNumber, cfgSID] = useConfigValue(
+    'Twilio.FromNumber',
+    'Twilio.MessagingServiceSID',
+  ) as [string | null, string | null]
+  const [messageID, setMessageID] = useState('')
+  const [fromNumber, setFromNumber] = useState(cfgSID || cfgFromNumber || '')
   const [toNumber, setToNumber] = useState('')
   const [body, setBody] = useState('')
   const [showErrorDialog, setShowErrorDialog] = useState(false)
 
-  const [send, sendStatus] = useMutation(sendSMSMutation, {
+  const [{ data: smsData, fetching: smsLoading, error: smsError }, commit] =
+    useMutation(sendSMSMutation)
+
+  const [{ data }] = useQuery({
+    query: debugMessageStatusQuery,
     variables: {
-      input: {
-        from: '+' + fromNumber,
-        to: '+' + toNumber,
-        body,
-      },
+      input: { providerMessageID: messageID },
     },
-    onError: () => setShowErrorDialog(true),
+    pause: !messageID,
   })
+
+  const isSent = data?.debugMessageStatus?.state?.status === 'OK'
+  let _details = data?.debugMessageStatus?.state?.details || 'Sending...'
+  _details = _details.charAt(0).toUpperCase() + _details.slice(1)
+
+  const details = isSent
+    ? `${_details} from ${data?.debugMessageStatus?.state?.formattedSrcValue}.`
+    : _details
 
   return (
     <React.Fragment>
-      <Form>
+      <Form
+        onSubmit={(e: { preventDefault: () => void }) => {
+          e.preventDefault()
+          commit({
+            input: {
+              from: fromNumber,
+              to: toNumber,
+              body,
+            },
+          }).then((res) => {
+            if (res.error) {
+              setShowErrorDialog(true)
+              return
+            }
+            setMessageID(res.data.debugSendSMS.id)
+          })
+        }}
+      >
         <Card>
           <CardContent>
             <Grid container spacing={2}>
               <Grid item xs={12} sm={12} md={12} lg={6}>
-                <TelTextField
+                <FromValueField
                   onChange={(e) => setFromNumber(e.target.value)}
                   value={fromNumber}
+                  defaultPhone={cfgFromNumber}
+                  defaultSID={cfgSID}
                   fullWidth
-                  label='From Number'
-                  helperText='Please provide your country code e.g. +1 (USA)'
-                  type='tel'
                 />
               </Grid>
               <Grid item xs={12} sm={12} md={12} lg={6}>
@@ -81,8 +120,6 @@ export default function AdminSMSSend(): JSX.Element {
                   value={toNumber}
                   fullWidth
                   label='To Number'
-                  helperText='Please provide your country code e.g. +1 (USA)'
-                  type='tel'
                 />
               </Grid>
               <Grid item xs={12}>
@@ -91,9 +128,6 @@ export default function AdminSMSSend(): JSX.Element {
                   value={body}
                   fullWidth
                   label='Body'
-                  InputLabelProps={{
-                    shrink: true,
-                  }}
                   multiline
                 />
               </Grid>
@@ -101,17 +135,11 @@ export default function AdminSMSSend(): JSX.Element {
           </CardContent>
 
           <CardActions>
-            <LoadingButton
-              buttonText='Send'
-              onClick={() => {
-                send()
-              }}
-              loading={sendStatus.loading}
-            />
-            {sendStatus.data?.debugSendSMS && (
-              <AppLink to={sendStatus.data.debugSendSMS.providerURL} newTab>
+            <LoadingButton buttonText='Send' loading={smsLoading} />
+            {smsData?.debugSendSMS && (
+              <AppLink to={smsData.debugSendSMS.providerURL} newTab>
                 <div className={classes.twilioLink}>
-                  <Typography>Open in Twilio&nbsp;</Typography>
+                  <Typography>{details} Open in Twilio&nbsp;</Typography>
                   <OpenInNewIcon fontSize='small' />
                 </div>
               </AppLink>
@@ -122,13 +150,9 @@ export default function AdminSMSSend(): JSX.Element {
 
       <Dialog open={showErrorDialog} onClose={() => setShowErrorDialog(false)}>
         <DialogTitle>An error occurred</DialogTitle>
-        <DialogContentError error={sendStatus.error?.message ?? ''} />
+        <DialogContentError error={smsError?.message ?? ''} />
         <DialogActions>
-          <Button
-            color='primary'
-            variant='contained'
-            onClick={() => setShowErrorDialog(false)}
-          >
+          <Button variant='contained' onClick={() => setShowErrorDialog(false)}>
             Okay
           </Button>
         </DialogActions>

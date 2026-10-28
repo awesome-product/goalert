@@ -1,4 +1,4 @@
-import { gql } from '@apollo/client'
+import { gql } from 'urql'
 import _ from 'lodash'
 import useMultiQuery from './useMultiQuery'
 
@@ -22,6 +22,8 @@ const infoQuery = gql`
   }
 `
 
+const noSuspense = { suspense: false }
+
 // useUserInfo will add `user` info to array items that contain a `userID`.
 export function useUserInfo<T extends HasUserID>(
   items: T[],
@@ -30,19 +32,23 @@ export function useUserInfo<T extends HasUserID>(
     (id) => ({ id }),
   )
 
-  const { data, loading, error } = useMultiQuery(infoQuery, {
+  const [{ data, fetching, error }] = useMultiQuery({
+    query: infoQuery,
     variables,
-    fetchPolicy: 'cache-first',
-    pollInterval: 0,
-    skip: items.length === 0,
+    requestPolicy: 'cache-first',
+    pause: items.length === 0,
+    context: noSuspense,
   })
 
-  if (error && !loading) {
+  // handle error
+  if (error && !fetching) {
     return items.map((item) => ({
       ...item,
       user: { id: item.userID, name: 'Error: ' + error.message },
     }))
   }
+
+  // handle none loaded
   if (!data) {
     return items.map((item) => ({
       ...item,
@@ -50,9 +56,12 @@ export function useUserInfo<T extends HasUserID>(
     }))
   }
 
+  // handle some loaded
   const lookup: Record<string, string> = {}
   data.forEach((res: WithUserInfo) => {
-    lookup[res.user.id] = res.user.name
+    if (res?.user) {
+      lookup[res.user.id] = res.user.name
+    }
   })
 
   return items.map((item: T) => ({

@@ -28,6 +28,9 @@ type SearchOptions struct {
 	// Omit specifies a list of service IDs to exclude from the results.
 	Omit []string `json:"m,omitempty"`
 
+	// Only lookup the service IDs present in the request.
+	Only []string `json:"n,omitempty"`
+
 	// FavoritesFirst indicates that services marked as favorite (by FavoritesUserID) should be returned first (before any non-favorites).
 	FavoritesFirst bool `json:"f,omitempty"`
 
@@ -42,15 +45,21 @@ type SearchCursor struct {
 	IsFavorite bool   `json:"f"`
 }
 
-var searchTemplate = template.Must(template.New("search").Parse(`
+var searchTemplate = template.Must(template.New("search").Funcs(search.Helpers()).Parse(`
 	SELECT{{if .LabelKey}} DISTINCT ON ({{ .OrderBy }}){{end}}
 		svc.id,
 		svc.name,
 		svc.description,
 		svc.escalation_policy_id,
-		fav IS DISTINCT FROM NULL
+		fav IS DISTINCT FROM NULL,
+		svc.maintenance_expires_at
 	FROM services svc
 	{{if not .FavoritesOnly }}LEFT {{end}}JOIN user_favorites fav ON svc.id = fav.tgt_service_id AND {{if .FavoritesUserID}}fav.user_id = :favUserID{{else}}false{{end}}
+	{{if and .IntegrationKey}}
+		JOIN integration_keys intKey ON
+			intKey.service_id = svc.id AND
+			intKey.id = :integrationKey
+	{{end}}
 	{{if and .LabelKey (not .LabelNegate)}}
 		JOIN labels l ON
 			l.tgt_service_id = svc.id AND
@@ -60,6 +69,9 @@ var searchTemplate = template.Must(template.New("search").Parse(`
 	WHERE true
 	{{if .Omit}}
 		AND not svc.id = any(:omit)
+	{{end}}
+	{{if .Only}}
+		AND svc.id = any(:only)
 	{{end}}
 	{{- if and .LabelKey .LabelNegate}}
 		AND svc.id NOT IN (
@@ -71,8 +83,8 @@ var searchTemplate = template.Must(template.New("search").Parse(`
 				{{if ne .LabelValue "*"}} AND value = :labelValue{{end}}
 		)
 	{{end}}
-	{{- if and .Search (not .LabelKey)}}
-		AND (svc.name ILIKE :search OR svc.description ILIKE :search)
+	{{- if and .Search (not .LabelKey) (not .IntegrationKey)}}
+		AND ({{orderedPrefixSearch "search" "svc.name"}} OR {{contains "search" "svc.description"}} OR {{contains "search" "svc.name"}})
 	{{- end}}
 	{{- if .After.Name}}
 		AND
@@ -98,19 +110,38 @@ func (opts renderData) OrderBy() string {
 	return "lower(svc.name)"
 }
 
+func (opts renderData) IntegrationKey() string {
+	if !strings.Contains(opts.Search, "token=") {
+		return ""
+	}
+	return opts.Search[6:42]
+}
+
 func (opts renderData) LabelKey() string {
-	idx := strings.IndexByte(opts.Search, '=')
+	searchStr := opts.Search
+	if strings.Contains(opts.Search, "token=") {
+		// strip token string
+		searchStr = opts.Search[42:]
+		searchStr = strings.TrimSpace(searchStr)
+	}
+	idx := strings.IndexByte(searchStr, '=')
 	if idx == -1 {
 		return ""
 	}
-	return strings.TrimSuffix(opts.Search[:idx], "!") // if `!=`` is used
+	return strings.TrimSuffix(searchStr[:idx], "!") // if `!=`` is used
 }
 func (opts renderData) LabelValue() string {
-	idx := strings.IndexByte(opts.Search, '=')
+	searchStr := opts.Search
+	if strings.Contains(opts.Search, "token=") {
+		// strip token string
+		searchStr = opts.Search[42:]
+		searchStr = strings.TrimSpace(searchStr)
+	}
+	idx := strings.IndexByte(searchStr, '=')
 	if idx == -1 {
 		return ""
 	}
-	val := opts.Search[idx+1:]
+	val := searchStr[idx+1:]
 	if val == "" {
 		return "*"
 	}
@@ -124,13 +155,6 @@ func (opts renderData) LabelNegate() bool {
 
 	return opts.Search[idx-1] == '!'
 }
-func (opts renderData) SearchStr() string {
-	if opts.Search == "" {
-		return ""
-	}
-
-	return "%" + search.Escape(opts.Search) + "%"
-}
 
 func (opts renderData) Normalize() (*renderData, error) {
 	if opts.Limit == 0 {
@@ -141,6 +165,7 @@ func (opts renderData) Normalize() (*renderData, error) {
 		validate.Search("Search", opts.Search),
 		validate.Range("Limit", opts.Limit, 0, search.MaxResults),
 		validate.ManyUUID("Omit", opts.Omit, 50),
+		validate.ManyUUID("Only", opts.Only, 50),
 	)
 	if opts.After.Name != "" {
 		err = validate.Many(err, validate.IDName("After.Name", opts.After.Name))
@@ -150,6 +175,9 @@ func (opts renderData) Normalize() (*renderData, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	if opts.IntegrationKey() != "" {
+		err = validate.Search("IntegrationKey", opts.IntegrationKey())
 	}
 	if opts.LabelKey() != "" {
 		err = validate.Search("LabelKey", opts.LabelKey())
@@ -169,17 +197,19 @@ func (opts renderData) Normalize() (*renderData, error) {
 func (opts renderData) QueryArgs() []sql.NamedArg {
 	return []sql.NamedArg{
 		sql.Named("favUserID", opts.FavoritesUserID),
+		sql.Named("integrationKey", opts.IntegrationKey()),
 		sql.Named("labelKey", opts.LabelKey()),
 		sql.Named("labelValue", opts.LabelValue()),
 		sql.Named("labelNegate", opts.LabelNegate()),
-		sql.Named("search", opts.SearchStr()),
+		sql.Named("search", opts.Search),
 		sql.Named("afterName", opts.After.Name),
 		sql.Named("omit", sqlutil.UUIDArray(opts.Omit)),
+		sql.Named("only", sqlutil.UUIDArray(opts.Only)),
 	}
 }
 
 // Search will return a list of matching services and the total number of matches available.
-func (db *DB) Search(ctx context.Context, opts *SearchOptions) ([]Service, error) {
+func (s *Store) Search(ctx context.Context, opts *SearchOptions) ([]Service, error) {
 	if opts == nil {
 		opts = &SearchOptions{}
 	}
@@ -204,7 +234,7 @@ func (db *DB) Search(ctx context.Context, opts *SearchOptions) ([]Service, error
 		return nil, errors.Wrap(err, "render query")
 	}
 
-	rows, err := db.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -213,10 +243,12 @@ func (db *DB) Search(ctx context.Context, opts *SearchOptions) ([]Service, error
 	var result []Service
 	for rows.Next() {
 		var s Service
-		err = rows.Scan(&s.ID, &s.Name, &s.Description, &s.EscalationPolicyID, &s.isUserFavorite)
+		var maintExpiresAt sql.NullTime
+		err = rows.Scan(&s.ID, &s.Name, &s.Description, &s.EscalationPolicyID, &s.isUserFavorite, &maintExpiresAt)
 		if err != nil {
 			return nil, err
 		}
+		s.MaintenanceExpiresAt = maintExpiresAt.Time
 
 		result = append(result, s)
 	}

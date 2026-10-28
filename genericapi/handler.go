@@ -2,6 +2,9 @@ package genericapi
 
 import (
 	"database/sql"
+	"encoding/json"
+	"io"
+	"mime"
 	"net/http"
 	"strings"
 	"time"
@@ -12,6 +15,7 @@ import (
 	"github.com/target/goalert/permission"
 	"github.com/target/goalert/retry"
 	"github.com/target/goalert/util/errutil"
+	"github.com/target/goalert/validation"
 	"github.com/target/goalert/validation/validate"
 )
 
@@ -27,11 +31,8 @@ func NewHandler(c Config) *Handler {
 
 // ServeUserAvatar will serve a redirect for a users avatar image.
 func (h *Handler) ServeUserAvatar(w http.ResponseWriter, req *http.Request) {
-	parts := strings.Split(req.URL.Path, "/")
-	userID := parts[len(parts)-1]
-
 	ctx := req.Context()
-	u, err := h.c.UserStore.FindOne(ctx, userID)
+	u, err := h.c.UserStore.FindOne(ctx, req.PathValue("userID"))
 	if errors.Is(err, sql.ErrNoRows) {
 		http.NotFound(w, req)
 		return
@@ -47,16 +48,8 @@ func (h *Handler) ServeUserAvatar(w http.ResponseWriter, req *http.Request) {
 // ServeHeartbeatCheck serves the heartbeat check-in endpoint.
 func (h *Handler) ServeHeartbeatCheck(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if r.Method != "POST" {
-		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
-		return
-	}
-
-	parts := strings.Split(r.URL.Path, "/")
-	monitorID := parts[len(parts)-1]
-
 	err := retry.DoTemporaryError(func(_ int) error {
-		return h.c.HeartbeatStore.RecordHeartbeat(ctx, monitorID)
+		return h.c.HeartbeatStore.RecordHeartbeat(ctx, r.PathValue("heartbeatID"))
 	},
 		retry.Log(ctx),
 		retry.Limit(12),
@@ -84,26 +77,81 @@ func (h *Handler) ServeCreateAlert(w http.ResponseWriter, r *http.Request) {
 
 	summary := r.FormValue("summary")
 	details := r.FormValue("details")
+	action := r.FormValue("action")
+	dedup := r.FormValue("dedup")
+
+	meta := make(map[string]string)
+	for _, v := range r.Form["meta"] {
+		key, val, ok := strings.Cut(v, "=")
+		if !ok {
+			continue
+		}
+		meta[key] = val
+	}
+
+	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if ct == "application/json" {
+		data, err := io.ReadAll(r.Body)
+		if errutil.HTTPError(ctx, w, err) {
+			return
+		}
+
+		var b struct {
+			Summary, Details, Action, Dedup *string
+			Meta                            map[string]string
+		}
+		err = json.Unmarshal(data, &b)
+		if errutil.HTTPError(ctx, w, validation.WrapError(err)) {
+			return
+		}
+
+		if b.Summary != nil {
+			summary = *b.Summary
+		}
+		if b.Details != nil {
+			details = *b.Details
+		}
+		if b.Dedup != nil {
+			dedup = *b.Dedup
+		}
+		if b.Action != nil {
+			action = *b.Action
+		}
+		if b.Meta != nil {
+			meta = b.Meta
+		}
+	}
+
+	status := alert.StatusTriggered
+	if action == "close" {
+		status = alert.StatusClosed
+	}
 
 	summary = validate.SanitizeText(summary, alert.MaxSummaryLength)
 	details = validate.SanitizeText(details, alert.MaxDetailsLength)
-
-	status := alert.StatusTriggered
-	if r.FormValue("action") == "close" {
-		status = alert.StatusClosed
-	}
 
 	a := &alert.Alert{
 		Summary:   summary,
 		Details:   details,
 		Source:    alert.SourceGeneric,
 		ServiceID: serviceID,
-		Dedup:     alert.NewUserDedup(r.FormValue("dedup")),
+		Dedup:     alert.NewUserDedup(dedup),
 		Status:    status,
 	}
 
+	var resp struct {
+		AlertID   int
+		ServiceID string
+		IsNew     bool
+	}
+
 	err = retry.DoTemporaryError(func(int) error {
-		_, err = h.c.AlertStore.CreateOrUpdate(ctx, a)
+		createdAlert, isNew, err := h.c.AlertStore.CreateOrUpdateWithMeta(ctx, a, meta)
+		if createdAlert != nil {
+			resp.AlertID = createdAlert.ID
+			resp.ServiceID = createdAlert.ServiceID
+			resp.IsNew = isNew
+		}
 		return err
 	},
 		retry.Log(ctx),
@@ -114,5 +162,15 @@ func (h *Handler) ServeCreateAlert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(204)
+	if r.Header.Get("Accept") != "application/json" {
+		w.WriteHeader(204)
+		return
+	}
+
+	data, err := json.Marshal(&resp)
+	if errutil.HTTPError(ctx, w, err) {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(data)
 }

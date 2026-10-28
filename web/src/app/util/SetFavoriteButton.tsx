@@ -1,26 +1,30 @@
 import React from 'react'
-import IconButton from '@material-ui/core/IconButton'
-import MUIFavoriteIcon from '@material-ui/icons/Favorite'
-import NotFavoriteIcon from '@material-ui/icons/FavoriteBorder'
-import Tooltip from '@material-ui/core/Tooltip'
-import { makeStyles } from '@material-ui/core/styles'
+import IconButton from '@mui/material/IconButton'
+import MUIFavoriteIcon from '@mui/icons-material/Favorite'
+import NotFavoriteIcon from '@mui/icons-material/FavoriteBorder'
+import Tooltip from '@mui/material/Tooltip'
+import makeStyles from '@mui/styles/makeStyles'
 import _ from 'lodash'
+import { Theme } from '@mui/material'
 
 interface SetFavoriteButtonProps {
-  typeName: 'rotation' | 'service' | 'schedule' | 'escalationPolicy'
+  typeName: 'rotation' | 'service' | 'schedule' | 'escalationPolicy' | 'user'
   onClick: (event: React.FormEvent<HTMLFormElement>) => void
   isFavorite?: boolean
   loading?: boolean
 }
 
-const useStyles = makeStyles({
+const useStyles = makeStyles((theme: Theme) => ({
   favorited: {
-    color: 'rgb(205, 24, 49)',
+    color:
+      theme.palette.mode === 'dark'
+        ? theme.palette.primary.main
+        : 'rgb(205, 24, 49)',
   },
   notFavorited: {
     color: 'inherit',
   },
-})
+}))
 
 export function FavoriteIcon(): JSX.Element {
   const classes = useStyles()
@@ -60,6 +64,7 @@ export function SetFavoriteButton({
         }
         type='submit'
         data-cy='set-fav'
+        size='large'
       >
         {icon}
       </IconButton>

@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { Form } from '../forms'
 import {
   Button,
@@ -14,8 +14,8 @@ import {
   ListItem,
   ListItemText,
   Tooltip,
-} from '@material-ui/core'
-import { useMutation, useQuery, ApolloError, gql } from '@apollo/client'
+} from '@mui/material'
+import { useMutation, useQuery, gql, CombinedError } from 'urql'
 import CopyText from '../util/CopyText'
 import TelTextField from '../util/TelTextField'
 import LoadingButton from '../loading/components/LoadingButton'
@@ -47,37 +47,41 @@ const numInfoQuery = gql`
   }
 `
 
-export default function AdminNumberLookup(): JSX.Element {
+const noSuspense = { suspense: false }
+
+export default function AdminNumberLookup(): React.JSX.Element {
   const [number, setNumber] = useState('')
   const [staleCarrier, setStaleCarrier] = useState(true)
-  const [lastError, setLastError] = useState(null as null | ApolloError)
 
-  const { data: numData } = useQuery(numInfoQuery, {
+  const [{ data: numData, error: queryError }] = useQuery({
+    query: numInfoQuery,
     variables: { number },
-    pollInterval: 0,
-    onError: (err) => setLastError(err),
+    context: noSuspense,
   })
   const numInfo = numData?.phoneNumberInfo as PhoneNumberInfo
 
-  const [lookup, { data: carrData, loading: carrLoading }] = useMutation(
-    carrierInfoMut,
-    {
-      variables: { number },
-      onError: (err) => setLastError(err),
-    },
-  )
+  const [
+    { data: carrData, fetching: carrLoading, error: mutationError },
+    commit,
+  ] = useMutation(carrierInfoMut)
   const carrInfo = carrData?.debugCarrierInfo as DebugCarrierInfo
 
-  function renderListItem(label: string, text = ''): JSX.Element {
+  const [lastError, setLastError] = useState<CombinedError | null>(null)
+  useEffect(() => {
+    if (queryError) setLastError(queryError)
+  }, [queryError])
+  useEffect(() => {
+    if (mutationError) setLastError(mutationError)
+  }, [mutationError])
+
+  function renderListItem(label: string, text = ''): React.JSX.Element {
     return (
       <React.Fragment>
         <Divider />
         <ListItem>
           <ListItemText
             primary={label}
-            secondary={
-              (text && <CopyText title={text} value={text} textOnly />) || '?'
-            }
+            secondary={(text && <CopyText title={text} value={text} />) || '?'}
           />
         </ListItem>
       </React.Fragment>
@@ -86,7 +90,13 @@ export default function AdminNumberLookup(): JSX.Element {
 
   return (
     <React.Fragment>
-      <Form>
+      <Form
+        onSubmit={(e: { preventDefault: () => void }) => {
+          e.preventDefault()
+          commit({ number })
+          setStaleCarrier(false)
+        }}
+      >
         <Card>
           <CardContent>
             <Grid container spacing={2}>
@@ -98,8 +108,6 @@ export default function AdminNumberLookup(): JSX.Element {
                   }}
                   value={number}
                   label='Phone Number'
-                  helperText='Please provide your country code e.g. +1 (USA)'
-                  type='tel'
                 />
               </Grid>
             </Grid>
@@ -133,13 +141,8 @@ export default function AdminNumberLookup(): JSX.Element {
                 <Tooltip title='May incur Twilio charges' placement='right'>
                   <LoadingButton
                     buttonText='Lookup Carrier Info'
-                    onClick={() => {
-                      lookup()
-                      setStaleCarrier(false)
-                    }}
                     disabled={!numInfo?.valid}
                     loading={carrLoading}
-                    noSubmit
                   />
                 </Tooltip>
               </CardActions>
@@ -152,11 +155,7 @@ export default function AdminNumberLookup(): JSX.Element {
         <DialogTitle>An error occurred</DialogTitle>
         <DialogContentError error={lastError?.message ?? ''} />
         <DialogActions>
-          <Button
-            color='primary'
-            variant='contained'
-            onClick={() => setLastError(null)}
-          >
+          <Button variant='contained' onClick={() => setLastError(null)}>
             Okay
           </Button>
         </DialogActions>

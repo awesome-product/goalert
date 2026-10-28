@@ -1,11 +1,12 @@
 import React from 'react'
-import List from '@material-ui/core/List'
-import ListItem from '@material-ui/core/ListItem'
-import ListItemText from '@material-ui/core/ListItemText'
-import Typography from '@material-ui/core/Typography'
+import List from '@mui/material/List'
+import ListItem from '@mui/material/ListItem'
+import ListItemText from '@mui/material/ListItemText'
+import Typography from '@mui/material/Typography'
 import { FormContainer } from '../forms'
 import _, { defaultTo } from 'lodash'
-import { makeStyles, Theme } from '@material-ui/core/styles'
+import { Theme } from '@mui/material/styles'
+import makeStyles from '@mui/styles/makeStyles'
 import {
   StringInput,
   StringListInput,
@@ -13,7 +14,7 @@ import {
   BoolInput,
 } from './AdminFieldComponents'
 import { ConfigValue } from '../../schema'
-import { yellow } from '@material-ui/core/colors'
+import { Alert } from '@mui/material'
 
 const components = {
   string: StringInput,
@@ -34,9 +35,6 @@ interface AdminSectionProps {
 }
 
 const useStyles = makeStyles((theme: Theme) => ({
-  activeItem: {
-    backgroundColor: yellow[100],
-  },
   listItem: {
     // leaves some room around fields without descriptions
     // 71px is the height of the checkbox field without w/o a desc
@@ -59,7 +57,9 @@ const useStyles = makeStyles((theme: Theme) => ({
   },
 }))
 
-export default function AdminSection(props: AdminSectionProps): JSX.Element {
+export default function AdminSection(
+  props: AdminSectionProps,
+): React.JSX.Element {
   // TODO: add 'reset to default' buttons
   const classes = useStyles()
   const { fields, value, headerNote } = props
@@ -83,21 +83,32 @@ export default function AdminSection(props: AdminSectionProps): JSX.Element {
           return (
             <ListItem
               key={f.id}
-              className={
-                classes.listItem +
-                ' ' +
-                (_.has(value, f.id) ? classes.activeItem : '')
-              }
+              className={classes.listItem}
               divider={idx !== fields.length - 1}
+              sx={_.has(value, f.id) ? { bgcolor: 'action.selected' } : {}}
             >
               <ListItemText
                 className={classes.listItemText}
-                primary={f.label}
-                secondary={f.description}
+                primary={(f.deprecated ? '* ' : '') + f.label}
+                secondary={
+                  f.deprecated ? (
+                    <React.Fragment>
+                      <Alert
+                        severity='warning'
+                        sx={{ pb: 1 }}
+                        style={{ margin: '1em' }}
+                      >
+                        Deprecated: {f.deprecated}
+                      </Alert>
+                      {f.description}
+                    </React.Fragment>
+                  ) : (
+                    f.description
+                  )
+                }
               />
               <div className={classes.listItemAction}>
                 <Field
-                  type={f.id === 'Twilio.FromNumber' ? 'tel' : 'text'}
                   name={f.id}
                   value={defaultTo(value[f.id], f.value)}
                   password={f.password}

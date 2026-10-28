@@ -39,7 +39,7 @@ type SearchCursor struct {
 	IsFavorite bool   `json:"f,omitempty"`
 }
 
-var searchTemplate = template.Must(template.New("search").Parse(`
+var searchTemplate = template.Must(template.New("search").Funcs(search.Helpers()).Parse(`
 	SELECT
 		pol.id,
 		pol.name,
@@ -54,8 +54,8 @@ var searchTemplate = template.Must(template.New("search").Parse(`
 	{{if .Omit}}
 		AND NOT pol.id = any(:omit)
 	{{end}}
-	{{if .SearchStr}}
-		AND (pol.name ILIKE :search OR pol.description ILIKE :search)
+	{{if .Search}}
+		AND ({{orderedPrefixSearch "search" "pol.name"}} OR {{contains "search" "pol.description"}} OR {{contains "search" "pol.name"}})
 	{{end}}
 	{{if .After.Name}}
 		AND
@@ -78,14 +78,6 @@ func (opts renderData) OrderBy() string {
 		return "fav isnull, lower(pol.name)"
 	}
 	return "lower(pol.name)"
-}
-
-func (opts renderData) SearchStr() string {
-	if opts.Search == "" {
-		return ""
-	}
-
-	return "%" + search.Escape(opts.Search) + "%"
 }
 
 func (opts renderData) Normalize() (*renderData, error) {
@@ -113,14 +105,14 @@ func (opts renderData) Normalize() (*renderData, error) {
 
 func (opts renderData) QueryArgs() []sql.NamedArg {
 	return []sql.NamedArg{
-		sql.Named("search", opts.SearchStr()),
+		sql.Named("search", opts.Search),
 		sql.Named("afterName", opts.After.Name),
 		sql.Named("omit", sqlutil.UUIDArray(opts.Omit)),
 		sql.Named("favUserID", opts.FavoritesUserID),
 	}
 }
 
-func (db *DB) Search(ctx context.Context, opts *SearchOptions) ([]Policy, error) {
+func (s *Store) Search(ctx context.Context, opts *SearchOptions) ([]Policy, error) {
 	err := permission.LimitCheckAny(ctx, permission.User)
 	if err != nil {
 		return nil, err
@@ -145,7 +137,7 @@ func (db *DB) Search(ctx context.Context, opts *SearchOptions) ([]Policy, error)
 		return nil, errors.Wrap(err, "render query")
 	}
 
-	rows, err := db.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

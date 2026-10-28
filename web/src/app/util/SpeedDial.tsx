@@ -5,8 +5,8 @@ import {
   SpeedDialAction,
   SpeedDialActionProps,
   SpeedDialProps,
-} from '@material-ui/lab'
-import { makeStyles } from '@material-ui/styles'
+} from '@mui/material'
+import { makeStyles } from '@mui/styles'
 
 const useStyles = makeStyles({
   speedDial: {
@@ -57,6 +57,9 @@ export default function CustomSpeedDial(
       onMouseLeave={() => setOpen(false)}
       open={open}
       className={classes.speedDial}
+      TransitionProps={{
+        unmountOnExit: true,
+      }}
     >
       {props.actions
         .slice()
@@ -80,6 +83,7 @@ export default function CustomSpeedDial(
                 return
               }
               action.onClick(e)
+              setOpen(false)
             }}
           />
         ))}

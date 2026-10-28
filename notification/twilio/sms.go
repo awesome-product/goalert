@@ -3,6 +3,7 @@ package twilio
 import (
 	"context"
 	"database/sql"
+	stderrors "errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -13,21 +14,28 @@ import (
 
 	"github.com/target/goalert/alert"
 	"github.com/target/goalert/config"
+	"github.com/target/goalert/gadb"
 	"github.com/target/goalert/notification"
+	"github.com/target/goalert/notification/nfydest"
 	"github.com/target/goalert/permission"
 	"github.com/target/goalert/retry"
 	"github.com/target/goalert/util/log"
+	"github.com/target/goalert/validation"
 
 	"github.com/pkg/errors"
 )
 
 var (
-	lastReplyRx  = regexp.MustCompile(`^'?\s*(c|close|a|ack[a-z]*)\s*'?$`)
-	shortReplyRx = regexp.MustCompile(`^'?\s*([0-9]+)\s*(c|a)\s*'?$`)
-	alertReplyRx = regexp.MustCompile(`^'?\s*(c|close|a|ack[a-z]*)\s*#?\s*([0-9]+)\s*'?$`)
+	lastReplyRx  = regexp.MustCompile(`^'?\s*(c|close|a|e|ack[a-z]*)\s*'?$`)
+	shortReplyRx = regexp.MustCompile(`^'?\s*([0-9]+)\s*(c|a|e)\s*'?$`)
+	alertReplyRx = regexp.MustCompile(`^'?\s*(c|close|e|a|ack[a-z]*)\s*#?\s*([0-9]+)\s*'?$`)
 
 	svcReplyRx = regexp.MustCompile(`^'?\s*([0-9]+)\s*(cc|aa)\s*'?$`)
 )
+
+func NewSMSDest(number string) gadb.DestV1 {
+	return gadb.NewDestV1(DestTypeTwilioSMS, FieldPhoneNumber, number)
+}
 
 // SMS implements a notification.Sender for Twilio SMS.
 type SMS struct {
@@ -35,12 +43,14 @@ type SMS struct {
 	c *Config
 	r notification.Receiver
 
-	ban *dbBan
+	limit *replyLimiter
 }
 
-var _ notification.ReceiverSetter = &SMS{}
-var _ notification.Sender = &SMS{}
-var _ notification.StatusChecker = &SMS{}
+var (
+	_ notification.ReceiverSetter = &SMS{}
+	_ nfydest.MessageSender       = &SMS{}
+	_ nfydest.MessageStatuser     = &SMS{}
+)
 
 // NewSMS performs operations like validating essential parameters, registering the Twilio client and db
 // and adding routes for successful and unsuccessful message delivery to Twilio
@@ -53,10 +63,8 @@ func NewSMS(ctx context.Context, db *sql.DB, c *Config) (*SMS, error) {
 	s := &SMS{
 		b: b,
 		c: c,
-	}
-	s.ban, err = newBanDB(ctx, db, c, "twilio_sms_errors")
-	if err != nil {
-		return nil, errors.Wrap(err, "init Twilio SMS DB")
+
+		limit: newReplyLimiter(),
 	}
 
 	return s, nil
@@ -66,26 +74,27 @@ func NewSMS(ctx context.Context, db *sql.DB, c *Config) (*SMS, error) {
 func (s *SMS) SetReceiver(r notification.Receiver) { s.r = r }
 
 // Status provides the current status of a message.
-func (s *SMS) Status(ctx context.Context, externalID string) (*notification.Status, error) {
+func (s *SMS) MessageStatus(ctx context.Context, externalID string) (*notification.Status, error) {
 	msg, err := s.c.GetSMS(ctx, externalID)
 	if err != nil {
-		return nil, err
+		return nil, wrapStatusErr(err)
 	}
+
 	return msg.messageStatus(), nil
 }
 
 // Send implements the notification.Sender interface.
-func (s *SMS) Send(ctx context.Context, msg notification.Message) (string, *notification.Status, error) {
+func (s *SMS) SendMessage(ctx context.Context, msg notification.Message) (*notification.SentMessage, error) {
 	cfg := config.FromContext(ctx)
 	if !cfg.Twilio.Enable {
-		return "", nil, errors.New("Twilio provider is disabled")
+		return nil, errors.New("Twilio provider is disabled")
 	}
-	if msg.Destination().Type != notification.DestTypeSMS {
-		return "", nil, errors.Errorf("unsupported destination type %s; expected SMS", msg.Destination().Type)
+	if msg.DestType() != DestTypeTwilioSMS {
+		return nil, errors.Errorf("unsupported destination type %s; expected SMS", msg.DestType())
 	}
-	destNumber := msg.Destination().Value
+	destNumber := msg.DestArg(FieldPhoneNumber)
 	if destNumber == cfg.Twilio.FromNumber {
-		return "", nil, errors.New("refusing to send outgoing SMS to FromNumber")
+		return nil, errors.New("refusing to send outgoing SMS to FromNumber")
 	}
 
 	ctx = log.WithFields(ctx, log.Fields{
@@ -93,79 +102,65 @@ func (s *SMS) Send(ctx context.Context, msg notification.Message) (string, *noti
 		"Type":  "TwilioSMS",
 	})
 
-	b, err := s.ban.IsBanned(ctx, destNumber, true)
-	if err != nil {
-		return "", nil, errors.Wrap(err, "check ban status")
-	}
-	if b {
-		return "", nil, errors.New("number had too many outgoing errors recently")
-	}
-
 	makeSMSCode := func(alertID int, serviceID string) int {
-		var code int
-		if hasTwoWaySMSSupport(ctx, destNumber) {
-			code, err = s.b.insertDB(ctx, destNumber, msg.ID(), alertID, serviceID)
-			if err != nil {
-				log.Log(ctx, errors.Wrap(err, "insert alert id for SMS callback -- sending 1-way SMS as fallback"))
-			}
+		if !hasTwoWaySMSSupport(ctx, destNumber) {
+			return 0
 		}
+
+		code, err := s.b.insertDB(ctx, destNumber, msg.MsgID(), alertID, serviceID)
+		if err != nil {
+			log.Log(ctx, errors.Wrap(err, "insert alert id for SMS callback -- sending 1-way SMS as fallback"))
+			return 0
+		}
+
 		return code
 	}
 
 	var message string
+	var err error
 	switch t := msg.(type) {
 	case notification.AlertStatus:
-		message, err = alertSMS{
-			ID:   t.AlertID,
-			Body: t.LogEntry,
-		}.Render()
+		message, err = renderAlertStatusMessage(cfg.ApplicationName(), t)
 	case notification.AlertBundle:
 		var link string
-		if !cfg.General.DisableSMSLinks {
+		if canContainURL(ctx, destNumber) {
 			link = cfg.CallbackURL(fmt.Sprintf("/services/%s/alerts", t.ServiceID))
 		}
 
-		message, err = alertSMS{
-			Count: t.Count,
-			Body:  t.ServiceName,
-			Link:  link,
-			Code:  makeSMSCode(0, t.ServiceID),
-		}.Render()
+		message, err = renderAlertBundleMessage(cfg.ApplicationName(), t, link, makeSMSCode(0, t.ServiceID))
 	case notification.Alert:
 		var link string
-		if !cfg.General.DisableSMSLinks {
+		if canContainURL(ctx, destNumber) {
 			link = cfg.CallbackURL(fmt.Sprintf("/alerts/%d", t.AlertID))
 		}
 
-		message, err = alertSMS{
-			ID:   t.AlertID,
-			Body: t.Summary,
-			Link: link,
-			Code: makeSMSCode(t.AlertID, ""),
-		}.Render()
+		message, err = renderAlertMessage(cfg.ApplicationName(), t, link, makeSMSCode(t.AlertID, ""))
 	case notification.Test:
-		message = "This is a test message from GoAlert."
+		message = fmt.Sprintf("%s: Test message.", cfg.ApplicationName())
 	case notification.Verification:
-		message = fmt.Sprintf("GoAlert verification code: %d", t.Code)
+		message = fmt.Sprintf("%s: Verification code: %s", cfg.ApplicationName(), t.Code)
 	default:
-		return "", nil, errors.Errorf("unhandled message type %T", t)
+		return nil, errors.Errorf("unhandled message type %T", t)
 	}
 	if err != nil {
-		return "", nil, errors.Wrap(err, "render message")
+		return nil, errors.Wrap(err, "render message")
 	}
 
 	opts := &SMSOptions{
-		ValidityPeriod: time.Second * 10,
+		ValidityPeriod: time.Second * 30,
 		CallbackParams: make(url.Values),
 	}
-	opts.CallbackParams.Set(msgParamID, msg.ID())
+	opts.CallbackParams.Set(msgParamID, msg.MsgID())
 	// Actually send notification to end user & receive Message Status
 	resp, err := s.c.SendSMS(ctx, destNumber, message, opts)
 	if err != nil {
-		return "", nil, errors.Wrap(err, "send message")
+		return nil, errors.Wrap(err, "send message")
 	}
 
-	return resp.SID, resp.messageStatus(), nil
+	// If the message was sent successfully, reset reply limits.
+	s.limit.Reset(destNumber)
+
+	return resp.sentMessage(), nil
 }
 
 func (s *SMS) ServeStatusCallback(w http.ResponseWriter, req *http.Request) {
@@ -173,9 +168,15 @@ func (s *SMS) ServeStatusCallback(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	ctx := req.Context()
+	cfg := config.FromContext(ctx)
 	status := MessageStatus(req.FormValue("MessageStatus"))
 	sid := validSID(req.FormValue("MessageSid"))
-	number := validPhone(req.FormValue("To"))
+	var number string
+	if cfg.Twilio.RCSSenderID != "" && req.FormValue("From") == "rcs:"+cfg.Twilio.RCSSenderID {
+		number = req.FormValue("To")
+	} else {
+		number = validPhone(req.FormValue("To"))
+	}
 	if status == "" || sid == "" || number == "" {
 		http.Error(w, "", http.StatusBadRequest)
 		return
@@ -187,7 +188,7 @@ func (s *SMS) ServeStatusCallback(w http.ResponseWriter, req *http.Request) {
 		"Phone":  number,
 		"Type":   "TwilioSMS",
 	})
-	msg := Message{SID: sid, Status: status}
+	msg := Message{SID: sid, Status: status, From: strings.TrimPrefix(req.FormValue("From"), "rcs:")}
 
 	log.Debugf(ctx, "Got Twilio SMS status callback.")
 
@@ -196,17 +197,6 @@ func (s *SMS) ServeStatusCallback(w http.ResponseWriter, req *http.Request) {
 		// log and continue
 		log.Log(ctx, err)
 	}
-
-	if status != MessageStatusFailed {
-		// ignore other types
-		return
-	}
-
-	err = s.ban.RecordError(context.Background(), number, true, "send failed")
-	if err != nil {
-		log.Log(ctx, errors.Wrap(err, "record error"))
-	}
-
 }
 
 // isStopMessage checks the body of the message against single-word matches
@@ -237,8 +227,8 @@ func (s *SMS) ServeMessage(w http.ResponseWriter, req *http.Request) {
 	}
 	ctx := req.Context()
 	cfg := config.FromContext(ctx)
-	from := validPhone(req.FormValue("From"))
-	if from == "" || from == cfg.Twilio.FromNumber {
+	from := validPhone(strings.TrimPrefix(req.FormValue("From"), "rcs:"))
+	if from == "" || from == cfg.Twilio.FromNumber || from == cfg.Twilio.RCSSenderID {
 		http.Error(w, "", http.StatusBadRequest)
 		return
 	}
@@ -248,21 +238,36 @@ func (s *SMS) ServeMessage(w http.ResponseWriter, req *http.Request) {
 		"Type":   "TwilioSMS",
 	})
 
-	respond := func(errMsg string, msg string) {
-		if errMsg != "" {
-			err := s.ban.RecordError(context.Background(), from, false, errMsg)
-			if err != nil {
-				log.Log(ctx, errors.Wrap(err, "record error"))
-			}
+	respond := func(isPassive bool, msg string) {
+		if !isPassive {
+			// always reset if an action was taken
+			s.limit.Reset(from)
 		}
-		_, err := s.c.SendSMS(ctx, from, msg, &SMSOptions{FromNumber: req.FormValue("to")})
+
+		if s.limit.ShouldDrop(from) {
+			log.Debugf(ctx, "SMS passive reply limit reached for %s, not replying.", from)
+			return
+		}
+
+		if isPassive {
+			valid, err := s.r.IsKnownDest(ctx, gadb.NewDestV1(DestTypeTwilioSMS, FieldPhoneNumber, from))
+			if err != nil {
+				log.Log(ctx, fmt.Errorf("check if known SMS number: %w", err))
+			} else if !valid {
+				// don't respond if the number is not known
+				return
+			}
+			s.limit.RecordPassiveReply(from)
+		}
+		smsFrom := req.FormValue("To")
+		if cfg.Twilio.MessagingServiceSID != "" {
+			smsFrom = cfg.Twilio.MessagingServiceSID
+		}
+		_, err := s.c.SendSMS(ctx, from, msg, &SMSOptions{FromNumber: smsFrom})
 		if err != nil {
 			log.Log(ctx, errors.Wrap(err, "send response"))
 		}
-		// TODO: we should track & queue these
-		// (maybe the engine should generate responses instead)
 	}
-	var banned bool
 	var err error
 	retryOpts := []retry.Option{
 		retry.Log(ctx),
@@ -270,32 +275,17 @@ func (s *SMS) ServeMessage(w http.ResponseWriter, req *http.Request) {
 		retry.FibBackoff(time.Second),
 	}
 
-	err = retry.DoTemporaryError(func(int) error {
-		banned, err = s.ban.IsBanned(ctx, from, false)
-		return errors.Wrap(err, "look up ban status")
-	}, retryOpts...)
-	if err != nil {
-		log.Log(ctx, err)
-		respond("", "System error. Visit the dashboard to manage alerts.")
-		return
-	}
-	if banned {
-		http.Error(w, "", http.StatusTooManyRequests)
-		return
-	}
-
 	// handle start and stop codes from user
 	body := req.FormValue("Body")
-	dest := notification.Dest{Type: notification.DestTypeSMS, Value: from}
 	if isStartMessage(body) {
-		err := retry.DoTemporaryError(func(int) error { return s.r.Start(ctx, dest) }, retryOpts...)
+		err := retry.DoTemporaryError(func(int) error { return s.r.Start(ctx, NewSMSDest(from)) }, retryOpts...)
 		if err != nil {
 			log.Log(ctx, fmt.Errorf("process START message: %w", err))
 		}
 		return
 	}
 	if isStopMessage(body) {
-		err := retry.DoTemporaryError(func(int) error { return s.r.Stop(ctx, dest) }, retryOpts...)
+		err := retry.DoTemporaryError(func(int) error { return s.r.Stop(ctx, NewSMSDest(from)) }, retryOpts...)
 		if err != nil {
 			log.Log(ctx, fmt.Errorf("process STOP message: %w", err))
 		}
@@ -303,7 +293,7 @@ func (s *SMS) ServeMessage(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if cfg.Twilio.DisableTwoWaySMS {
-		respond("response codes disabled", "Response codes are currently disabled. Visit the dashboard to manage alerts.")
+		respond(true, "Response codes are currently disabled. Visit the dashboard to manage alerts.")
 		return
 	}
 
@@ -315,6 +305,8 @@ func (s *SMS) ServeMessage(w http.ResponseWriter, req *http.Request) {
 	if m := lastReplyRx.FindStringSubmatch(body); len(m) == 2 {
 		if strings.HasPrefix(m[1], "a") {
 			result = notification.ResultAcknowledge
+		} else if strings.HasPrefix(m[1], "e") {
+			result = notification.ResultEscalate
 		} else {
 			result = notification.ResultResolve
 		}
@@ -322,6 +314,8 @@ func (s *SMS) ServeMessage(w http.ResponseWriter, req *http.Request) {
 	} else if m := shortReplyRx.FindStringSubmatch(body); len(m) == 3 {
 		if strings.HasPrefix(m[2], "a") {
 			result = notification.ResultAcknowledge
+		} else if strings.HasPrefix(m[2], "e") {
+			result = notification.ResultEscalate
 		} else {
 			result = notification.ResultResolve
 		}
@@ -335,6 +329,8 @@ func (s *SMS) ServeMessage(w http.ResponseWriter, req *http.Request) {
 	} else if m := alertReplyRx.FindStringSubmatch(body); len(m) == 3 {
 		if strings.HasPrefix(m[1], "a") {
 			result = notification.ResultAcknowledge
+		} else if strings.HasPrefix(m[1], "e") {
+			result = notification.ResultEscalate
 		} else {
 			result = notification.ResultResolve
 		}
@@ -349,6 +345,8 @@ func (s *SMS) ServeMessage(w http.ResponseWriter, req *http.Request) {
 		isSvc = true
 		if strings.HasPrefix(m[2], "a") {
 			result = notification.ResultAcknowledge
+		} else if strings.HasPrefix(m[2], "e") {
+			result = notification.ResultEscalate
 		} else {
 			result = notification.ResultResolve
 		}
@@ -362,16 +360,19 @@ func (s *SMS) ServeMessage(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if lookupFn == nil {
-		respond("unknown action", "Sorry, but that isn't a request GoAlert understood. Visit the Web UI for more information. To unsubscribe, reply with STOP.")
+		respond(true, "Sorry, but that isn't a request GoAlert understood. Visit the Web UI for more information. To unsubscribe, reply with STOP.")
 		ctx = log.WithField(ctx, "SMSBody", body)
 		log.Debug(ctx, errors.Wrap(err, "parse alert action"))
 		return
 	}
 
 	var prefix string
-	if result == notification.ResultAcknowledge {
+	switch result {
+	case notification.ResultAcknowledge:
 		prefix = "Acknowledged"
-	} else {
+	case notification.ResultEscalate:
+		prefix = "Escalation requested"
+	default:
 		prefix = "Closed"
 	}
 
@@ -391,7 +392,7 @@ func (s *SMS) ServeMessage(w http.ResponseWriter, req *http.Request) {
 	}, retryOpts...)
 
 	if errors.Is(err, sql.ErrNoRows) || (isSvc && info.ServiceName == "") || (!isSvc && info.AlertID == 0) {
-		respond("unknown callbackID", "Unknown reply code for this action. Visit the dashboard to manage alerts.")
+		respond(true, "Unknown reply code for this action. Visit the dashboard to manage alerts.")
 		return
 	}
 
@@ -402,37 +403,40 @@ func (s *SMS) ServeMessage(w http.ResponseWriter, req *http.Request) {
 	} else if alert.IsAlreadyAcknowledged(err) {
 		nonSystemErr = true
 		msg = fmt.Sprintf("Alert #%d already acknowledged", alert.AlertID(err))
+	} else if validation.IsClientError(err) {
+		respond(true, "Error: "+stderrors.Unwrap(err).Error())
+		return
 	}
 
 	if nonSystemErr {
 		var e alert.LogEntryFetcher
 		// alert store returns the special error struct, twilio checks if it's special, and if so, pulls the log entry
 		if errors.As(err, &e) {
-			err = nil
 			// we pass a 'sudo' context to give permission
 			permission.SudoContext(ctx, func(sCtx context.Context) {
 				entry, err := e.LogEntry(sCtx)
 				if err != nil {
 					log.Log(sCtx, errors.Wrap(err, "fetch log entry"))
 				} else {
-					msg += "\n\n" + entry.String()
+					msg += "\n\n" + entry.String(ctx)
 				}
 			})
+		} else {
+			log.Log(ctx, errors.Wrap(err, "process notification response"))
 		}
-		log.Log(ctx, errors.Wrap(err, "process notification response"))
-		respond("", msg)
+		respond(true, msg)
 		return
 	}
 
 	if err != nil {
 		log.Log(ctx, err)
-		respond("", msg)
+		respond(true, msg)
 		return
 	}
 
 	if info.ServiceName != "" {
-		respond("", fmt.Sprintf("%s all alerts for service '%s'", prefix, info.ServiceName))
+		respond(false, fmt.Sprintf("%s all alerts for service '%s'", prefix, info.ServiceName))
 	} else {
-		respond("", fmt.Sprintf("%s alert #%d", prefix, info.AlertID))
+		respond(false, fmt.Sprintf("%s alert #%d", prefix, info.AlertID))
 	}
 }

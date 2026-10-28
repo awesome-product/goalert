@@ -7,20 +7,19 @@ import (
 	"sync"
 	"time"
 
-	alertlog "github.com/target/goalert/alert/log"
+	"github.com/google/uuid"
+	"github.com/target/goalert/alert/alertlog"
 	"github.com/target/goalert/app/lifecycle"
 	"github.com/target/goalert/config"
 	"github.com/target/goalert/engine/processinglock"
+	"github.com/target/goalert/gadb"
 	"github.com/target/goalert/lock"
 	"github.com/target/goalert/notification"
-	"github.com/target/goalert/notificationchannel"
 	"github.com/target/goalert/permission"
 	"github.com/target/goalert/retry"
-	"github.com/target/goalert/user/contactmethod"
 	"github.com/target/goalert/util"
 	"github.com/target/goalert/util/log"
 	"github.com/target/goalert/util/sqlutil"
-	"go.opencensus.io/trace"
 
 	"github.com/pkg/errors"
 )
@@ -31,12 +30,12 @@ type DB struct {
 
 	pausable lifecycle.Pausable
 
-	stuckMessages *sql.Stmt
+	stuckMessages        *sql.Stmt
+	timeoutStuckMessages *sql.Stmt
 
 	setSending *sql.Stmt
 
 	lockStmt    *sql.Stmt
-	messages    *sql.Stmt
 	currentTime *sql.Stmt
 	retryReset  *sql.Stmt
 	retryClear  *sql.Stmt
@@ -44,13 +43,12 @@ type DB struct {
 	sendDeadlineExpired *sql.Stmt
 
 	failDisabledCM *sql.Stmt
-	alertlogstore  alertlog.Store
+	alertlogstore  *alertlog.Store
 
 	failSMSVoice *sql.Stmt
 
 	sentByCMType *sql.Stmt
 
-	updateCMStatusUpdate      *sql.Stmt
 	cleanupStatusUpdateOptOut *sql.Stmt
 
 	tempFail     *sql.Stmt
@@ -60,7 +58,8 @@ type DB struct {
 	advLock        *sql.Stmt
 	advLockCleanup *sql.Stmt
 
-	insertAlertBundle *sql.Stmt
+	createAlertBundle *sql.Stmt
+	bundleMessages    *sql.Stmt
 
 	deleteAny *sql.Stmt
 
@@ -69,10 +68,10 @@ type DB struct {
 }
 
 // NewDB creates a new DB.
-func NewDB(ctx context.Context, db *sql.DB, a alertlog.Store, pausable lifecycle.Pausable) (*DB, error) {
+func NewDB(ctx context.Context, db *sql.DB, a *alertlog.Store, pausable lifecycle.Pausable) (*DB, error) {
 	lock, err := processinglock.NewLock(ctx, db, processinglock.Config{
 		Type:    processinglock.TypeMessage,
-		Version: 8,
+		Version: 11,
 	})
 	if err != nil {
 		return nil, err
@@ -112,7 +111,8 @@ func NewDB(ctx context.Context, db *sql.DB, a alertlog.Store, pausable lifecycle
 			fired_at = null,
 			provider_msg_id = coalesce($2, provider_msg_id),
 			provider_seq = CASE WHEN $3 = -1 THEN provider_seq ELSE $3 END,
-			next_retry_at = null
+			next_retry_at = null,
+			src_value = coalesce(src_value, $6)
 		where
 			(id = $1 or provider_msg_id = $2) and
 			(provider_seq <= $3 or $3 = -1) and
@@ -132,7 +132,7 @@ func NewDB(ctx context.Context, db *sql.DB, a alertlog.Store, pausable lifecycle
 
 		sentMessages: make(map[string]Message),
 
-		advLock: p.P(`select pg_advisory_lock($1)`),
+		advLock: p.P(`select pg_try_advisory_lock($1)`),
 		advLockCleanup: p.P(`
 			select pg_terminate_backend(lock.pid)
 			from pg_locks lock
@@ -154,6 +154,7 @@ func NewDB(ctx context.Context, db *sql.DB, a alertlog.Store, pausable lifecycle
 				where
 					last_status = 'queued_remotely' and
 					last_status_at < now()-'1 minute'::interval and
+					sent_at > now()-'24 hours'::interval and
 					provider_msg_id notnull
 				order by
 					last_status_at
@@ -167,6 +168,28 @@ func NewDB(ctx context.Context, db *sql.DB, a alertlog.Store, pausable lifecycle
 			returning msg.id, msg.provider_msg_id
 		`),
 
+		// Some providers (e.g., Twilio RCS) may never report a final status, and
+		// eventually purge the message entirely. Stop checking after 24 hours.
+		timeoutStuckMessages: p.P(`
+			update outgoing_messages
+			set
+				last_status = 'failed',
+				last_status_at = now(),
+				status_details = 'timed out waiting for final status from provider (last known: ' || status_details || ')',
+				cycle_id = null,
+				next_retry_at = null
+			where id in (
+				select id
+				from outgoing_messages
+				where
+					last_status = 'queued_remotely' and
+					sent_at <= now()-'24 hours'::interval
+				order by sent_at
+				limit 1000
+				for update skip locked
+			)
+		`),
+
 		sentByCMType: p.P(`
 			select count(*)
 			from outgoing_messages msg
@@ -174,31 +197,16 @@ func NewDB(ctx context.Context, db *sql.DB, a alertlog.Store, pausable lifecycle
 			where msg.sent_at > $1 and cm.type = $2
 		`),
 
-		updateCMStatusUpdate: p.P(`
-			update outgoing_messages msg
-			set contact_method_id = usr.alert_status_log_contact_method_id
-			from users usr
-			where
-				msg.message_type = 'alert_status_update' and
-				(
-					msg.last_status = 'pending' or
-					(msg.last_status = 'failed' and msg.next_retry_at notnull)
-				) and
-				msg.contact_method_id != usr.alert_status_log_contact_method_id and
-				msg.user_id = usr.id and
-				usr.alert_status_log_contact_method_id notnull
-		`),
 		cleanupStatusUpdateOptOut: p.P(`
 			delete from outgoing_messages msg
-			using users usr
+			using user_contact_methods cm
 			where
 				msg.message_type = 'alert_status_update' and
 				(
 					msg.last_status = 'pending' or
 					(msg.last_status = 'failed' and msg.next_retry_at notnull)
 				) and
-				usr.alert_status_log_contact_method_id isnull and
-				usr.id = msg.user_id
+				not cm.enable_status_updates and cm.id = msg.contact_method_id
 		`),
 		setSending: p.P(`
 			update outgoing_messages
@@ -291,53 +299,28 @@ func NewDB(ctx context.Context, db *sql.DB, a alertlog.Store, pausable lifecycle
 			returning msg.id as msg_id, alert_id, msg.user_id, cm.id as cm_id
 		`),
 
-		insertAlertBundle: p.P(`
-			with new_msg as (
-				insert into outgoing_messages (
-					id,
-					created_at,
-					message_type,
-					contact_method_id,
-					channel_id,
-					user_id,
-					service_id
-				) values (
-					$1, $2, 'alert_notification_bundle', $3, $4, $5, $6
-				) returning (id)
+		createAlertBundle: p.P(`
+			insert into outgoing_messages (
+				id,
+				created_at,
+				message_type,
+				contact_method_id,
+				channel_id,
+				user_id,
+				service_id
+			) values (
+				$1, $2, 'alert_notification_bundle', $3, $4, $5, $6
 			)
+		`),
+
+		bundleMessages: p.P(`
 			update outgoing_messages
 			set
 				last_status = 'bundled',
 				last_status_at = now(),
-				status_details = (select id from new_msg),
+				status_details = $1,
 				cycle_id = null
-			where id = any($7::uuid[])
-		`),
-
-		messages: p.P(`
-			select
-				msg.id,
-				msg.message_type,
-				cm.type,
-				chan.type,
-				coalesce(msg.contact_method_id, msg.channel_id),
-				coalesce(cm.value, chan.value),
-				msg.alert_id,
-				msg.alert_log_id,
-				msg.user_verification_code_id,
-				cm.user_id,
-				msg.service_id,
-				msg.created_at,
-				msg.sent_at,
-				msg.status_alert_ids,
-				msg.schedule_id
-			from outgoing_messages msg
-			left join user_contact_methods cm on cm.id = msg.contact_method_id
-			left join notification_channels chan on chan.id = msg.channel_id
-			where
-				sent_at >= $1 or
-				last_status = 'pending' and
-				(msg.contact_method_id isnull or msg.message_type = 'verification_message' or not cm.disabled)
+			where id = any($2::uuid[])
 		`),
 
 		deleteAny: p.P(`delete from outgoing_messages where id = any($1)`),
@@ -351,76 +334,57 @@ func (db *DB) currentQueue(ctx context.Context, tx *sql.Tx, now time.Time) (*que
 		sentSince = cutoff
 	}
 
-	result := make([]Message, 0, len(db.sentMessages))
+	rows, err := gadb.New(tx).MessageMgrGetPending(ctx, sql.NullTime{Time: sentSince, Valid: true})
+	if err != nil {
+		return nil, errors.Wrap(err, "fetch outgoing messages")
+	}
+
+	result := make([]Message, 0, len(rows))
+	for _, row := range rows {
+		var msg Message
+		msg.ID = row.ID.String()
+		msg.Type = row.MessageType
+
+		msg.AlertID = int(row.AlertID.Int64)
+		msg.AlertLogID = int(row.AlertLogID.Int64)
+		if row.UserVerificationCodeID.Valid {
+			msg.VerifyID = row.UserVerificationCodeID.UUID.String()
+		}
+		if row.UserID.Valid {
+			msg.UserID = row.UserID.UUID.String()
+		}
+		if row.ServiceID.Valid {
+			msg.ServiceID = row.ServiceID.UUID.String()
+		}
+		msg.CreatedAt = row.CreatedAt
+		msg.SentAt = row.SentAt.Time
+		msg.DestID.CMID = row.CmID
+		msg.DestID.NCID = row.ChanID
+		msg.Dest = row.Dest.DestV1
+		msg.StatusAlertIDs = row.StatusAlertIds
+		if row.ScheduleID.Valid {
+			msg.ScheduleID = row.ScheduleID.UUID.String()
+		}
+		if msg.Dest.Type == "" {
+			log.Debugf(ctx, "unknown message type for message %s", msg.ID)
+			continue
+		}
+
+		if !msg.SentAt.IsZero() {
+			// if the message was sent, just add it to the map
+			db.sentMessages[msg.ID] = msg
+			continue
+		}
+
+		result = append(result, msg)
+	}
+
 	for id, msg := range db.sentMessages {
 		if msg.SentAt.Before(cutoff) {
 			delete(db.sentMessages, id)
 			continue
 		}
 		result = append(result, msg)
-	}
-
-	rows, err := tx.StmtContext(ctx, db.messages).QueryContext(ctx, sentSince)
-	if err != nil {
-		return nil, errors.Wrap(err, "fetch outgoing messages")
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var msg Message
-		var destID, destValue, verifyID, userID, serviceID, cmType, chanType, scheduleID sql.NullString
-		var alertID, logID sql.NullInt64
-		var statusAlertIDs sqlutil.IntArray
-		var createdAt, sentAt sql.NullTime
-		err = rows.Scan(
-			&msg.ID,
-			&msg.Type,
-			&cmType,
-			&chanType,
-			&destID,
-			&destValue,
-			&alertID,
-			&logID,
-			&verifyID,
-			&userID,
-			&serviceID,
-			&createdAt,
-			&sentAt,
-			&statusAlertIDs,
-			&scheduleID,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "scan row")
-		}
-		msg.AlertID = int(alertID.Int64)
-		msg.AlertLogID = int(logID.Int64)
-		msg.VerifyID = verifyID.String
-		msg.UserID = userID.String
-		msg.ServiceID = serviceID.String
-		msg.CreatedAt = createdAt.Time
-		msg.SentAt = sentAt.Time
-		msg.Dest.ID = destID.String
-		msg.Dest.Value = destValue.String
-		msg.StatusAlertIDs = statusAlertIDs
-		msg.ScheduleID = scheduleID.String
-		switch {
-		case cmType.String == string(contactmethod.TypeSMS):
-			msg.Dest.Type = notification.DestTypeSMS
-		case cmType.String == string(contactmethod.TypeVoice):
-			msg.Dest.Type = notification.DestTypeVoice
-		case chanType.String == string(notificationchannel.TypeSlack):
-			msg.Dest.Type = notification.DestTypeSlackChannel
-		case cmType.String == string(contactmethod.TypeEmail):
-			msg.Dest.Type = notification.DestTypeUserEmail
-		default:
-			log.Debugf(ctx, "unknown message type for message %s", msg.ID)
-			continue
-		}
-
-		result = append(result, msg)
-		if !msg.SentAt.IsZero() {
-			db.sentMessages[msg.ID] = msg
-		}
 	}
 	db.lastSent = now
 
@@ -441,26 +405,42 @@ func (db *DB) currentQueue(ctx context.Context, tx *sql.Tx, now time.Time) (*que
 		}
 	}
 
-	if cfg.General.MessageBundles {
-		result, err = bundleAlertMessages(result, func(msg Message, ids []string) error {
-			var cmID, chanID, userID sql.NullString
-			if msg.UserID != "" {
-				userID.Valid = true
-				userID.String = msg.UserID
-			}
-			if msg.Dest.Type.IsUserCM() {
-				cmID.Valid = true
-				cmID.String = msg.Dest.ID
-			} else {
-				chanID.Valid = true
-				chanID.String = msg.Dest.ID
-			}
-			_, err := tx.StmtContext(ctx, db.insertAlertBundle).ExecContext(ctx, msg.ID, msg.CreatedAt, cmID, chanID, userID, msg.ServiceID, sqlutil.UUIDArray(ids))
-			return err
-		})
+	result, err = dedupAlerts(result, func(parentID string, duplicateIDs []string) error {
+		_, err = tx.StmtContext(ctx, db.bundleMessages).ExecContext(ctx, parentID, sqlutil.UUIDArray(duplicateIDs))
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("bundle '%v' by pointing to '%s': %w", duplicateIDs, parentID, err)
 		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dedup alerts: %w", err)
+	}
+
+	if cfg.General.DisableMessageBundles {
+		return newQueue(result, now), nil
+	}
+
+	result, err = bundleAlertMessages(result, func(msg Message) (string, error) {
+		var userID sql.NullString
+		if msg.UserID != "" {
+			userID.Valid = true
+			userID.String = msg.UserID
+		}
+
+		newID := uuid.NewString()
+		_, err := tx.StmtContext(ctx, db.createAlertBundle).ExecContext(ctx, newID, msg.CreatedAt, msg.DestID.CMID, msg.DestID.NCID, userID, msg.ServiceID)
+		if err != nil {
+			return "", err
+		}
+
+		return newID, nil
+	}, func(parentID string, ids []string) error {
+		_, err = tx.StmtContext(ctx, db.bundleMessages).ExecContext(ctx, parentID, sqlutil.UUIDArray(ids))
+		return err
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return newQueue(result, now), nil
@@ -476,6 +456,7 @@ func (db *DB) UpdateMessageStatus(ctx context.Context, status *notification.Send
 		retry.FibBackoff(time.Millisecond*100),
 	)
 }
+
 func (db *DB) _UpdateMessageStatus(ctx context.Context, status *notification.SendResult) error {
 	if status == nil {
 		// nothing to do
@@ -508,9 +489,17 @@ func (db *DB) _UpdateMessageStatus(ctx context.Context, status *notification.Sen
 		s = StatusSent
 	case notification.StateDelivered:
 		s = StatusDelivered
+	case notification.StateRead:
+		s = StatusRead
 	}
 
-	_, err = db.updateStatus.ExecContext(ctx, cbID, status.ProviderMessageID, status.Sequence, s, status.Details)
+	var srcValue sql.NullString
+	if status.SrcValue != "" {
+		srcValue.Valid = true
+		srcValue.String = status.SrcValue
+	}
+
+	_, err = db.updateStatus.ExecContext(ctx, cbID, status.ProviderMessageID, status.Sequence, s, status.Details, srcValue)
 	return err
 }
 
@@ -521,7 +510,7 @@ type SendFunc func(context.Context, *Message) (*notification.SendResult, error)
 var ErrAbort = errors.New("aborted due to pause")
 
 // StatusFunc is used to fetch the latest status of a message.
-type StatusFunc func(ctx context.Context, id string, providerID notification.ProviderMessageID) (*notification.Status, error)
+type StatusFunc func(ctx context.Context, providerID notification.ProviderMessageID) (*notification.Status, error)
 
 // SendMessages will send notifications using SendFunc.
 func (db *DB) SendMessages(ctx context.Context, send SendFunc, status StatusFunc) error {
@@ -565,20 +554,25 @@ func (db *DB) _SendMessages(ctx context.Context, send SendFunc, status StatusFun
 	}
 	defer cLock.Close()
 
-	_, err = cLock.Exec(execCtx, db.advLock, lock.GlobalMessageSending)
+	var gotLock bool
+	err = cLock.WithTx(execCtx, func(tx *sql.Tx) error {
+		return tx.StmtContext(execCtx, db.advLock).QueryRowContext(execCtx, lock.GlobalMessageSending).Scan(&gotLock)
+	})
 	if err != nil {
 		return errors.Wrap(err, "acquire global sending advisory lock")
 	}
+	if !gotLock {
+		return processinglock.ErrNoLock
+	}
 	defer func() {
-		ctx := trace.NewContext(context.Background(), trace.FromContext(execCtx))
-		cLock.ExecWithoutLock(ctx, `select pg_advisory_unlock_all()`)
+		_, _ = cLock.ExecWithoutLock(log.FromContext(execCtx).BackgroundContext(), `select pg_advisory_unlock(4912)`)
 	}()
 
 	tx, err := cLock.BeginTx(execCtx, nil)
 	if err != nil {
 		return errors.Wrap(err, "begin transaction")
 	}
-	defer tx.Rollback()
+	defer sqlutil.Rollback(ctx, "engine: message: send", tx)
 
 	_, err = tx.Stmt(db.lockStmt).ExecContext(execCtx)
 	if err != nil {
@@ -589,11 +583,6 @@ func (db *DB) _SendMessages(ctx context.Context, send SendFunc, status StatusFun
 	err = tx.Stmt(db.currentTime).QueryRowContext(execCtx).Scan(&t)
 	if err != nil {
 		return errors.Wrap(err, "get current time")
-	}
-
-	_, err = tx.Stmt(db.updateCMStatusUpdate).ExecContext(execCtx)
-	if err != nil {
-		return errors.Wrap(err, "update status update CM preferences")
 	}
 
 	_, err = tx.Stmt(db.cleanupStatusUpdateOptOut).ExecContext(execCtx)
@@ -690,7 +679,7 @@ func (db *DB) _SendMessages(ctx context.Context, send SendFunc, status StatusFun
 	var wg sync.WaitGroup
 	for _, t := range q.Types() {
 		wg.Add(1)
-		go func(typ notification.DestType) {
+		go func(typ string) {
 			defer wg.Done()
 			err := db.sendMessagesByType(ctx, cLock, send, q, typ)
 			if err != nil && !errors.Is(err, processinglock.ErrNoLock) {
@@ -707,10 +696,24 @@ func (db *DB) refreshMessageState(ctx context.Context, statusFn StatusFunc, id s
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	status, err := statusFn(ctx, id, providerID)
+	status, err := statusFn(ctx, providerID)
 	if errors.Is(err, notification.ErrStatusUnsupported) {
 		// not available
 		res <- nil
+		return
+	}
+	if errors.Is(err, notification.ErrStatusNotFound) {
+		// provider no longer has the message, so no further updates will ever arrive
+		log.Log(ctx, err)
+		res <- &notification.SendResult{
+			Status: notification.Status{
+				State:    notification.StateFailedPerm,
+				Details:  "message no longer exists at provider; final status unknown",
+				Sequence: -1,
+			},
+			ID:                id,
+			ProviderMessageID: providerID,
+		}
 		return
 	}
 	if err != nil {
@@ -733,7 +736,12 @@ func (db *DB) updateStuckMessages(ctx context.Context, statusFn StatusFunc) erro
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer sqlutil.Rollback(ctx, "message: update stuck messages", tx)
+
+	_, err = tx.StmtContext(ctx, db.timeoutStuckMessages).ExecContext(ctx)
+	if err != nil {
+		return err
+	}
 
 	rows, err := tx.Stmt(db.stuckMessages).QueryContext(ctx)
 	if err != nil {
@@ -775,7 +783,7 @@ func (db *DB) updateStuckMessages(ctx context.Context, statusFn StatusFunc) erro
 	return nil
 }
 
-func (db *DB) sendMessagesByType(ctx context.Context, cLock *processinglock.Conn, send SendFunc, q *queue, typ notification.DestType) error {
+func (db *DB) sendMessagesByType(ctx context.Context, cLock *processinglock.Conn, send SendFunc, q *queue, typ string) error {
 	ch := make(chan error)
 	var count int
 	for {
@@ -812,18 +820,12 @@ func (db *DB) sendMessagesByType(ctx context.Context, cLock *processinglock.Conn
 }
 
 func (db *DB) sendMessage(ctx context.Context, cLock *processinglock.Conn, send SendFunc, m *Message) (bool, error) {
-	ctx, sp := trace.StartSpan(ctx, "Engine.MessageManager.SendMessage")
-	defer sp.End()
 	ctx = log.WithFields(ctx, log.Fields{
-		"DestTypeID": m.Dest.ID,
-		"DestType":   m.Dest.Type.String(),
+		"DestID":     m.DestID,
+		"DestType":   m.Dest.Type,
 		"CallbackID": m.ID,
 	})
-	sp.AddAttributes(
-		trace.StringAttribute("message.dest.id", m.Dest.ID),
-		trace.StringAttribute("message.dest.type", m.Dest.Type.String()),
-		trace.StringAttribute("message.callback.id", m.ID),
-	)
+
 	if m.AlertID != 0 {
 		ctx = log.WithField(ctx, "AlertID", m.AlertID)
 	}

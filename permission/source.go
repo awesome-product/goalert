@@ -1,6 +1,6 @@
 package permission
 
-//go:generate go run golang.org/x/tools/cmd/stringer -type SourceType
+//go:generate go tool stringer -type SourceType
 
 // SourceType describes a type of authentication used to authorize a context.
 type SourceType int
@@ -26,6 +26,12 @@ const (
 
 	// SourceTypeCalendarSubscription is set when a context is authorized for use of a calendar subscription.
 	SourceTypeCalendarSubscription
+
+	// SourceTypeGQLAPIKey is set when a context is authorized for use of the GraphQL API.
+	SourceTypeGQLAPIKey
+
+	// SourceTypeUIK is set when a context is authorized for use of a universal integration key.
+	SourceTypeUIK
 )
 
 // SourceInfo provides information about the source of a context's authorization.

@@ -1,27 +1,29 @@
 import { DateTime, Interval } from 'luxon'
 import _ from 'lodash'
+import { ExplicitZone } from './luxon-helpers'
 
 export interface SpanISO {
   start: string
   end: string
 }
 
-export function parseInterval(s: SpanISO): Interval {
+export function parseInterval(s: SpanISO, zone: ExplicitZone): Interval {
   return Interval.fromDateTimes(
-    DateTime.fromISO(s.start),
-    DateTime.fromISO(s.end),
+    DateTime.fromISO(s.start, { zone }),
+    DateTime.fromISO(s.end, { zone }),
   )
 }
 
 export function trimSpans<T extends SpanISO>(
   spans: T[],
-  ...intervals: Interval[]
+  intervals: Interval[],
+  zone: ExplicitZone,
 ): T[] {
   intervals = Interval.merge(intervals)
 
   return _.flatten(
     spans.map((s) => {
-      const ivl = parseInterval(s)
+      const ivl = parseInterval(s, zone)
 
       return ivl.difference(...intervals).map((ivl) => ({
         ...s,

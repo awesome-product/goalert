@@ -3,18 +3,26 @@ package graphqlapp
 import (
 	context "context"
 	"database/sql"
+	"errors"
 	"strconv"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/target/goalert/alert/alertlog"
 	"github.com/target/goalert/assignment"
 	"github.com/target/goalert/escalation"
+	"github.com/target/goalert/gadb"
 	"github.com/target/goalert/graphql2"
 	"github.com/target/goalert/heartbeat"
 	"github.com/target/goalert/integrationkey"
 	"github.com/target/goalert/label"
+	"github.com/target/goalert/notice"
 	"github.com/target/goalert/oncall"
 	"github.com/target/goalert/permission"
 	"github.com/target/goalert/search"
 	"github.com/target/goalert/service"
+	"github.com/target/goalert/util/sqlutil"
+	"github.com/target/goalert/util/timeutil"
 	"github.com/target/goalert/validation"
 	"github.com/target/goalert/validation/validate"
 )
@@ -28,6 +36,7 @@ func (a *App) Service() graphql2.ServiceResolver { return (*Service)(a) }
 func (q *Query) Service(ctx context.Context, id string) (*service.Service, error) {
 	return (*App)(q).FindOneService(ctx, id)
 }
+
 func (q *Query) Services(ctx context.Context, opts *graphql2.ServiceSearchOptions) (conn *graphql2.ServiceConnection, err error) {
 	if opts == nil {
 		opts = &graphql2.ServiceSearchOptions{}
@@ -45,6 +54,7 @@ func (q *Query) Services(ctx context.Context, opts *graphql2.ServiceSearchOption
 		searchOpts.FavoritesFirst = *opts.FavoritesFirst
 	}
 	searchOpts.Omit = opts.Omit
+	searchOpts.Only = opts.Only
 	if opts.After != nil && *opts.After != "" {
 		err = search.ParseCursor(*opts.After, &searchOpts)
 		if err != nil {
@@ -83,20 +93,106 @@ func (q *Query) Services(ctx context.Context, opts *graphql2.ServiceSearchOption
 	conn.Nodes = svcs
 	return conn, err
 }
+func (s *Service) RecentEvents(ctx context.Context, obj *service.Service, opts *graphql2.AlertRecentEventsOptions) (*graphql2.AlertLogEntryConnection, error) {
+	id := uuid.MustParse(obj.ID)
+	return (*App)(s).RecentAlertEvents(ctx, opts, alertlog.SearchOptions{FilterServiceID: &id})
+}
+
+func (s *Service) AlertStats(ctx context.Context, svc *service.Service, input *graphql2.ServiceAlertStatsOptions) (*graphql2.AlertStats, error) {
+	if input == nil {
+		input = &graphql2.ServiceAlertStatsOptions{}
+	}
+	if input.TsOptions == nil {
+		input.TsOptions = &graphql2.TimeSeriesOptions{
+			BucketDuration: timeutil.ISODuration{DayPart: 1},
+		}
+	}
+
+	var start time.Time
+	end := time.Now()
+	if input.Start != nil {
+		start = *input.Start
+	}
+	if input.End != nil {
+		end = *input.End
+	}
+
+	res := timeutil.ISODuration{DayPart: 1}
+	origin := start
+	if input.TsOptions != nil {
+		res = input.TsOptions.BucketDuration
+		if input.TsOptions.BucketOrigin != nil {
+			origin = *input.TsOptions.BucketOrigin
+		}
+	}
+
+	var stats graphql2.AlertStats
+	rows, err := (*App)(s).FindAlertStats(ctx, AlertStatsParam{
+		Stride:    res.PGXInterval(),
+		Origin:    origin,
+		StartTime: start,
+		EndTime:   end,
+	}, uuid.MustParse(svc.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return &stats, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		end := res.AddTo(r.Bucket)
+		stats.AlertCount = append(stats.AlertCount, graphql2.TimeSeriesBucket{Start: r.Bucket, End: end, Value: float64(r.AlertCount)})
+		stats.EscalatedCount = append(stats.EscalatedCount, graphql2.TimeSeriesBucket{Start: r.Bucket, End: end, Value: float64(r.EscalatedCount)})
+		stats.AvgAckSec = append(stats.AvgAckSec, graphql2.TimeSeriesBucket{Start: r.Bucket, End: end, Value: r.AvgTimeToAckSeconds})
+		stats.AvgCloseSec = append(stats.AvgCloseSec, graphql2.TimeSeriesBucket{Start: r.Bucket, End: end, Value: r.AvgTimeToCloseSeconds})
+	}
+	return &stats, nil
+}
+
+func (s *Service) AlertsByStatus(ctx context.Context, svc *service.Service) (*graphql2.AlertsByStatus, error) {
+	rows, err := (*App)(s).FindAlertCountByStatus(ctx, uuid.MustParse(svc.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return &graphql2.AlertsByStatus{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var st graphql2.AlertsByStatus
+	for _, r := range rows {
+		switch r.Status {
+		case gadb.EnumAlertStatusActive:
+			st.Acked = int(r.Count)
+		case gadb.EnumAlertStatusClosed:
+			st.Closed = int(r.Count)
+		case gadb.EnumAlertStatusTriggered:
+			st.Unacked = int(r.Count)
+		}
+	}
+
+	return &st, err
+}
+
+func (s *Service) Notices(ctx context.Context, raw *service.Service) ([]notice.Notice, error) {
+	return s.NoticeStore.FindAllServiceNotices(ctx, raw.ID)
+}
 
 func (s *Service) Labels(ctx context.Context, raw *service.Service) ([]label.Label, error) {
-	return s.LabelStore.FindAllByService(ctx, raw.ID)
+	return s.LabelStore.FindAllByTarget(ctx, s.DB, assignment.ServiceTarget(raw.ID))
 }
 
 func (s *Service) EscalationPolicy(ctx context.Context, raw *service.Service) (*escalation.Policy, error) {
 	return (*App)(s).FindOnePolicy(ctx, raw.EscalationPolicyID)
 }
+
 func (s *Service) IsFavorite(ctx context.Context, raw *service.Service) (bool, error) {
 	return raw.IsUserFavorite(), nil
 }
+
 func (s *Service) OnCallUsers(ctx context.Context, raw *service.Service) ([]oncall.ServiceOnCallUser, error) {
 	return s.OnCallStore.OnCallUsersByService(ctx, raw.ID)
 }
+
 func (s *Service) IntegrationKeys(ctx context.Context, raw *service.Service) ([]integrationkey.IntegrationKey, error) {
 	return s.IntKeyStore.FindAllByService(ctx, raw.ID)
 }
@@ -147,7 +243,7 @@ func (m *Mutation) CreateService(ctx context.Context, input graphql2.CreateServi
 		}
 
 		if input.Favorite != nil && *input.Favorite {
-			err = m.FavoriteStore.SetTx(ctx, tx, permission.UserID(ctx), assignment.ServiceTarget(result.ID))
+			err = m.FavoriteStore.Set(ctx, tx, permission.UserID(ctx), assignment.ServiceTarget(result.ID))
 			if err != nil {
 				return err
 			}
@@ -170,7 +266,7 @@ func (m *Mutation) CreateService(ctx context.Context, input graphql2.CreateServi
 		}
 
 		for i, hb := range input.NewHeartbeatMonitors {
-			hb.ServiceID = result.ID
+			hb.ServiceID = &result.ID
 			_, err = m.CreateHeartbeatMonitor(ctx, hb)
 			if err != nil {
 				return validation.AddPrefix("newHeartbeatMonitors["+strconv.Itoa(i)+"].", err)
@@ -196,7 +292,7 @@ func (a *Mutation) UpdateService(ctx context.Context, input graphql2.UpdateServi
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback()
+	defer sqlutil.Rollback(ctx, "graphql: update service", tx)
 
 	svc, err := a.ServiceStore.FindOneForUpdate(ctx, tx, input.ID)
 	if err != nil {
@@ -211,6 +307,10 @@ func (a *Mutation) UpdateService(ctx context.Context, input graphql2.UpdateServi
 	}
 	if input.EscalationPolicyID != nil {
 		svc.EscalationPolicyID = *input.EscalationPolicyID
+	}
+
+	if input.MaintenanceExpiresAt != nil {
+		svc.MaintenanceExpiresAt = *input.MaintenanceExpiresAt
 	}
 
 	err = a.ServiceStore.UpdateTx(ctx, tx, svc)

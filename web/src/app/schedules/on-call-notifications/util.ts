@@ -1,22 +1,25 @@
-import { ApolloError } from '@apollo/client'
 import { DateTime } from 'luxon'
 
 import {
   OnCallNotificationRule,
   OnCallNotificationRuleInput,
+  TargetType,
   WeekdayFilter,
 } from '../../../schema'
 import { allErrors, fieldErrors, nonFieldErrors } from '../../util/errutil'
 import { weekdaySummary } from '../util'
+import { ApolloError } from '@apollo/client'
+import { CombinedError } from 'urql'
 
 export type Value = {
-  slackChannelID: string | null
   time: string | null
   weekdayFilter: WeekdayFilter
+  type: TargetType
+  targetID: string | null
 }
 
 export type RuleFieldError = {
-  field: 'time' | 'weekdayFilter' | 'slackChannelID'
+  field: 'time' | 'weekdayFilter' | 'type' | 'slackChannelID' | 'slackUserGroup'
   message: string
 }
 
@@ -70,24 +73,25 @@ export const onCallValueToRuleInput = (
     ? DateTime.fromISO(v.time).setZone(zone).toFormat('HH:mm')
     : undefined,
   weekdayFilter: v.time ? v.weekdayFilter : undefined,
-  target: { type: 'slackChannel', id: v.slackChannelID || '' },
+  target: { id: v.targetID || '', type: v.type },
 })
 
 export const onCallRuleToInput = (
   v: OnCallNotificationRule,
-): OnCallNotificationRuleInput | null =>
-  v
-    ? {
-        time: v.time,
-        id: v.id,
-        weekdayFilter: v.weekdayFilter,
-        target: { type: v.target.type, id: v.target.id },
-      }
-    : null
+): OnCallNotificationRuleInput | null => {
+  if (!v.target) return null
+
+  return {
+    time: v.time,
+    id: v.id,
+    weekdayFilter: v.weekdayFilter,
+    target: { type: v.target.type, id: v.target.id },
+  }
+}
 
 export function mapOnCallErrors(
-  mErr?: ApolloError | null,
-  ...qErr: Array<ApolloError | undefined>
+  mErr?: ApolloError | CombinedError | null,
+  ...qErr: Array<ApolloError | CombinedError | undefined>
 ): [Error[], RuleFieldError[]] {
   let dialogErrs: Error[] = []
   qErr.forEach((e) => (dialogErrs = dialogErrs.concat(allErrors(e))))
@@ -96,7 +100,6 @@ export function mapOnCallErrors(
   }
 
   dialogErrs = dialogErrs.concat(nonFieldErrors(mErr))
-
   const fieldErrs = fieldErrors(mErr)
     .map((e) => {
       switch (e.field) {
@@ -105,8 +108,12 @@ export function mapOnCallErrors(
           return e
       }
 
-      if (e.field.startsWith('target')) {
+      if (e.field === 'targetTypeSlackChannel') {
         return { ...e, field: 'slackChannelID' }
+      }
+
+      if (e.field === 'targetTypeSlackUserGroup') {
+        return { ...e, field: 'slackUserGroup' }
       }
 
       dialogErrs.push(e)
@@ -117,10 +124,16 @@ export function mapOnCallErrors(
   return [dialogErrs, fieldErrs]
 }
 
-export function onCallRuleSummary(
-  zone: string,
-  r?: OnCallNotificationRule,
-): string {
+// SummaryInput will accept a partial OnCallNotificationRule, only depending on the fields
+// that are used to generate the summary. This prevents typescript from complaining about
+// missing fields when we only need a subset of the fields (like `target` which will be deprecated
+// in favor of `dest`).
+export type SummaryInput = Pick<
+  OnCallNotificationRule,
+  'time' | 'weekdayFilter'
+>
+
+export function onCallRuleSummary(zone: string, r?: SummaryInput): string {
   if (!r) return ''
   if (!r.time) return 'when on-call changes.'
 

@@ -17,13 +17,10 @@ func fib(n int) int {
 	}
 	return _fib[n]
 }
+
 func init() {
 	fib(30)
 }
-
-// DoFunc is a function that can be retried. It is passed the current attempt number (starting with 0)
-// and should return true if a retry should be attempted.
-type DoFunc func(int) (bool, error)
 
 // An Option takes the attempt number and the last error value (can be nil) and should indicate
 // if a retry should be made.
@@ -31,7 +28,9 @@ type Option func(int, error) bool
 
 // Do will retry the given DoFunc until it or an option returns false. The last returned
 // error value (can be nil) of fn will be returned.
-func Do(fn DoFunc, opts ...Option) error {
+//
+// fn will be passed the current attempt number (starting with 0).
+func Do(fn func(attempt int) (shouldRetry bool, err error), opts ...Option) error {
 	var n int
 	var err error
 	var retry bool
@@ -50,13 +49,13 @@ func Do(fn DoFunc, opts ...Option) error {
 	}
 }
 
-// Log will log all errors between retries returned from the DoFunc. The final error, if any, is not logged.
+// Log will log all errors between retries returned from the DoFunc at Debug level. The final error, if any, is not logged.
 func Log(ctx context.Context) Option {
 	return func(a int, err error) bool {
 		if a == 0 || err == nil {
 			return true
 		}
-		log.Log(log.WithField(ctx, "RetryAttempt", a-1), errors.Wrap(err, "will retry"))
+		log.Debug(log.WithField(ctx, "RetryAttempt", a-1), errors.Wrap(err, "will retry"))
 		return true
 	}
 }
@@ -80,7 +79,7 @@ func FibBackoff(d time.Duration) Option {
 	}
 }
 
-// Context will allow retry to continue until the context is cancelled.
+// Context will allow retry to continue until the context is canceled.
 func Context(ctx context.Context) Option {
 	return func(a int, _ error) bool {
 		return ctx.Err() == nil

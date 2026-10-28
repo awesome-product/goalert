@@ -43,7 +43,7 @@ func SendMailTLS(ctx context.Context, addr string, a NegotiateAuth, from string,
 	if err != nil {
 		return err
 	}
-	conn.SetDeadline(t)
+	_ = conn.SetDeadline(t)
 	defer conn.Close()
 
 	host, _, _ := net.SplitHostPort(addr)
@@ -63,7 +63,7 @@ func SendMail(ctx context.Context, addr string, a NegotiateAuth, from string, to
 	if err != nil {
 		return err
 	}
-	conn.SetDeadline(t)
+	_ = conn.SetDeadline(t)
 	defer conn.Close()
 
 	host, _, _ := net.SplitHostPort(addr)
@@ -75,7 +75,7 @@ func sendMail(ctx context.Context, conn net.Conn, host string, a NegotiateAuth, 
 	if err != nil {
 		return err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }() // we check for proper errors at the end, this is just best effort
 
 	_, isTLS := conn.(*tls.Conn)
 	if ok, _ := c.Extension("STARTTLS"); !isTLS && ok {
@@ -108,12 +108,10 @@ func sendMail(ctx context.Context, conn net.Conn, host string, a NegotiateAuth, 
 	if err != nil {
 		return err
 	}
-	_, err = w.Write(msg)
-	if err != nil {
+	if _, err := w.Write(msg); err != nil {
 		return err
 	}
-	err = w.Close()
-	if err != nil {
+	if err := w.Close(); err != nil {
 		return err
 	}
 

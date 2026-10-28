@@ -3,12 +3,14 @@ package twilio
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"text/template"
 	"unicode"
 
-	"github.com/pkg/errors"
 	"github.com/target/goalert/config"
+	"github.com/target/goalert/notification"
+	"github.com/target/goalert/util"
 )
 
 // 160 GSM characters (140 bytes) is the max for a single segment message.
@@ -19,31 +21,26 @@ import (
 // then be 70 or 67 characters for single or multi-segmented messages, respectively.
 const maxGSMLen = 160
 
-type alertSMS struct {
-	ID    int
-	Count int
-	Body  string
-	Link  string
-	Code  int
-}
-
-var smsTmpl = template.Must(template.New("alertSMS").Parse(`
-{{- if .ID}}Alert #{{.ID}}: {{.Body}}
-{{- else if .Count}}Svc '{{.Body}}': {{.Count}} unacked alert{{if gt .Count 1}}s{{end}}
-{{- end}}
+var alertTempl = template.Must(template.New("alertSMS").Parse(`{{.AppName}}: Alert #{{.AlertID}}: {{.Summary}}
 {{- if .Link }}
 
-{{.Link}}
-{{- end}}
-{{- if and .Count .ID }}
-
-{{.Count}} other alert{{if gt .Count 1}}s have{{else}} has{{end}} been updated.
-{{- end}}
+{{.Link}}{{end}}
 {{- if .Code}}
 
-Reply '{{.Code}}a{{if .Count}}a{{end}}' to ack{{if .Count}} all{{end}}, '{{.Code}}c{{if .Count}}c{{end}}' to close{{if .Count}} all{{end}}.
-{{- end}}`,
-))
+Reply '{{.Code}}a' to ack, '{{.Code}}e' to escalate, '{{.Code}}c' to close.{{end}}`))
+
+var bundleTempl = template.Must(template.New("alertBundleSMS").Parse(`{{.AppName}}: Svc '{{.ServiceName}}': {{.Count}} unacked alert{{if gt .Count 1}}s{{end}}
+
+{{- if .Link }}
+
+	{{.Link}}
+{{end}}
+{{- if .Code}}
+	Reply '{{.Code}}aa' to ack all, '{{.Code}}cc' to close all.{{end}}`))
+
+var statusTempl = template.Must(template.New("alertStatusSMS").Parse(`{{.AppName}}: Alert #{{.AlertID}}{{- if .Summary }}: {{.Summary}}{{end}}
+
+	{{.LogEntry}}`))
 
 const gsmAlphabet = "@∆ 0¡P¿p£!1AQaq$Φ\"2BRbr¥Γ#3CScsèΛ¤4DTdtéΩ%5EUeuùΠ&6FVfvìΨ'7GWgwòΣ(8HXhxÇΘ)9IYiy\n Ξ *:JZjzØ+;KÄkäøÆ,<LÖlö\ræ-=MÑmñÅß.>NÜnüåÉ/?O§oà"
 
@@ -93,43 +90,174 @@ func mapGSM(r rune) rune {
 	return '?'
 }
 
+// hasAnyPrefix returns true if any of the prefixes are present in the string.
+func hasAnyPrefix(s string, prefixes ...string) bool {
+	for _, p := range prefixes {
+		if !strings.HasPrefix(s, p) {
+			continue
+		}
+
+		return true
+	}
+
+	return false
+}
+
+// canContainURL returns true if the message can contain a URL.
+func canContainURL(ctx context.Context, number string) bool {
+	if config.FromContext(ctx).General.DisableSMSLinks {
+		return false
+	}
+
+	return !hasAnyPrefix(number,
+		// Non-exhaustive list of dialing codes that forbid URLs.
+		"+86", // CN - https://www.twilio.com/guidelines/cn/sms
+	)
+}
+
 // hasTwoWaySMSSupport returns true if a number supports 2-way SMS messaging (replies).
 func hasTwoWaySMSSupport(ctx context.Context, number string) bool {
 	if config.FromContext(ctx).Twilio.DisableTwoWaySMS {
 		return false
 	}
 
-	// India numbers do not support SMS replies.
-	return !strings.HasPrefix(number, "+91")
+	return !hasAnyPrefix(number,
+		// Non-exhaustive list of dialing codes that do not support 2-way SMS.
+		"+91",  // IN - https://www.twilio.com/guidelines/in/sms
+		"+86",  // CN - https://www.twilio.com/guidelines/cn/sms
+		"+502", // GT - https://www.twilio.com/guidelines/gt/sms
+		"+506", // CR - https://www.twilio.com/guidelines/cr/sms
+		"+507", // PA - https://www.twilio.com/guidelines/pa/sms
+		"+84",  // VN - https://www.twilio.com/guidelines/vn/sms
+	)
 }
 
-// Render will render a single-segment SMS.
-//
-// Non-GSM characters will be replaced with '?' and Body will be
-// truncated (if needed) until the output is <= 160 characters.
-func (a alertSMS) Render() (string, error) {
-	a.Body = strings.Map(mapGSM, a.Body)
-	a.Body = strings.Replace(a.Body, "  ", " ", -1)
-	a.Body = strings.TrimSpace(a.Body)
+func normalizeGSM(str string) (s string) {
+	s = strings.Map(mapGSM, str)
+	s = strings.ReplaceAll(s, "  ", " ")
+	s = strings.TrimSpace(s)
+	return s
+}
 
+func renderMinGSMSegments(inputs []string, render func(inputs []string) (string, error)) (string, error) {
+	for i, s := range inputs {
+		inputs[i] = normalizeGSM(s)
+	}
+
+	size := maxGSMLen
+	for {
+		result, err := util.RenderSizeN(size, inputs, func(inputs []string) (string, error) {
+			cpy := make([]string, len(inputs))
+			for i, s := range inputs {
+				cpy[i] = strings.TrimSpace(s)
+			}
+
+			return render(cpy)
+		})
+		if errors.Is(err, util.ErrNoSolution) {
+			size += maxGSMLen
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+
+		return result, nil
+	}
+}
+
+// renderAlertMessage will render a SMS message for an Alert.
+//
+// Non-GSM characters will be replaced with '?' and fields will be
+// truncated (as needed) to use the minimum number of message segments.
+func renderAlertMessage(appName string, a notification.Alert, link string, code int) (string, error) {
 	var buf bytes.Buffer
-	err := smsTmpl.Execute(&buf, a)
+	var data struct {
+		AppName string
+		notification.Alert
+		Link string
+		Code int
+	}
+	data.AppName = appName
+	data.Alert = a
+	data.Link = link
+	data.Code = code
+
+	result, err := renderMinGSMSegments([]string{a.Summary}, func(inputs []string) (string, error) {
+		buf.Reset()
+		data.Summary = inputs[0]
+		err := alertTempl.Execute(&buf, data)
+		if err != nil {
+			return "", err
+		}
+		return buf.String(), nil
+	})
 	if err != nil {
 		return "", err
 	}
 
-	if buf.Len() > maxGSMLen {
-		newBodyLen := len(a.Body) - (buf.Len() - maxGSMLen)
-		if newBodyLen <= 0 {
-			return "", errors.New("message too long to include body")
-		}
-		a.Body = strings.TrimSpace(a.Body[:newBodyLen])
+	return result, nil
+}
+
+// renderAlertStatusMessage will render a SMS message for an Alert Status.
+//
+// Non-GSM characters will be replaced with '?' and fields will be
+// truncated (as needed) to use the minimum number of message segments.
+func renderAlertStatusMessage(appName string, a notification.AlertStatus) (string, error) {
+	var buf bytes.Buffer
+	var data struct {
+		AppName string
+		notification.AlertStatus
+	}
+	data.AppName = appName
+	data.AlertStatus = a
+	result, err := renderMinGSMSegments([]string{a.Summary, a.LogEntry}, func(inputs []string) (string, error) {
 		buf.Reset()
-		err = smsTmpl.Execute(&buf, a)
+		data.Summary = inputs[0]
+		data.LogEntry = inputs[1]
+		err := statusTempl.Execute(&buf, data)
 		if err != nil {
 			return "", err
 		}
+		return buf.String(), nil
+	})
+	if err != nil {
+		return "", err
 	}
 
-	return buf.String(), nil
+	return result, nil
+}
+
+// renderAlertBundleMessage will render an SMS message for an Alert Bundle.
+//
+// Non-GSM characters will be replaced with '?' and fields will be
+// truncated (as needed) to use the minimum number of message segments.
+func renderAlertBundleMessage(appName string, a notification.AlertBundle, link string, code int) (string, error) {
+	var buf bytes.Buffer
+
+	var data struct {
+		AppName string
+		notification.AlertBundle
+		Link string
+		Code int
+	}
+	data.AppName = appName
+	data.AlertBundle = a
+	data.Link = link
+	data.Code = code
+
+	result, err := renderMinGSMSegments([]string{data.ServiceName}, func(inputs []string) (string, error) {
+		buf.Reset()
+		data.ServiceName = inputs[0]
+		err := bundleTempl.Execute(&buf, data)
+		if err != nil {
+			return "", err
+		}
+		return buf.String(), nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return result, nil
 }

@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"time"
+
 	"github.com/target/goalert/validation/validate"
 
 	"github.com/google/uuid"
@@ -10,7 +12,8 @@ type callback struct {
 	ID              string
 	AlertID         int
 	ServiceID       string
-	ContactMethodID string
+	ContactMethodID uuid.UUID
+	CreatedAt       time.Time
 }
 
 func (c callback) Normalize() (*callback, error) {
@@ -19,7 +22,6 @@ func (c callback) Normalize() (*callback, error) {
 	}
 	err := validate.Many(
 		validate.UUID("ID", c.ID),
-		validate.UUID("ContactMethodID", c.ContactMethodID),
 	)
 	if err != nil {
 		return nil, err

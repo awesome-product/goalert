@@ -27,7 +27,6 @@ type Store struct {
 	update      *sql.Stmt
 	setUserRole *sql.Stmt
 	findOne     *sql.Stmt
-	findAll     *sql.Stmt
 
 	findMany *sql.Stmt
 
@@ -36,13 +35,19 @@ type Store struct {
 	rotationParts      *sql.Stmt
 	updateRotationPart *sql.Stmt
 	deleteRotationPart *sql.Stmt
+	rotActiveIndex     *sql.Stmt
+	rotSetActive       *sql.Stmt
+	lockRotTables      *sql.Stmt
 
 	findOneForUpdate *sql.Stmt
+
+	findOneBySubject *sql.Stmt
 
 	insertUserAuthSubject *sql.Stmt
 	deleteUserAuthSubject *sql.Stmt
 
-	findAuthSubjectsByUser *sql.Stmt
+	usersMissingProvider *sql.Stmt
+	setAuthSubject       *sql.Stmt
 
 	findAuthSubjects *sql.Stmt
 
@@ -62,23 +67,26 @@ func NewStore(ctx context.Context, db *sql.DB) (*Store, error) {
 
 		userExist: make(chan map[uuid.UUID]struct{}, 1),
 
-		ids: p.P(`SELECT id FROM users`),
-
 		insert: p.P(`
 			INSERT INTO users (
-				id, name, email, avatar_url, role, alert_status_log_contact_method_id
+				id, name, email, avatar_url, role
 			)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			VALUES ($1, $2, $3, $4, $5)
 		`),
+
+		ids: p.P(`SELECT id FROM users`),
 
 		update: p.P(`
 			UPDATE users
 			SET
 				name = $2,
-				email = $3,
-				alert_status_log_contact_method_id = $4
+				email = $3
 			WHERE id = $1
 		`),
+
+		rotActiveIndex: p.P(`SELECT position FROM rotation_state WHERE rotation_id = $1 FOR UPDATE`),
+		rotSetActive:   p.P(`UPDATE rotation_state SET position = $2, rotation_participant_id = $3 WHERE rotation_id = $1`),
+		lockRotTables:  p.P(`LOCK TABLE rotation_participants, rotation_state IN EXCLUSIVE MODE`),
 
 		setUserRole: p.P(`UPDATE users SET role = $2 WHERE id = $1`),
 		findAuthSubjects: p.P(`
@@ -89,11 +97,26 @@ func NewStore(ctx context.Context, db *sql.DB) (*Store, error) {
 				(user_id = any($2) or $2 isnull)
 		`),
 
+		usersMissingProvider: p.P(`
+			SELECT
+				id, name, email, avatar_url, role, false
+			FROM users
+			WHERE id not in (select user_id from auth_subjects where provider_id = $1)
+		`),
+		setAuthSubject: p.P(`
+			INSERT INTO auth_subjects (provider_id, subject_id, user_id)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (provider_id, subject_id) DO UPDATE
+			SET user_id = $3
+		`),
+
 		findMany: p.P(`
 			SELECT
-				id, name, email, avatar_url, role, alert_status_log_contact_method_id
-			FROM users
-			WHERE id = any($1)
+				u.id, u.name, u.email, u.avatar_url, u.role, fav is distinct from null
+			FROM users u
+			LEFT JOIN user_favorites fav ON
+				fav.tgt_user_id = u.id AND fav.user_id = $2
+			WHERE u.id = any($1)
 		`),
 
 		deleteOne:          p.P(`DELETE FROM users WHERE id = $1`),
@@ -102,30 +125,29 @@ func NewStore(ctx context.Context, db *sql.DB) (*Store, error) {
 		updateRotationPart: p.P(`UPDATE rotation_participants SET user_id = $2 WHERE id = $1`),
 		deleteRotationPart: p.P(`DELETE FROM rotation_participants WHERE id = $1`),
 
+		findOneBySubject: p.P(`
+			SELECT
+				u.id, u.name, u.email, u.avatar_url, u.role, false
+			FROM auth_subjects s
+			JOIN users u ON u.id = s.user_id
+			WHERE s.provider_id = $1 AND s.subject_id = $2
+		`),
+
 		findOne: p.P(`
 			SELECT
-				id, name, email, avatar_url, role, alert_status_log_contact_method_id
-			FROM users
-			WHERE id = $1
+				u.id, u.name, u.email, u.avatar_url, u.role, fav is distinct from null
+			FROM users u
+			LEFT JOIN user_favorites fav ON
+				fav.tgt_user_id = u.id AND fav.user_id = $2
+			WHERE u.id = $1
 		`),
+
 		findOneForUpdate: p.P(`
 			SELECT
-				id, name, email, avatar_url, role, alert_status_log_contact_method_id
+				id, name, email, avatar_url, role, false
 			FROM users
 			WHERE id = $1
 			FOR UPDATE
-		`),
-
-		findAuthSubjectsByUser: p.P(`
-			SELECT provider_id, subject_id
-			FROM auth_subjects 
-			WHERE user_id = $1
-		`),
-
-		findAll: p.P(`
-			SELECT
-				id, name, email, avatar_url, role, alert_status_log_contact_method_id
-			FROM users
 		`),
 
 		insertUserAuthSubject: p.P(`
@@ -155,13 +177,76 @@ func NewStore(ctx context.Context, db *sql.DB) (*Store, error) {
 	return store, nil
 }
 
+// SetAuthSubject will add or update the auth subject for the provider/subject pair to point to the provided user ID.
+func (s *Store) SetAuthSubject(ctx context.Context, providerID, subjectID, userID string) error {
+	err := permission.LimitCheckAny(ctx, permission.System, permission.Admin)
+	if err != nil {
+		return err
+	}
+
+	err = validate.Many(
+		validate.SubjectID("ProviderID", providerID),
+		validate.SubjectID("SubjectID", subjectID),
+		validate.UUID("UserID", userID),
+	)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.setAuthSubject.ExecContext(ctx, providerID, subjectID, userID)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// WithoutAuthProviderFunc will call forEachFn for each user that is missing an auth subject for the given provider ID.
+// If an error is returned by forEachFn it will stop reading and be returned. Favorites information will not be included (always false).
+func (s *Store) WithoutAuthProviderFunc(ctx context.Context, providerID string, forEachFn func(User) error) error {
+	err := permission.LimitCheckAny(ctx, permission.System, permission.Admin)
+	if err != nil {
+		return err
+	}
+	err = validate.SubjectID("ProviderID", providerID)
+	if err != nil {
+		return err
+	}
+
+	rows, err := s.usersMissingProvider.QueryContext(ctx, providerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var u User
+		err = u.scanFrom(rows.Scan)
+		if err != nil {
+			return fmt.Errorf("scan user row with missing provider '%s': %w", providerID, err)
+		}
+		err = forEachFn(u)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // AuthSubjectsFunc will call the provided forEachFn for each AuthSubject.
 // If an error is returned by forEachFn it will stop reading subjects and be returned.
 //
 // providerID, if not empty, will limit AuthSubjects to those with the same providerID.
-// userID, if not empty, will limit AuthSubjects to those assigned to the given userID.
-func (s *Store) AuthSubjectsFunc(ctx context.Context, providerID string, forEachFn func(AuthSubject) error, userIDs ...string) error {
-	err := permission.LimitCheckAny(ctx, permission.System, permission.Admin)
+// userID, if not empty, will limit AuthSubjects to those assigned to the given userID(s).
+func (s *Store) AuthSubjectsFunc(ctx context.Context, providerID string, userIDs []string, forEachFn func(AuthSubject) error) error {
+	checks := []permission.Checker{permission.Admin}
+	if len(userIDs) == 1 {
+		checks = append(checks, permission.MatchUser(userIDs[0]))
+	}
+	err := permission.LimitCheckAny(ctx, checks...)
 	if err != nil {
 		return err
 	}
@@ -230,7 +315,7 @@ func (s *Store) DeleteManyTx(ctx context.Context, tx *sql.Tx, ids []string) erro
 		if err != nil {
 			return err
 		}
-		defer tx.Rollback()
+		defer sqlutil.Rollback(ctx, "user: delete", tx)
 	}
 
 	for _, id := range ids {
@@ -253,9 +338,6 @@ func withTx(ctx context.Context, tx *sql.Tx, stmt *sql.Stmt) *sql.Stmt {
 	}
 
 	return tx.StmtContext(ctx, stmt)
-}
-func (s *Store) requireTx(ctx context.Context, tx *sql.Tx, fn func(*sql.Tx) error) error {
-	return nil
 }
 
 // InsertTx creates a new User.
@@ -281,21 +363,6 @@ func (s *Store) InsertTx(ctx context.Context, tx *sql.Tx, u *User) (*User, error
 // Insert is equivalent to calling InsertTx(ctx, nil, u).
 func (s *Store) Insert(ctx context.Context, u *User) (*User, error) { return s.InsertTx(ctx, nil, u) }
 
-// DeleteTx deletes a User with the given ID.
-func (s *Store) DeleteTx(ctx context.Context, tx *sql.Tx, id string) error {
-	err := permission.LimitCheckAny(ctx, permission.System, permission.Admin)
-	if err != nil {
-		return err
-	}
-
-	err = validate.UUID("UserID", id)
-	if err != nil {
-		return err
-	}
-
-	return s.requireTx(ctx, tx, func(tx *sql.Tx) error { return s.retryDeleteTx(ctx, tx, id) })
-}
-
 func (s *Store) retryDeleteTx(ctx context.Context, tx *sql.Tx, id string) error {
 	return retry.DoTemporaryError(func(int) error {
 		err := s._deleteTx(ctx, tx, id)
@@ -313,6 +380,11 @@ func (s *Store) retryDeleteTx(ctx context.Context, tx *sql.Tx, id string) error 
 }
 
 func (s *Store) _deleteTx(ctx context.Context, tx *sql.Tx, id string) error {
+	_, err := tx.StmtContext(ctx, s.lockRotTables).ExecContext(ctx)
+	if err != nil {
+		return err
+	}
+
 	// cleanup rotations first
 	rows, err := tx.StmtContext(ctx, s.userRotations).QueryContext(ctx, id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -367,12 +439,22 @@ func (s *Store) removeUserFromRotation(ctx context.Context, tx *sql.Tx, userID, 
 		participants = append(participants, p)
 	}
 
+	var activeIndex int
+	err = tx.StmtContext(ctx, s.rotActiveIndex).QueryRowContext(ctx, rotationID).Scan(&activeIndex)
+	if err != nil {
+		return fmt.Errorf("query active index: %w", err)
+	}
+
 	// update participant user IDs
 	var skipped bool
 	curIndex := -1
 	updatePart := tx.StmtContext(ctx, s.updateRotationPart)
-	for _, p := range participants {
+	for i, p := range participants {
 		if p.UserID == userID {
+			if i < activeIndex {
+				activeIndex--
+			}
+
 			skipped = true
 			continue
 		}
@@ -384,6 +466,9 @@ func (s *Store) removeUserFromRotation(ctx context.Context, tx *sql.Tx, userID, 
 			}
 		}
 	}
+	if activeIndex > curIndex {
+		activeIndex = 0
+	}
 
 	// delete in reverse order from the end
 	deletePart := tx.StmtContext(ctx, s.deleteRotationPart)
@@ -394,16 +479,15 @@ func (s *Store) removeUserFromRotation(ctx context.Context, tx *sql.Tx, userID, 
 		}
 	}
 
+	_, err = tx.StmtContext(ctx, s.rotSetActive).ExecContext(ctx, rotationID, activeIndex, participants[activeIndex].ID)
+	if err != nil {
+		return fmt.Errorf("set active index: %w", err)
+	}
+
 	return nil
 }
 
-// Delete is equivalent to calling DeleteTx(ctx, nil, id).
-func (s *Store) Delete(ctx context.Context, id string) error { return s.DeleteTx(ctx, nil, id) }
-
-// Update id equivalent to calling UpdateTx(ctx, nil, u).
-func (s *Store) Update(ctx context.Context, u *User) error { return s.UpdateTx(ctx, nil, u) }
-
-// UpdateTx allows updating a user name, email, and status update preference.
+// UpdateTx allows updating a user name and email.
 func (s *Store) UpdateTx(ctx context.Context, tx *sql.Tx, u *User) error {
 	err := permission.LimitCheckAny(ctx, permission.System, permission.Admin, permission.MatchUser(u.ID))
 	if err != nil {
@@ -453,7 +537,7 @@ func (s *Store) FindMany(ctx context.Context, ids []string) ([]User, error) {
 		return nil, err
 	}
 
-	rows, err := s.findMany.QueryContext(ctx, sqlutil.UUIDArray(ids))
+	rows, err := s.findMany.QueryContext(ctx, sqlutil.UUIDArray(ids), permission.UserNullUUID(ctx))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -480,7 +564,8 @@ func (s *Store) FindOne(ctx context.Context, id string) (*User, error) {
 	return s.FindOneTx(ctx, nil, id, false)
 }
 
-// FindOneTx will return a single user, locking the row if forUpdate is set.
+// FindOneTx will return a single user, locking the row if forUpdate is set. When `forUpdate` is true,
+// favorite information is omitted (always false).
 func (s *Store) FindOneTx(ctx context.Context, tx *sql.Tx, id string, forUpdate bool) (*User, error) {
 	err := permission.LimitCheckAny(ctx, permission.All)
 	if err != nil {
@@ -492,13 +577,42 @@ func (s *Store) FindOneTx(ctx context.Context, tx *sql.Tx, id string, forUpdate 
 		return nil, err
 	}
 
-	stmt := s.findOne
+	var row *sql.Row
 	if forUpdate {
-		stmt = s.findOneForUpdate
+		row = withTx(ctx, tx, s.findOneForUpdate).QueryRowContext(ctx, id)
+	} else {
+		row = withTx(ctx, tx, s.findOne).QueryRowContext(ctx, id, permission.UserNullUUID(ctx))
 	}
-	row := withTx(ctx, tx, stmt).QueryRowContext(ctx, id)
+
 	var u User
 	err = u.scanFrom(row.Scan)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// FindOneBySubject will find a user matching the subjectID for the given providerID.
+func (s *Store) FindOneBySubject(ctx context.Context, providerID, subjectID string) (*User, error) {
+	err := permission.LimitCheckAny(ctx, permission.Admin)
+	if err != nil {
+		return nil, err
+	}
+
+	err = validate.Many(
+		validate.SubjectID("ProviderID", providerID),
+		validate.SubjectID("SubjectID", subjectID),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	row := s.findOneBySubject.QueryRowContext(ctx, providerID, subjectID)
+	var u User
+	err = u.scanFrom(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -560,40 +674,15 @@ func (s *Store) FindSomeAuthSubjectsForProvider(ctx context.Context, limit int, 
 // FindAllAuthSubjectsForUser returns all auth subjects associated with a given userID.
 func (s *Store) FindAllAuthSubjectsForUser(ctx context.Context, userID string) ([]AuthSubject, error) {
 	var result []AuthSubject
-	err := s.AuthSubjectsFunc(ctx, "", func(sub AuthSubject) error {
+	err := s.AuthSubjectsFunc(ctx, "", []string{userID}, func(sub AuthSubject) error {
 		result = append(result, sub)
 		return nil
-	}, userID)
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	return result, nil
-}
-
-// FindAll returns all users.
-func (s *Store) FindAll(ctx context.Context) ([]User, error) {
-	err := permission.LimitCheckAny(ctx, permission.All)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := s.findAll.QueryContext(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	users := []User{}
-	for rows.Next() {
-		var u User
-		err = u.scanFrom(rows.Scan)
-		if err != nil {
-			return nil, err
-		}
-		users = append(users, u)
-	}
-
-	return users, nil
 }
 
 // AddAuthSubjectTx adds an auth subject for a user.

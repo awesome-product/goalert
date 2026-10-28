@@ -1,4 +1,7 @@
-schema: ./schema.graphql
+schema:
+  - ./schema.graphql
+  - ./graph/*.graphqls
+
 omit_slice_element_pointers: true
 exec:
   filename: generated.go
@@ -16,6 +19,9 @@ models:
         fieldName: AlertStatusCMID
   UserContactMethod:
     model: github.com/target/goalert/user/contactmethod.ContactMethod
+    fields:
+      value:
+        resolver: true
   UserNotificationRule:
     model: github.com/target/goalert/user/notificationrule.NotificationRule
   Target:
@@ -30,13 +36,17 @@ models:
   Alert:
     model: github.com/target/goalert/alert.Alert
   AlertLogEntry:
-    model: github.com/target/goalert/alert/log.Entry
+    model: github.com/target/goalert/alert/alertlog.Entry
   AlertState:
     model: github.com/target/goalert/alert.State
   Service:
     model: github.com/target/goalert/service.Service
   ISOTimestamp:
     model: github.com/target/goalert/graphql2.ISOTimestamp
+  ISODuration:
+    model: github.com/target/goalert/util/timeutil.ISODuration
+  ISORInterval:
+    model: github.com/target/goalert/util/timeutil.ISORInterval
   EscalationPolicy:
     model: github.com/target/goalert/escalation.Policy
   Rotation:
@@ -44,7 +54,7 @@ models:
   Schedule:
     model: github.com/target/goalert/schedule.Schedule
   UserCalendarSubscription:
-    model: github.com/target/goalert/calendarsubscription.CalendarSubscription
+    model: github.com/target/goalert/calsub.Subscription
   ServiceOnCallUser:
     model: github.com/target/goalert/oncall.ServiceOnCallUser
   EscalationPolicyStep:
@@ -63,10 +73,10 @@ models:
     model: github.com/target/goalert/override.UserOverride
   OnCallShift:
     model: github.com/target/goalert/oncall.Shift
-  ContactMethodType:
-    model: github.com/target/goalert/graphql2.ContactMethodType
   SlackChannel:
     model: github.com/target/goalert/notification/slack.Channel
+  SlackUserGroup:
+    model: github.com/target/goalert/notification/slack.UserGroup
   HeartbeatMonitor:
     model: github.com/target/goalert/heartbeat.Monitor
   HeartbeatMonitorState:
@@ -75,8 +85,6 @@ models:
     model: github.com/target/goalert/limit.ID
   DebugCarrierInfo:
     model: github.com/target/goalert/notification/twilio.CarrierInfo
-  UserSession:
-    model: github.com/target/goalert/auth.UserSession
   Notice:
     model: github.com/target/goalert/notice.Notice
   NoticeType:
@@ -91,8 +99,50 @@ models:
     model: github.com/target/goalert/graphql2.OnCallNotificationRuleInput
   WeekdayFilter:
     model: github.com/target/goalert/util/timeutil.WeekdayFilter
+  AlertMetric:
+    model: github.com/target/goalert/alert/alertmetrics.Metric
   ID:
     model:
       - github.com/99designs/gqlgen/graphql.ID
-      - github.com/google/uuid.UUID
+      - github.com/target/goalert/graphql2.UUID
       - github.com/target/goalert/schedule.RuleID
+  MessageLogConnectionStats:
+    model: github.com/target/goalert/notification.SearchOptions
+  ExprExpression:
+    model: github.com/target/goalert/graphql2.ExprExpression
+  ExprBooleanExpression:
+    model: github.com/target/goalert/graphql2.ExprBooleanExpression
+  ExprStringExpression:
+    model: github.com/target/goalert/graphql2.ExprStringExpression
+  ExprValue:
+    model: github.com/target/goalert/graphql2.ExprValue
+  ExprIdentifier:
+    model: github.com/target/goalert/graphql2.ExprIdentifier
+  ExprStringMap:
+    model: github.com/target/goalert/graphql2.ExprStringMap
+  StringMap:
+    model: github.com/target/goalert/graphql2.StringMap
+  DestinationInput:
+    model: github.com/target/goalert/gadb.DestV1
+  Destination:
+    model: github.com/target/goalert/gadb.DestV1
+  Action:
+    model: github.com/target/goalert/gadb.UIKActionV1
+  ActionInput:
+    model: github.com/target/goalert/gadb.UIKActionV1
+  KeyRule:
+    model: github.com/target/goalert/gadb.UIKRuleV1
+  KeyRuleInput:
+    model: github.com/target/goalert/gadb.UIKRuleV1
+  KeyRuleActionsInput:
+    model: github.com/target/goalert/gadb.UIKRuleV1
+  KeyConfig:
+    model: github.com/target/goalert/gadb.UIKConfigV1
+  DestinationFieldConfig:
+    model: github.com/target/goalert/notification/nfydest.FieldConfig
+  DestinationTypeInfo:
+    model: github.com/target/goalert/notification/nfydest.TypeInfo
+  DynamicParamConfig:
+    model: github.com/target/goalert/notification/nfydest.DynamicParamConfig
+  DestinationDisplayInfo:
+    model: github.com/target/goalert/notification/nfydest.DisplayInfo

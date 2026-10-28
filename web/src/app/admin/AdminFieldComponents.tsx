@@ -1,15 +1,15 @@
 import React, { useState } from 'react'
-import Grid from '@material-ui/core/Grid'
-import IconButton from '@material-ui/core/IconButton'
-import Input from '@material-ui/core/Input'
-import InputAdornment from '@material-ui/core/InputAdornment'
-import Switch from '@material-ui/core/Switch'
-import Visibility from '@material-ui/icons/Visibility'
-import VisibilityOff from '@material-ui/icons/VisibilityOff'
+import Grid from '@mui/material/Grid'
+import IconButton from '@mui/material/IconButton'
+import Input from '@mui/material/OutlinedInput'
+import InputAdornment from '@mui/material/InputAdornment'
+import Switch from '@mui/material/Switch'
+import Visibility from '@mui/icons-material/Visibility'
+import VisibilityOff from '@mui/icons-material/VisibilityOff'
 import TelTextField from '../util/TelTextField'
 
 interface InputProps {
-  type: string
+  type?: string
   name: string
   value: string
   password?: boolean
@@ -17,11 +17,11 @@ interface InputProps {
   autoComplete?: string
 }
 
-export function StringInput(props: InputProps): JSX.Element {
+export function StringInput(props: InputProps): React.JSX.Element {
   const [showPassword, setShowPassword] = useState(false)
   const { onChange, password, type = 'text', ...rest } = props
 
-  const renderPasswordAdornment = (): JSX.Element | null => {
+  const renderPasswordAdornment = (): React.JSX.Element | null => {
     if (!props.password) return null
 
     return (
@@ -29,6 +29,7 @@ export function StringInput(props: InputProps): JSX.Element {
         <IconButton
           aria-label='Toggle password visibility'
           onClick={() => setShowPassword(!showPassword)}
+          size='large'
         >
           {showPassword ? <Visibility /> : <VisibilityOff />}
         </IconButton>
@@ -36,7 +37,7 @@ export function StringInput(props: InputProps): JSX.Element {
     )
   }
 
-  if (type === 'tel') {
+  if (props.name === 'Twilio.FromNumber') {
     return <TelTextField onChange={(e) => onChange(e.target.value)} {...rest} />
   }
   return (
@@ -51,7 +52,7 @@ export function StringInput(props: InputProps): JSX.Element {
   )
 }
 
-export const StringListInput = (props: InputProps): JSX.Element => {
+export const StringListInput = (props: InputProps): React.JSX.Element => {
   const value = props.value ? props.value.split('\n').concat('') : ['']
   return (
     <Grid container spacing={1}>
@@ -79,7 +80,7 @@ export const StringListInput = (props: InputProps): JSX.Element => {
   )
 }
 
-export const IntegerInput = (props: InputProps): JSX.Element => (
+export const IntegerInput = (props: InputProps): React.JSX.Element => (
   <Input
     name={props.name}
     value={props.value}
@@ -94,7 +95,7 @@ export const IntegerInput = (props: InputProps): JSX.Element => (
   />
 )
 
-export const BoolInput = (props: InputProps): JSX.Element => (
+export const BoolInput = (props: InputProps): React.JSX.Element => (
   <Switch
     name={props.name}
     value={props.value}

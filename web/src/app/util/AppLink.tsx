@@ -1,34 +1,72 @@
-import React, { forwardRef, ForwardRefRenderFunction } from 'react'
-import { Link, LinkProps } from 'react-router-dom'
-import { useSelector } from 'react-redux'
-import { urlPathSelector } from '../selectors'
+import React, { forwardRef } from 'react'
+import { LinkProps } from '@mui/material'
+import MUILink from '@mui/material/Link'
+
+import { Link, LinkProps as WLinkProps, useLocation } from 'wouter'
 import joinURL from './joinURL'
 
-export interface AppLinkProps extends LinkProps {
+type MergedLinkProps = Omit<LinkProps & WLinkProps, 'to' | 'href'>
+
+export interface AppLinkProps extends MergedLinkProps {
   to: string
   newTab?: boolean
+  onClick?: React.MouseEventHandler<HTMLAnchorElement> // use explicit anchor elem
 }
 
-const AppLink: ForwardRefRenderFunction<HTMLAnchorElement, AppLinkProps> =
-  function AppLink(props, ref): JSX.Element {
-    const { to: _to, newTab, ...other } = props
-    const path = useSelector(urlPathSelector)
+interface WrapLinkProps {
+  to: string
+  children: React.ReactNode
+}
 
-    if (newTab) {
-      other.target = '_blank'
-      other.rel = 'noopener noreferrer'
-    }
+const WrapLink = forwardRef(function WrapLink(
+  props: WrapLinkProps,
+  ref: React.Ref<HTMLAnchorElement>,
+) {
+  const { to, children, ...rest } = props
+  return (
+    <Link to={to} ref={ref} {...rest}>
+      {children}
+    </Link>
+  )
+})
 
-    if (/^(mailto:|https?:\/\/)/.test(_to)) {
-      return (
-        <a href={_to} ref={ref} {...other}>
-          {other.children}
-        </a>
-      )
-    }
+const AppLink = forwardRef<HTMLAnchorElement, AppLinkProps>((props, ref) => {
+  let { to, newTab, ...other } = props
+  const [location] = useLocation()
 
-    const to = _to.startsWith('/') ? _to : joinURL(path, _to)
-    return <Link to={to} ref={ref} {...other} />
+  if (newTab) {
+    other.target = '_blank'
+    other.rel = 'noopener noreferrer'
   }
 
-export default forwardRef(AppLink)
+  const external = /^(tel:|mailto:|blob:|https?:\/\/)/.test(to)
+
+  // handle relative URLs
+  if (!external && !to.startsWith('/')) {
+    to = joinURL(location, to)
+  }
+
+  return (
+    <MUILink
+      {...other}
+      ref={ref}
+      to={to}
+      href={to}
+      component={external || newTab ? 'a' : WrapLink}
+    />
+  )
+})
+
+AppLink.displayName = 'AppLink'
+export default AppLink
+
+// forwardRef required to shut console up
+export const AppLinkListItem = forwardRef<HTMLAnchorElement, AppLinkProps>(
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  (props, _) => (
+    <li>
+      <AppLink {...props} />
+    </li>
+  ),
+)
+AppLinkListItem.displayName = 'AppLinkListItem'

@@ -7,64 +7,31 @@ import (
 	"strings"
 	"time"
 
-	"contrib.go.opencensus.io/exporter/stackdriver/propagation"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/target/goalert/app/csp"
 	"github.com/target/goalert/config"
+	"github.com/target/goalert/expflag"
 	"github.com/target/goalert/genericapi"
 	"github.com/target/goalert/grafana"
 	"github.com/target/goalert/mailgun"
 	"github.com/target/goalert/notification/twilio"
+	"github.com/target/goalert/permission"
 	prometheus "github.com/target/goalert/prometheusalertmanager"
 	"github.com/target/goalert/site24x7"
 	"github.com/target/goalert/util/errutil"
 	"github.com/target/goalert/util/log"
 	"github.com/target/goalert/web"
-	"go.opencensus.io/plugin/ochttp"
 )
 
 func (app *App) initHTTP(ctx context.Context) error {
-	var traceMiddleware func(next http.Handler) http.Handler
-	if app.cfg.StackdriverProjectID != "" {
-		traceMiddleware = func(next http.Handler) http.Handler {
-			return &ochttp.Handler{
-				IsPublicEndpoint: true,
-				Propagation:      &propagation.HTTPFormat{},
-				Handler:          next,
-			}
-		}
-	} else {
-		traceMiddleware = func(next http.Handler) http.Handler {
-			return &ochttp.Handler{
-				IsPublicEndpoint: true,
-				Handler:          next,
-			}
-		}
-	}
-
 	middleware := []func(http.Handler) http.Handler{
-		traceMiddleware,
-		// add app config to request context
-		func(next http.Handler) http.Handler { return config.Handler(next, app.ConfigStore) },
-
 		func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				w.Header().Set("Referrer-Policy", "same-origin")
-				next.ServeHTTP(w, req)
+				next.ServeHTTP(w, req.WithContext(app.Context(req.Context())))
 			})
 		},
 
-		// request cooldown tracking (for graceful shutdown)
-		func(next http.Handler) http.Handler {
-			if app.cooldown == nil {
-				return next
-			}
-			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				if !strings.HasPrefix(req.URL.Path, "/health") {
-					app.cooldown.Trigger()
-				}
-				next.ServeHTTP(w, req)
-			})
-		},
+		withSecureHeaders(app.cfg.EnableSecureHeaders, strings.HasPrefix(app.cfg.PublicURL, "https://")),
 
 		config.ShortURLMiddleware,
 
@@ -105,8 +72,8 @@ func (app *App) initHTTP(ctx context.Context) error {
 			})
 		},
 
-		// limit auth check counts (fail-safe for loops or DB access)
-		authCheckLimit(100),
+		// limit external calls (fail-safe for loops or DB access)
+		extCallLimit(100),
 
 		// request logging
 		logRequest(app.cfg.LogRequests),
@@ -127,23 +94,13 @@ func (app *App) initHTTP(ctx context.Context) error {
 		// limit max request size
 		maxBodySizeMiddleware(app.cfg.MaxReqBodyBytes),
 
-		// return a 404 if the v1 graphql api is disabled
-		graphQLV1DeprecationMiddleware(),
-
-		// pause has to become before anything that uses the DB (like auth)
-		app.pauseHandler,
-
 		// authenticate requests
 		app.AuthHandler.WrapHandler,
 
 		// add auth info to request logs
 		logRequestAuth,
 
-		conReqLimit{
-			perIntKey:  1,
-			perService: 2,
-			perUser:    3,
-		}.Middleware,
+		LimitConcurrencyByAuthSource,
 
 		wrapGzip,
 	}
@@ -151,7 +108,7 @@ func (app *App) initHTTP(ctx context.Context) error {
 	if app.cfg.Verbose {
 		middleware = append(middleware, func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				next.ServeHTTP(w, req.WithContext(log.EnableDebug(req.Context())))
+				next.ServeHTTP(w, req.WithContext(log.WithDebug(req.Context())))
 			})
 		})
 	}
@@ -165,42 +122,44 @@ func (app *App) initHTTP(ctx context.Context) error {
 		UserStore:           app.UserStore,
 	})
 
-	mux.Handle("/api/graphql", app.graphql2.Handler())
-	mux.Handle("/api/graphql/explore", app.graphql2.PlayHandler())
+	mux.Handle("POST /api/graphql", app.graphql2.Handler())
 
-	mux.HandleFunc("/api/v2/config", app.ConfigStore.ServeConfig)
+	mux.HandleFunc("GET /api/v2/config", app.ConfigStore.ServeConfig)
+	mux.HandleFunc("PUT /api/v2/config", app.ConfigStore.ServeConfig)
 
-	mux.HandleFunc("/api/v2/identity/providers", app.AuthHandler.ServeProviders)
-	mux.HandleFunc("/api/v2/identity/logout", app.AuthHandler.ServeLogout)
+	mux.HandleFunc("GET /api/v2/identity/providers", app.AuthHandler.ServeProviders)
+	mux.HandleFunc("POST /api/v2/identity/logout", app.AuthHandler.ServeLogout)
 
 	basicAuth := app.AuthHandler.IdentityProviderHandler("basic")
-	mux.HandleFunc("/api/v2/identity/providers/basic", basicAuth)
+	mux.HandleFunc("POST /api/v2/identity/providers/basic", basicAuth)
 
 	githubAuth := app.AuthHandler.IdentityProviderHandler("github")
-	mux.HandleFunc("/api/v2/identity/providers/github", githubAuth)
-	mux.HandleFunc("/api/v2/identity/providers/github/callback", githubAuth)
+	mux.HandleFunc("POST /api/v2/identity/providers/github", githubAuth)
+	mux.HandleFunc("GET /api/v2/identity/providers/github/callback", githubAuth)
 
 	oidcAuth := app.AuthHandler.IdentityProviderHandler("oidc")
-	mux.HandleFunc("/api/v2/identity/providers/oidc", oidcAuth)
-	mux.HandleFunc("/api/v2/identity/providers/oidc/callback", oidcAuth)
+	mux.HandleFunc("POST /api/v2/identity/providers/oidc", oidcAuth)
+	mux.HandleFunc("GET /api/v2/identity/providers/oidc/callback", oidcAuth)
 
-	mux.HandleFunc("/api/v2/mailgun/incoming", mailgun.IngressWebhooks(app.AlertStore, app.IntegrationKeyStore))
-	mux.HandleFunc("/api/v2/grafana/incoming", grafana.GrafanaToEventsAPI(app.AlertStore, app.IntegrationKeyStore))
-	mux.HandleFunc("/api/v2/site24x7/incoming", site24x7.Site24x7ToEventsAPI(app.AlertStore, app.IntegrationKeyStore))
-	mux.HandleFunc("/api/v2/prometheusalertmanager/incoming", prometheus.PrometheusAlertmanagerEventsAPI(app.AlertStore, app.IntegrationKeyStore))
+	if expflag.ContextHas(ctx, expflag.UnivKeys) {
+		mux.HandleFunc("POST /api/v2/uik", app.UIKHandler.ServeHTTP)
+	}
+	mux.HandleFunc("POST /api/v2/mailgun/incoming", mailgun.IngressWebhooks(app.AlertStore, app.IntegrationKeyStore))
+	mux.HandleFunc("POST /api/v2/grafana/incoming", grafana.GrafanaToEventsAPI(app.AlertStore, app.IntegrationKeyStore))
+	mux.HandleFunc("POST /api/v2/site24x7/incoming", site24x7.Site24x7ToEventsAPI(app.AlertStore, app.IntegrationKeyStore))
+	mux.HandleFunc("POST /api/v2/prometheusalertmanager/incoming", prometheus.PrometheusAlertmanagerEventsAPI(app.AlertStore, app.IntegrationKeyStore))
 
-	mux.HandleFunc("/api/v2/generic/incoming", generic.ServeCreateAlert)
-	mux.HandleFunc("/api/v2/heartbeat/", generic.ServeHeartbeatCheck)
-	mux.HandleFunc("/api/v2/user-avatar/", generic.ServeUserAvatar)
-	mux.HandleFunc("/api/v2/calendar", app.CalSubStore.ServeICalData)
+	mux.HandleFunc("POST /api/v2/generic/incoming", generic.ServeCreateAlert)
+	mux.HandleFunc("POST /api/v2/heartbeat/{heartbeatID}", generic.ServeHeartbeatCheck)
+	mux.HandleFunc("GET /api/v2/user-avatar/{userID}", generic.ServeUserAvatar)
+	mux.HandleFunc("GET /api/v2/calendar", app.CalSubStore.ServeICalData)
 
-	mux.HandleFunc("/api/v2/twilio/message", app.twilioSMS.ServeMessage)
-	mux.HandleFunc("/api/v2/twilio/message/status", app.twilioSMS.ServeStatusCallback)
-	mux.HandleFunc("/api/v2/twilio/call", app.twilioVoice.ServeCall)
-	mux.HandleFunc("/api/v2/twilio/call/status", app.twilioVoice.ServeStatusCallback)
+	mux.HandleFunc("POST /api/v2/twilio/message", app.twilioSMS.ServeMessage)
+	mux.HandleFunc("POST /api/v2/twilio/message/status", app.twilioSMS.ServeStatusCallback)
+	mux.HandleFunc("POST /api/v2/twilio/call", app.twilioVoice.ServeCall)
+	mux.HandleFunc("POST /api/v2/twilio/call/status", app.twilioVoice.ServeStatusCallback)
 
-	// Legacy (v1) API mapping
-	mux.HandleFunc("/v1/graphql", app.graphql.ServeHTTP)
+	mux.HandleFunc("POST /api/v2/slack/message-action", app.slackChan.ServeMessageAction)
 
 	middleware = append(middleware,
 		httpRewrite(app.cfg.HTTPPrefix, "/v1/graphql2", "/api/graphql"),
@@ -237,7 +196,6 @@ func (app *App) initHTTP(ctx context.Context) error {
 				*app.twilioConfig,
 			)
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-
 				if strings.HasPrefix(req.URL.Path, "/api/v2/twilio/") {
 					twilioHandler.ServeHTTP(w, req)
 					return
@@ -248,15 +206,49 @@ func (app *App) initHTTP(ctx context.Context) error {
 		},
 	)
 
-	mux.HandleFunc("/health", app.healthCheck)
-	mux.HandleFunc("/health/engine", app.engineStatus)
+	mux.HandleFunc("GET /health", app.healthCheck)
+	mux.HandleFunc("GET /health/engine", app.engineStatus)
+	mux.HandleFunc("GET /health/engine/cycle", app.engineCycle)
+	mux.Handle("GET /health/", http.NotFoundHandler())
 
-	webH, err := web.NewHandler(app.cfg.UIURL, app.cfg.HTTPPrefix)
+	webH, err := web.NewHandler(app.cfg.UIDir, app.cfg.HTTPPrefix)
 	if err != nil {
 		return err
 	}
-	// non-API/404s go to UI handler
-	mux.Handle("/", webH)
+
+	// This is necessary so that we can return 404 for invalid/unknown API routes, otherwise it will get caught by the UI handler and incorrectly return the index.html or a 405 (Method Not Allowed) error.
+	mux.Handle("GET /api/", http.NotFoundHandler())
+	mux.Handle("POST /api/", http.NotFoundHandler())
+	mux.Handle("GET /v1/", http.NotFoundHandler())
+	mux.Handle("POST /v1/", http.NotFoundHandler())
+
+	// non-API/404s go to UI handler and return index.html
+	mux.Handle("GET /", webH)
+
+	mux.Handle("GET /api/graphql/explore", webH)
+	mux.Handle("GET /api/graphql/explore/", webH)
+
+	mux.HandleFunc("GET /admin/riverui/", func(w http.ResponseWriter, r *http.Request) {
+		err := permission.LimitCheckAny(r.Context(), permission.Admin)
+		if permission.IsUnauthorized(err) {
+			// render login since we're on a UI route
+			webH.ServeHTTP(w, r)
+			return
+		}
+		if errutil.HTTPError(r.Context(), w, err) {
+			return
+		}
+
+		app.RiverUI.ServeHTTP(csp.NonceResponseWriter(csp.NonceValue(r.Context()), w), r)
+	})
+	mux.HandleFunc("POST /admin/riverui/api/", func(w http.ResponseWriter, r *http.Request) {
+		err := permission.LimitCheckAny(r.Context(), permission.Admin)
+		if errutil.HTTPError(r.Context(), w, err) {
+			return
+		}
+
+		app.RiverUI.ServeHTTP(w, r)
+	})
 
 	app.srv = &http.Server{
 		Handler: applyMiddleware(mux, middleware...),
@@ -270,7 +262,7 @@ func (app *App) initHTTP(ctx context.Context) error {
 	app.srv.Handler = promhttp.InstrumentHandlerInFlight(metricReqInFlight, app.srv.Handler)
 	app.srv.Handler = promhttp.InstrumentHandlerCounter(metricReqTotal, app.srv.Handler)
 
-	// Ingress/load balancer/proxy can do keep-alives, backend doesn't need it.
+	// Ingress/load balancer/proxy can do a keep-alive, backend doesn't need it.
 	// It also makes zero downtime deploys nearly impossible; an idle connection
 	// could have an in-flight request when the server closes it.
 	app.srv.SetKeepAlivesEnabled(false)

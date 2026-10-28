@@ -5,94 +5,50 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/pkg/errors"
+	"github.com/target/goalert/notification/nfydest"
 	"github.com/target/goalert/util/log"
-	"go.opencensus.io/trace"
 )
 
 // Manager is used as an intermediary between Senders and Receivers.
-// It should be contstructed first (with NewManager()) and passed to
+// It should be constructed first (with NewManager()) and passed to
 // Senders and Receivers that require it.
 type Manager struct {
-	providers   map[string]*namedSender
-	searchOrder []*namedSender
-
-	ResultReceiver
 	mx *sync.RWMutex
 
-	stubNotifiers bool
+	reg *nfydest.Registry
 }
 
-var _ ResultReceiver = Manager{}
+// var _ ResultReceiver = Manager{}
 
 // NewManager initializes a new Manager.
-func NewManager() *Manager {
+func NewManager(reg *nfydest.Registry) *Manager {
 	return &Manager{
-		mx:        new(sync.RWMutex),
-		providers: make(map[string]*namedSender),
+		mx:  new(sync.RWMutex),
+		reg: reg,
 	}
-}
-
-// SetStubNotifiers will cause all notifications senders to be stubbed out.
-//
-// This causes all notifications to be marked as delivered, but not actually sent.
-func (mgr *Manager) SetStubNotifiers() {
-	mgr.stubNotifiers = true
 }
 
 // MessageStatus will return the current status of a message.
-func (mgr *Manager) MessageStatus(ctx context.Context, messageID string, providerMsgID ProviderMessageID) (*Status, error) {
-
-	provider := mgr.providers[providerMsgID.ProviderName]
-	if provider == nil {
-		return nil, errors.Errorf("unknown provider ID '%s'", providerMsgID.ProviderName)
-	}
-
-	checker, ok := provider.Sender.(StatusChecker)
-	if !ok {
-		return nil, ErrStatusUnsupported
-	}
-
-	ctx, sp := trace.StartSpan(ctx, "NotificationManager.Status")
-	sp.AddAttributes(
-		trace.StringAttribute("provider.id", providerMsgID.ExternalID),
-		trace.StringAttribute("provider.message.id", providerMsgID.ProviderName),
-	)
-	defer sp.End()
-	return checker.Status(ctx, providerMsgID.ExternalID)
-}
-
-// RegisterSender will register a sender under a given DestType and name.
-// A sender for the same name and type will replace an existing one, if any.
-func (mgr *Manager) RegisterSender(t DestType, name string, s Sender) {
-	mgr.mx.Lock()
-	defer mgr.mx.Unlock()
-
-	_, ok := mgr.providers[name]
-	if ok {
-		panic("name already taken")
-	}
-	if mgr.stubNotifiers {
-		// disable notification sending
-		s = stubSender{}
-	}
-
-	n := &namedSender{name: name, Sender: s, destType: t}
-	mgr.providers[name] = n
-	mgr.searchOrder = append(mgr.searchOrder, n)
-
-	if rs, ok := s.(ReceiverSetter); ok {
-		rs.SetReceiver(&namedReceiver{ns: n, r: mgr})
-	}
+func (mgr *Manager) MessageStatus(ctx context.Context, providerMsgID ProviderMessageID) (*Status, error) {
+	return mgr.reg.MessageStatus(ctx, providerMsgID.ProviderName, providerMsgID.ExternalID)
 }
 
 // SetResultReceiver will set the ResultReceiver as the target for all Receiver calls.
 // It will panic if called multiple times.
-func (mgr *Manager) SetResultReceiver(p ResultReceiver) {
-	if mgr.ResultReceiver != nil {
-		panic("tried to register a second Processor instance")
+func (mgr *Manager) SetResultReceiver(ctx context.Context, recv ResultReceiver) error {
+	types, err := mgr.reg.Types(ctx)
+	if err != nil {
+		return fmt.Errorf("error getting types: %w", err)
 	}
-	mgr.ResultReceiver = p
+
+	for _, t := range types {
+		p := mgr.reg.Provider(t.Type)
+		if r, ok := p.(ReceiverSetter); ok {
+			r.SetReceiver(&namedReceiver{r: recv, destType: t.Type})
+		}
+	}
+
+	return nil
 }
 
 // SendMessage tries all registered senders for the type given
@@ -102,46 +58,49 @@ func (mgr *Manager) SendMessage(ctx context.Context, msg Message) (*SendResult, 
 	mgr.mx.RLock()
 	defer mgr.mx.RUnlock()
 
-	destType := msg.Destination().Type
+	destType := msg.DestType()
 
 	ctx = log.WithFields(ctx, log.Fields{
 		"ProviderType": destType,
-		"CallbackID":   msg.ID(),
+		"CallbackID":   msg.MsgID(),
 	})
 	if a, ok := msg.(Alert); ok {
 		ctx = log.WithField(ctx, "AlertID", a.AlertID)
 	}
-
-	var tried bool
-	for _, s := range mgr.searchOrder {
-		if s.destType != destType {
-			continue
-		}
-		tried = true
-
-		sendCtx := log.WithField(ctx, "ProviderName", s.name)
-		sendCtx, sp := trace.StartSpan(sendCtx, "NotificationManager.Send")
-		sp.AddAttributes(
-			trace.StringAttribute("provider.id", s.name),
-			trace.StringAttribute("message.type", msg.Type().String()),
-			trace.StringAttribute("message.id", msg.ID()),
-		)
-		res, err := s.Send(sendCtx, msg)
-		sp.End()
-		if err != nil {
-			log.Log(sendCtx, errors.Wrap(err, "send notification"))
-			continue
-		}
-		log.Logf(sendCtx, "notification sent")
-		metricSentTotal.
-			WithLabelValues(msg.Destination().Type.String(), msg.Type().String()).
-			Inc()
-		// status already wrapped via namedSender
-		return res, nil
-	}
-	if !tried {
-		return nil, fmt.Errorf("no senders registered for type '%s'", destType)
+	sendCtx := log.WithField(ctx, "ProviderName", msg.DestType())
+	sent, err := mgr.reg.SendMessage(sendCtx, msg)
+	if err != nil {
+		return nil, err
 	}
 
-	return nil, errors.New("all notification senders failed")
+	log.Logf(sendCtx, "notification sent")
+	metricSentTotal.
+		WithLabelValues(msg.DestType(), fmt.Sprintf("%T", msg), msgSvcID(msg)).
+		Inc()
+
+	return &SendResult{
+		ID: msg.MsgID(),
+		Status: Status{
+			State:    sent.State,
+			Details:  sent.StateDetails,
+			SrcValue: sent.SrcValue,
+		},
+		ProviderMessageID: ProviderMessageID{
+			ProviderName: msg.DestType(),
+			ExternalID:   sent.ExternalID,
+		},
+	}, nil
+}
+
+func msgSvcID(msg Message) string {
+	switch msg := msg.(type) {
+	case Alert:
+		return msg.ServiceID
+	case AlertBundle:
+		return msg.ServiceID
+	case AlertStatus:
+		return msg.ServiceID
+	}
+
+	return ""
 }

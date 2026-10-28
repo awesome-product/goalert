@@ -1,16 +1,16 @@
 package twilio
 
 import (
+	"database/sql"
 	"net/http"
 
 	"github.com/target/goalert/user/contactmethod"
 )
 
 const (
-	msgParamID    = "msgID"
-	msgParamSubID = "msgSubjectID"
-	msgParamBody  = "msgBody"
-
+	msgParamID     = "msgID"
+	msgParamSubID  = "msgSubjectID"
+	msgParamBody   = "msgBody"
 	msgParamBundle = "msgBundle"
 )
 
@@ -24,5 +24,8 @@ type Config struct {
 	Client *http.Client
 
 	// CMStore is used for storing and fetching metadata (like carrier information).
-	CMStore contactmethod.Store
+	CMStore *contactmethod.Store
+
+	// DB is used for storing DB connection data (needed for carrier metadata dbtx).
+	DB *sql.DB
 }

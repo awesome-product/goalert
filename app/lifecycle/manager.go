@@ -54,8 +54,10 @@ type Manager struct {
 	isPausing   bool
 }
 
-var _ Pausable = &Manager{}
-var _ PauseResumer = &Manager{}
+var (
+	_ Pausable     = &Manager{}
+	_ PauseResumer = &Manager{}
+)
 
 // NewManager will construct a new manager wrapping the provided
 // run and shutdown funcs.
@@ -195,7 +197,12 @@ func (m *Manager) Run(ctx context.Context) error {
 
 	err := m.runFunc(ctx)
 	close(m.runDone)
-	<-m.shutdownDone
+	s = <-m.status
+	m.status <- s
+	if s == StatusShutdown {
+		<-m.shutdownDone
+	}
+
 	return err
 }
 
@@ -255,7 +262,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// Pause will bein a pause opperation.
+// Pause will bein a pause operation.
 // SetPauseResumer must have been called or ErrPauseUnsupported is returned.
 //
 // Pause is atomic and guarantees a paused state if nil is returned

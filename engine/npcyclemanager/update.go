@@ -3,11 +3,11 @@ package npcyclemanager
 import (
 	"context"
 
-	alertlog "github.com/target/goalert/alert/log"
+	"github.com/pkg/errors"
+	"github.com/target/goalert/alert/alertlog"
 	"github.com/target/goalert/permission"
 	"github.com/target/goalert/util/log"
-
-	"github.com/pkg/errors"
+	"github.com/target/goalert/util/sqlutil"
 )
 
 // UpdateAll will update and cleanup all notification cycles.
@@ -33,9 +33,15 @@ func (db *DB) update(ctx context.Context, all bool, alertID *int) error {
 	if err != nil {
 		return errors.Wrap(err, "begin tx")
 	}
-	defer tx.Rollback()
+	defer sqlutil.Rollback(ctx, "np cycle manager", tx)
 
 	rows, err := tx.StmtContext(ctx, db.queueMessages).QueryContext(ctx)
+	if merr := sqlutil.MapError(err); merr != nil && merr.Code == "23503" && merr.ConstraintName == "outgoing_messages_contact_method_id_fkey" {
+		// This can happen if a contact method is deleted after the notification policy cycle was created, but before the notification was sent.
+		// Log a debug message, but otherwise ignore it, we'll try again on the next cycle.
+		log.Debug(ctx, err)
+		return nil
+	}
 	if err != nil {
 		return errors.Wrap(err, "queue outgoing messages")
 	}

@@ -89,7 +89,7 @@ func (sess *session) init() {
 
 	_, err = ym.Ping()
 	if err != nil {
-		ym.Close()
+		_ = ym.Close()
 		log.Println("ERROR:", err)
 		return
 	}
@@ -102,7 +102,7 @@ func (sess *session) OpenContext(ctx context.Context) (net.Conn, error) {
 	sess.mx.Lock()
 	defer sess.mx.Unlock()
 
-	// check done/cancelled first
+	// check done/canceled first
 	select {
 	case <-sess.doneCh:
 		return nil, io.ErrClosedPipe
@@ -137,10 +137,10 @@ func (sess *session) End() {
 
 	sess.start.Do(sess.init)
 	if sess.ym != nil {
-		sess.ym.Close()
+		_ = sess.ym.Close()
 	}
 
-	sess.stream.Close()
+	_ = sess.stream.Close()
 	sess.s.mx.Lock()
 	defer sess.s.mx.Unlock()
 

@@ -1,10 +1,11 @@
 import React, { ReactNode } from 'react'
-import Drawer from '@material-ui/core/Drawer'
-import { makeStyles } from '@material-ui/core'
+import Drawer from '@mui/material/Drawer'
+import makeStyles from '@mui/styles/makeStyles'
+import { Theme } from '@mui/material/styles'
 
-export const drawerWidth = '220px'
+export const drawerWidth = '190px'
 
-const useStyles = makeStyles((theme) => ({
+const useStyles = makeStyles((theme: Theme) => ({
   sidebarPaper: {
     width: drawerWidth,
     position: 'fixed',
@@ -19,7 +20,7 @@ interface WideSideBarProps {
   children: ReactNode
 }
 
-function WideSideBar(props: WideSideBarProps): JSX.Element {
+function WideSideBar(props: WideSideBarProps): React.JSX.Element {
   const classes = useStyles()
 
   return (

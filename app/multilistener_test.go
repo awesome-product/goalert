@@ -28,7 +28,6 @@ func withTimeout(t *testing.T, name string, fn func() error) error {
 }
 
 func TestMultiListener_Close(t *testing.T) {
-
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	assert.NoError(t, err)
 	defer l.Close()
@@ -45,7 +44,6 @@ func TestMultiListener_Close(t *testing.T) {
 
 func TestMultiListener_Accept(t *testing.T) {
 	t.Run("multiple listeners", func(t *testing.T) {
-
 		l1, err := net.Listen("tcp", "127.0.0.1:0")
 		assert.NoError(t, err)
 		defer l1.Close()
@@ -85,7 +83,6 @@ func TestMultiListener_Accept(t *testing.T) {
 		assert.Error(t, err)
 	})
 	t.Run("return on accept pending", func(t *testing.T) {
-
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		assert.NoError(t, err)
 		defer l.Close()
@@ -94,7 +91,7 @@ func TestMultiListener_Accept(t *testing.T) {
 
 		go func() {
 			time.Sleep(10 * time.Millisecond) // wait until Accept is called
-			m.Close()
+			_ = m.Close()
 		}()
 
 		err = withTimeout(t, "accept", func() error { _, err := m.Accept(); return err })

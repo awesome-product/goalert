@@ -11,7 +11,7 @@ import (
 
 // maximum lengths
 const (
-	MaxSummaryLength = 118
+	MaxSummaryLength = 1024     // 1KiB
 	MaxDetailsLength = 6 * 1024 // 6KiB
 )
 
@@ -55,12 +55,13 @@ func (a Alert) Normalize() (*Alert, error) {
 	if string(a.Status) == "" {
 		a.Status = StatusTriggered
 	}
-	a.Summary = strings.Replace(a.Summary, "\n", " ", -1)
-	a.Summary = strings.Replace(a.Summary, "  ", " ", -1)
+	a.Summary = strings.ReplaceAll(a.Summary, "\n", " ")
+	a.Summary = strings.ReplaceAll(a.Summary, "  ", " ")
+
 	err := validate.Many(
 		validate.Text("Summary", a.Summary, 1, MaxSummaryLength),
 		validate.Text("Details", a.Details, 0, MaxDetailsLength),
-		validate.OneOf("Source", a.Source, SourceManual, SourceGrafana, SourceSite24x7, SourcePrometheusAlertmanager, SourceEmail, SourceGeneric),
+		validate.OneOf("Source", a.Source, SourceManual, SourceGrafana, SourceSite24x7, SourcePrometheusAlertmanager, SourceEmail, SourceGeneric, SourceUniversal),
 		validate.OneOf("Status", a.Status, StatusTriggered, StatusActive, StatusClosed),
 		validate.UUID("ServiceID", a.ServiceID),
 	)

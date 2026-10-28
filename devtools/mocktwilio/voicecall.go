@@ -37,7 +37,7 @@ type VoiceCall struct {
 	start time.Time
 
 	// callStart tracks when the call was accepted
-	// and is used to cacluate call.CallDuration when completed.
+	// and is used to calculate call.CallDuration when completed.
 	callStart      time.Time
 	url            string
 	callbackURL    string
@@ -129,12 +129,14 @@ func (s *Server) serveCallStatus(w http.ResponseWriter, req *http.Request) {
 		panic(err)
 	}
 }
+
 func (s *Server) call(id string) *VoiceCall {
 	s.mx.RLock()
 	defer s.mx.RUnlock()
 
 	return s.calls[id]
 }
+
 func (s *Server) serveNewCall(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "POST" {
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
@@ -150,9 +152,9 @@ func (s *Server) serveNewCall(w http.ResponseWriter, req *http.Request) {
 		hangupCh:  make(chan struct{}),
 	}
 
-	vc.call.From = req.FormValue("From")
+	fromValue := req.FormValue("From")
 	s.mx.RLock()
-	_, hasCallback := s.callbacks["VOICE:"+vc.call.From]
+	_, hasCallback := s.callbacks["VOICE:"+fromValue]
 	s.mx.RUnlock()
 	if !hasCallback {
 		apiError(400, w, &twilio.Exception{
@@ -160,8 +162,10 @@ func (s *Server) serveNewCall(w http.ResponseWriter, req *http.Request) {
 		})
 		return
 	}
+
 	vc.s = s
 	vc.call.To = req.FormValue("To")
+	vc.call.From = fromValue
 	vc.call.SID = s.id("CA")
 	vc.call.SequenceNumber = new(int)
 	vc.callbackURL = req.FormValue("StatusCallback")
@@ -211,10 +215,11 @@ func (vc *VoiceCall) updateStatus(stat twilio.CallStatus) {
 	// move to queued
 	vc.mx.Lock()
 	vc.call.Status = stat
-	if stat == twilio.CallStatusInProgress {
+
+	switch stat {
+	case twilio.CallStatusInProgress:
 		vc.callStart = time.Now()
-	}
-	if stat == twilio.CallStatusCompleted {
+	case twilio.CallStatusCompleted:
 		vc.call.CallDuration = time.Since(vc.callStart)
 	}
 	*vc.call.SequenceNumber++
@@ -242,6 +247,7 @@ func (vc *VoiceCall) updateStatus(stat twilio.CallStatus) {
 		vc.s.errs <- errors.Wrap(err, "post to call status callback")
 	}
 }
+
 func (vc *VoiceCall) values(digits string) url.Values {
 	call := vc.cloneCall()
 
@@ -282,7 +288,7 @@ func (vc *VoiceCall) Accept() { close(vc.acceptCh) }
 // Reject will reject a call, moving it to a "failed" state.
 func (vc *VoiceCall) Reject() { close(vc.rejectCh); <-vc.doneCh }
 
-// Hangup will end the call, setting it's state to "completed".
+// Hangup will end the call, setting its state to "completed".
 func (vc *VoiceCall) Hangup() { close(vc.hangupCh); <-vc.doneCh }
 
 func (vc *VoiceCall) fetchMessage(digits string) (string, error) {
@@ -292,10 +298,10 @@ func (vc *VoiceCall) fetchMessage(digits string) (string, error) {
 	}
 	type resp struct {
 		XMLName xml.Name `xml:"Response"`
-		Say     []string `xml:"Say"`
+		Say     []string `xml:"Say>prosody"`
 		Gather  struct {
 			Action string   `xml:"action,attr"`
-			Say    []string `xml:"Say"`
+			Say    []string `xml:"Say>prosody"`
 		}
 		RedirectURL string    `xml:"Redirect"`
 		Hangup      *struct{} `xml:"Hangup"`
@@ -335,7 +341,7 @@ func (vc *VoiceCall) Status() twilio.CallStatus {
 func (vc *VoiceCall) PressDigits(digits string) { vc.pressCh <- digits }
 
 // ID returns the unique ID of this phone call.
-// It is analogus to the Twilio SID of a call.
+// It is analogous to the Twilio SID of a call.
 func (vc *VoiceCall) ID() string {
 	return vc.call.SID
 }
@@ -345,7 +351,7 @@ func (vc *VoiceCall) To() string {
 	return vc.call.To
 }
 
-// From return the source phone number.
+// From returns the source phone number.
 func (vc *VoiceCall) From() string {
 	return vc.call.From
 }

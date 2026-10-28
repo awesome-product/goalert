@@ -1,19 +1,16 @@
 import React from 'react'
-import Grid from '@material-ui/core/Grid'
-import Typography from '@material-ui/core/Typography'
-import { makeStyles } from '@material-ui/core/styles'
+import Grid from '@mui/material/Grid'
+import Typography from '@mui/material/Typography'
+import makeStyles from '@mui/styles/makeStyles'
+import { Theme } from '@mui/material/styles'
 import AdminNumberLookup from './AdminNumberLookup'
 import AdminSMSSend from './AdminSMSSend'
+import { useConfigValue } from '../util/RequireConfig'
 
-const useStyles = makeStyles((theme) => ({
+const useStyles = makeStyles((theme: Theme) => ({
   gridContainer: {
     [theme.breakpoints.up('md')]: {
       justifyContent: 'center',
-    },
-  },
-  gridItem: {
-    [theme.breakpoints.up('md')]: {
-      maxWidth: '65%',
     },
   },
   groupTitle: {
@@ -24,12 +21,23 @@ const useStyles = makeStyles((theme) => ({
   },
 }))
 
-export default function AdminToolbox(): JSX.Element {
+export default function AdminToolbox(): React.JSX.Element {
   const classes = useStyles()
+
+  const [hasTwilio] = useConfigValue('Twilio.Enable')
+
+  if (!hasTwilio) {
+    return (
+      <Typography variant='body1' color='textSecondary'>
+        Twilio is not enabled. Please enable Twilio in the configuration to use
+        this feature.
+      </Typography>
+    )
+  }
 
   return (
     <Grid container spacing={2} className={classes.gridContainer}>
-      <Grid container item xs={12} className={classes.gridItem}>
+      <Grid container item xs={12}>
         <Grid item xs={12}>
           <Typography
             component='h2'
@@ -44,7 +52,7 @@ export default function AdminToolbox(): JSX.Element {
           <AdminNumberLookup />
         </Grid>
       </Grid>
-      <Grid container item xs={12} className={classes.gridItem}>
+      <Grid container item xs={12}>
         <Grid item xs={12}>
           <Typography
             component='h2'

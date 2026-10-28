@@ -1,20 +1,15 @@
 import React, { useState } from 'react'
-import FlatList from '../lists/FlatList'
-import {
-  QueryHookOptions,
-  useMutation,
-  useQuery,
-  ApolloError,
-  gql,
-} from '@apollo/client'
-import { Button, Card, Grid, IconButton } from '@material-ui/core'
-import DeleteIcon from '@material-ui/icons/Delete'
+import { useMutation, useQuery, CombinedError, gql } from 'urql'
+import { Button, Card, Grid, IconButton } from '@mui/material'
+import DeleteIcon from '@mui/icons-material/Delete'
 import { UserSession } from '../../schema'
 import Bowser from 'bowser'
-import { formatTimeSince } from '../util/timeFormat'
 import _ from 'lodash'
 import FormDialog from '../dialogs/FormDialog'
 import { nonFieldErrors } from '../util/errutil'
+import { Time } from '../util/Time'
+import CompList from '../lists/CompList'
+import { CompListItemText } from '../lists/CompListItems'
 
 const profileQuery = gql`
   query {
@@ -58,17 +53,14 @@ const mutationLogoutAll = gql`
   }
 `
 
-export interface UserSessionListProps {
-  userID?: string
-}
-
 function friendlyUAString(ua: string): string {
   if (!ua) return 'Unknown device'
   const b = Bowser.getParser(ua)
 
   let str
   if (b.getBrowserName()) {
-    str = b.getBrowserName() + ' ' + b.getBrowserVersion().split('.')[0]
+    str =
+      b.getBrowserName() + ' ' + (b.getBrowserVersion()?.split('.')[0] || '')
   }
   if (!str) {
     str = 'Unknown device'
@@ -90,39 +82,39 @@ type Session = {
   userAgent: string
 }
 
-export default function UserSessionList(
-  props: UserSessionListProps,
-): JSX.Element {
+export type UserSessionListProps = {
+  userID: string
+}
+
+export default function UserSessionList({
+  userID,
+}: UserSessionListProps): JSX.Element {
   // handles both logout all and logout individual sessions
   const [endSession, setEndSession] = useState<Session | 'all' | null>(null)
 
-  const userID = props.userID
-  const options: QueryHookOptions = {}
+  let variables = {}
   if (userID) {
-    options.variables = { userID }
+    variables = { userID }
   }
-  const { data } = useQuery(userID ? byUserQuery : profileQuery, options)
+  const [{ data }] = useQuery({
+    query: userID ? byUserQuery : profileQuery,
+    variables,
+  })
 
   const sessions: UserSession[] = _.sortBy(
     data?.user?.sessions || [],
     (s: UserSession) => (s.current ? '_' + s.lastAccessAt : s.lastAccessAt),
   ).reverse()
 
-  const [logoutOne, logoutOneStatus] = useMutation(mutationLogoutOne, {
-    variables: { id: (endSession as Session)?.id },
-    onCompleted: () => setEndSession(null),
-  })
-  const [logoutAll, logoutAllStatus] = useMutation(mutationLogoutAll, {
-    onCompleted: () => setEndSession(null),
-  })
+  const [logoutOneStatus, logoutOne] = useMutation(mutationLogoutOne)
+  const [logoutAllStatus, logoutAll] = useMutation(mutationLogoutAll)
 
   return (
     <React.Fragment>
       <Grid container spacing={2}>
         {!userID && (
-          <Grid item xs={12} container justify='flex-end'>
+          <Grid item xs={12} container justifyContent='flex-end'>
             <Button
-              color='primary'
               variant='outlined'
               data-cy='reset'
               onClick={() => setEndSession('all')}
@@ -133,27 +125,38 @@ export default function UserSessionList(
         )}
         <Grid item xs={12}>
           <Card>
-            <FlatList
-              emptyMessage='No active sessions'
-              items={sessions.map((s) => ({
-                title: friendlyUAString(s.userAgent),
-                highlight: s.current,
-                secondaryAction: s.current ? null : (
-                  <IconButton
-                    color='primary'
-                    onClick={() =>
-                      setEndSession({
-                        id: s.id,
-                        userAgent: s.userAgent,
-                      })
-                    }
-                  >
-                    <DeleteIcon />
-                  </IconButton>
-                ),
-                subText: `Last access: ${formatTimeSince(s.lastAccessAt)}`,
-              }))}
-            />
+            <CompList emptyMessage='No active sessions'>
+              {sessions.map((s) => (
+                <CompListItemText
+                  key={s.id}
+                  title={friendlyUAString(s.userAgent)}
+                  highlight={s.current}
+                  action={
+                    s.current ? null : (
+                      <IconButton
+                        onClick={() =>
+                          setEndSession({
+                            id: s.id,
+                            userAgent: s.userAgent,
+                          })
+                        }
+                        size='large'
+                      >
+                        <DeleteIcon />
+                      </IconButton>
+                    )
+                  }
+                  subText={
+                    <Time
+                      format='relative'
+                      time={s.lastAccessAt}
+                      prefix='Last access: '
+                      min={{ minutes: 2 }}
+                    />
+                  }
+                />
+              ))}
+            </CompList>
           </Card>
         </Grid>
       </Grid>
@@ -162,10 +165,14 @@ export default function UserSessionList(
         <FormDialog
           title='Are you sure?'
           confirm
-          loading={logoutAllStatus.loading}
-          errors={nonFieldErrors(logoutAllStatus.error as ApolloError)}
+          loading={logoutAllStatus.fetching}
+          errors={nonFieldErrors(logoutAllStatus.error as CombinedError)}
           subTitle='This will log you out of all other sessions.'
-          onSubmit={() => logoutAll()}
+          onSubmit={() =>
+            logoutAll().then((result) => {
+              if (!result.error) setEndSession(null)
+            })
+          }
           onClose={() => setEndSession(null)}
         />
       )}
@@ -174,12 +181,16 @@ export default function UserSessionList(
         <FormDialog
           title='Are you sure?'
           confirm
-          loading={logoutOneStatus.loading}
-          errors={nonFieldErrors(logoutOneStatus.error as ApolloError)}
+          loading={logoutOneStatus.fetching}
+          errors={nonFieldErrors(logoutOneStatus.error as CombinedError)}
           subTitle={`This will log you out of your "${friendlyUAString(
             endSession.userAgent,
           )}" session.`}
-          onSubmit={() => logoutOne()}
+          onSubmit={() =>
+            logoutOne({ id: (endSession as Session)?.id }).then((result) => {
+              if (!result.error) setEndSession(null)
+            })
+          }
           onClose={() => setEndSession(null)}
         />
       )}

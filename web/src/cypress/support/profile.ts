@@ -1,6 +1,94 @@
 import { Chance } from 'chance'
+import profile from '../fixtures/profile.json'
 
 const c = new Chance()
+
+declare global {
+  namespace Cypress {
+    interface Chainable {
+      /** Creates a new user profile. */
+      createUser: typeof createUser
+
+      /** Creates multiple new user profiles. */
+      createManyUsers: typeof createManyUsers
+
+      /**
+       * Resets the test user profile, including any existing contact methods.
+       */
+      resetProfile: typeof resetProfile
+
+      /** Adds a contact method. If userID is missing, the test user's will be used. */
+      addContactMethod: typeof addContactMethod
+
+      /** Adds a notification rule. If userID is missing, the test user's will be used. */
+      addNotificationRule: typeof addNotificationRule
+    }
+  }
+
+  type UserRole = 'user' | 'admin'
+  interface Profile {
+    id: string
+    name: string
+    email: string
+    role: UserRole
+    username?: string
+    passwordHash?: string
+    isFavorite: boolean
+  }
+
+  interface UserOptions {
+    name?: string
+    email?: string
+    role?: UserRole
+    favorite?: boolean
+  }
+
+  type ContactMethodType = 'SMS' | 'VOICE'
+  interface ContactMethod {
+    id: string
+    userID: string
+    name: string
+    type: ContactMethodType
+    value: string
+  }
+
+  interface ContactMethodOptions {
+    userID?: string
+    name?: string
+    type?: ContactMethodType
+    value?: string
+  }
+
+  interface NotificationRule {
+    id: string
+    userID: string
+    contactMethodID: string
+    contactMethod: ContactMethod
+    delayMinutes: number
+  }
+
+  interface NotificationRuleOptions {
+    userID?: string
+    delayMinutes?: number
+    contactMethodID?: string
+    contactMethod?: ContactMethodOptions
+  }
+}
+
+function setFavoriteUser(id: string): Cypress.Chainable {
+  const query = `
+    mutation setFavorite($input: SetFavoriteInput!){
+      setFavorite(input: $input)
+    }
+  `
+
+  return cy.graphql(query, {
+    input: {
+      target: { type: 'user', id },
+      favorite: true,
+    },
+  })
+}
 
 function createManyUsers(
   users: Array<UserOptions>,
@@ -10,6 +98,7 @@ function createManyUsers(
     name: user.name || c.word({ length: 12 }),
     email: user.email || c.email(),
     role: user.role || 'user',
+    isFavorite: user.favorite || false,
   }))
 
   const dbQuery =
@@ -19,7 +108,13 @@ function createManyUsers(
       .join(',') +
     `;`
 
-  return cy.sql(dbQuery).then(() => profiles)
+  return cy
+    .sql(dbQuery)
+    .then(() =>
+      Promise.all(
+        profiles.filter((p) => p.isFavorite).map((u) => setFavoriteUser(u.id)),
+      ).then(() => profiles),
+    )
 }
 
 function createUser(user?: UserOptions): Cypress.Chainable<Profile> {
@@ -32,9 +127,7 @@ function addContactMethod(
 ): Cypress.Chainable<ContactMethod> {
   if (!cm) cm = {}
   if (!cm.userID) {
-    return cy
-      .fixture('profile')
-      .then((prof) => addContactMethod({ ...cm, userID: prof.id }))
+    return addContactMethod({ ...cm, userID: profile.id })
   }
 
   const mutation = `
@@ -61,7 +154,7 @@ function addContactMethod(
     .then((res: GraphQLResponse) => {
       res = res.createUserContactMethod
       res.userID = cm && cm.userID
-      return res
+      return res as ContactMethod
     })
 }
 
@@ -70,9 +163,7 @@ function addNotificationRule(
 ): Cypress.Chainable<NotificationRule> {
   if (!nr) nr = {}
   if (!nr.userID) {
-    return cy
-      .fixture('profile')
-      .then((prof) => addNotificationRule({ ...nr, userID: prof.id }))
+    return addNotificationRule({ ...nr, userID: profile.id })
   }
 
   if (!nr.contactMethodID) {
@@ -114,7 +205,7 @@ function addNotificationRule(
       res.userID = userID
       res.contactMethod.userID = userID
 
-      return res
+      return res as NotificationRule
     })
 }
 
@@ -153,7 +244,7 @@ function clearContactMethods(id: string): Cypress.Chainable {
 
 function resetProfile(prof?: Profile): Cypress.Chainable {
   if (!prof) {
-    return cy.fixture('profile').then(resetProfile)
+    return resetProfile(profile as unknown as Profile)
   }
 
   const mutation = `

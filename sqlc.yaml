@@ -1,0 +1,60 @@
+version: '2'
+sql:
+  - schema:
+      - swo/swoinfo/pgtables.sql
+      - swo/swosync/changelog.sql
+      - migrate/migrations/20180816094955-switchover-state.sql
+      - migrate/migrations/20220808103727-switchover-mk2.sql
+    queries:
+      - swo/*/queries.sql
+      - swo/queries.sql
+    engine: postgresql
+    gen:
+      go:
+        out: swo/swodb
+        sql_package: pgx/v5
+  - schema:
+      - migrate/schema.sql
+      - swo/swoinfo/pgtables.sql
+      - swo/swosync/changelog.sql
+    queries:
+      - '*/queries.sql'
+      - '*/*/queries.sql'
+    engine: postgresql
+    gen:
+      go:
+        out: gadb
+        sql_package: database/sql
+        overrides:
+          - db_type: pg_catalog.interval
+            go_type:
+              import: github.com/target/goalert/util/sqlutil
+              type: Interval
+          - db_type: interval
+            go_type:
+              import: github.com/target/goalert/util/sqlutil
+              type: Interval
+          - column: public.schedule_rules.start_time
+            go_type:
+              import: github.com/target/goalert/util/timeutil
+              type: Clock
+          - column: public.schedule_rules.end_time
+            go_type:
+              import: github.com/target/goalert/util/timeutil
+              type: Clock
+          - column: public.outgoing_messages.provider_msg_id
+            go_type:
+              type: ProviderMessageID
+          - column: public.user_contact_methods.dest
+            go_type:
+              # Note: We can't use the nullable/non-nullable types here because
+              # sqlc doesn't support it for column overrides yet.
+              #
+              # Since it's common to have NULL (i.e., when scanning contact methods and notificaiton channels at once) we use the nullable type.
+              type: NullDestV1
+          - column: public.notification_channels.dest
+            go_type:
+              type: NullDestV1
+          - column: public.uik_config.config
+            go_type:
+              type: UIKConfig

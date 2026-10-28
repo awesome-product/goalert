@@ -1,120 +1,193 @@
+import { Checkbox, FormControlLabel, Typography } from '@mui/material'
+import Grid from '@mui/material/Grid'
+import TextField from '@mui/material/TextField'
 import React from 'react'
-import Grid from '@material-ui/core/Grid'
-import TextField from '@material-ui/core/TextField'
-import { FormContainer, FormField } from '../forms'
-import TelTextField from '../util/TelTextField'
-import { MenuItem, Typography } from '@material-ui/core'
-import { ContactMethodType } from '../../schema'
-import { useConfigValue } from '../util/RequireConfig'
+import { DestinationInput } from '../../schema'
+import { FormContainer } from '../forms'
+import { renderMenuItem } from '../selection/DisableableMenuItem'
+import DestinationField from '../selection/DestinationField'
+import { useContactMethodTypes } from '../util/RequireConfig'
+
+export type Value = {
+  name: string
+  dest: DestinationInput
+  statusUpdates: boolean
+  private: boolean
+}
 
 export type UserContactMethodFormProps = {
-  value: { name: string; type: ContactMethodType; value: string }
-  disclaimer?: string
+  value: Value
 
-  errors?: Array<{ field: 'name' | 'type' | 'value'; message: string }>
+  nameError?: string
+  destTypeError?: string
+  destFieldErrors?: Readonly<Record<string, string>>
 
   disabled?: boolean
   edit?: boolean
-}
 
-function renderEmailField(edit: boolean): JSX.Element {
-  return (
-    <FormField
-      placeholder='foobar@example.com'
-      fullWidth
-      name='value'
-      required
-      label='Email Address'
-      type='email'
-      component={TextField}
-      disabled={edit}
-    />
-  )
-}
+  disablePortal?: boolean // for testing, disable portal on select menu
 
-function renderPhoneField(edit: boolean): JSX.Element {
-  return (
-    <React.Fragment>
-      <FormField
-        placeholder='11235550123'
-        aria-labelledby='countryCodeIndicator'
-        fullWidth
-        name='value'
-        required
-        label='Phone Number'
-        type='tel'
-        component={TelTextField}
-        disabled={edit}
-      />
-      {!edit && (
-        <Typography variant='caption' component='p' id='countryCodeIndicator'>
-          Please provide your country code e.g. +1 (USA), +91 (India), +44 (UK)
-        </Typography>
-      )}
-    </React.Fragment>
-  )
-}
-
-function renderTypeField(type: ContactMethodType, edit: boolean): JSX.Element {
-  switch (type) {
-    case 'SMS':
-    case 'VOICE':
-      return renderPhoneField(edit)
-    case 'EMAIL':
-      return renderEmailField(edit)
-    default:
-  }
-
-  // fallback to generic
-  return (
-    <FormField
-      fullWidth
-      name='value'
-      required
-      label='Value'
-      component={TextField}
-      disabled={edit}
-    />
-  )
+  onChange?: (CMValue: Value) => void
 }
 
 export default function UserContactMethodForm(
   props: UserContactMethodFormProps,
 ): JSX.Element {
-  const { value, edit = false, disclaimer, ...other } = props
+  const { value, edit = false, ...other } = props
 
-  const [smsVoiceEnabled, emailEnabled] = useConfigValue(
-    'Twilio.Enable',
-    'SMTP.Enable',
-  )
+  const destinationTypes = useContactMethodTypes()
+  const currentType = destinationTypes.find((d) => d.type === value.dest.type)
+
+  if (!currentType) throw new Error('invalid destination type')
+
+  let statusLabel = 'Send alert status updates'
+  let statusUpdateChecked = value.statusUpdates
+  if (currentType.statusUpdatesRequired) {
+    statusLabel = 'Send alert status updates (cannot be disabled for this type)'
+    statusUpdateChecked = true
+  } else if (!currentType.supportsStatusUpdates) {
+    statusLabel = 'Send alert status updates (not supported for this type)'
+    statusUpdateChecked = false
+  }
 
   return (
-    <FormContainer {...other} value={value} optionalLabels>
+    <FormContainer
+      {...other}
+      value={value}
+      mapOnChangeValue={(newValue: Value): Value => {
+        if (newValue.dest.type === value.dest.type) {
+          return newValue
+        }
+
+        // reset otherwise
+        return {
+          ...newValue,
+          dest: {
+            ...newValue.dest,
+            args: {},
+          },
+        }
+      }}
+      optionalLabels
+    >
       <Grid container spacing={2}>
         <Grid item xs={12} sm={12} md={6}>
-          <FormField fullWidth name='name' required component={TextField} />
+          <TextField
+            fullWidth
+            name='name'
+            label='Name'
+            disabled={props.disabled}
+            error={!!props.nameError}
+            helperText={props.nameError}
+            value={value.name}
+            onChange={(e) =>
+              props.onChange &&
+              props.onChange({ ...value, name: e.target.value })
+            }
+          />
         </Grid>
         <Grid item xs={12} sm={12} md={6}>
-          <FormField
+          <TextField
             fullWidth
-            name='type'
-            required
+            name='dest.type'
+            label='Destination Type'
             select
-            disabled={edit}
-            component={TextField}
+            error={!!props.destTypeError}
+            helperText={props.destTypeError}
+            SelectProps={{ MenuProps: { disablePortal: props.disablePortal } }}
+            value={value.dest.type}
+            onChange={(v) =>
+              props.onChange &&
+              props.onChange({
+                ...value,
+                dest: {
+                  type: v.target.value as string,
+                  args: {},
+                },
+              })
+            }
+            disabled={props.disabled || edit}
           >
-            {(edit || smsVoiceEnabled) && <MenuItem value='SMS'>SMS</MenuItem>}
-            {(edit || smsVoiceEnabled) && (
-              <MenuItem value='VOICE'>VOICE</MenuItem>
+            {destinationTypes.map((t) =>
+              renderMenuItem({
+                label: t.name,
+                value: t.type,
+                disabled: !t.enabled,
+                disabledMessage: t.enabled ? '' : 'Disabled by administrator.',
+              }),
             )}
-            {(edit || emailEnabled) && <MenuItem value='EMAIL'>EMAIL</MenuItem>}
-          </FormField>
+          </TextField>
         </Grid>
         <Grid item xs={12}>
-          {renderTypeField(value.type, edit)}
+          <DestinationField
+            destType={value.dest.type}
+            disabled={props.disabled || edit}
+            fieldErrors={props.destFieldErrors}
+            value={value.dest.args || {}}
+            onChange={(v) =>
+              props.onChange &&
+              props.onChange({
+                ...value,
+                dest: {
+                  ...value.dest,
+                  args: v,
+                },
+              })
+            }
+          />
+        </Grid>
+
+        {currentType?.userDisclaimer !== '' && (
+          <Grid item xs={12}>
+            <Typography variant='caption'>
+              {currentType?.userDisclaimer}
+            </Typography>
+          </Grid>
+        )}
+
+        <Grid item xs={12}>
+          <FormControlLabel
+            label={statusLabel}
+            title='Alert status updates are sent when an alert is acknowledged, closed, or escalated.'
+            control={
+              <Checkbox
+                name='enableStatusUpdates'
+                disabled={
+                  !currentType.supportsStatusUpdates ||
+                  currentType.statusUpdatesRequired ||
+                  props.disabled
+                }
+                checked={statusUpdateChecked}
+                onChange={(v) =>
+                  props.onChange &&
+                  props.onChange({
+                    ...value,
+                    statusUpdates: v.target.checked,
+                  })
+                }
+              />
+            }
+          />
         </Grid>
         <Grid item xs={12}>
-          <Typography variant='caption'>{disclaimer}</Typography>
+          <FormControlLabel
+            label='This is a private contact method'
+            title='Private contact methods are not visible to other users.'
+            control={
+              <Checkbox
+                name='private'
+                disabled={props.disabled}
+                checked={value.private}
+                onChange={(v) =>
+                  props.onChange &&
+                  props.onChange({
+                    ...value,
+                    private: v.target.checked,
+                  })
+                }
+              />
+            }
+          />
         </Grid>
       </Grid>
     </FormContainer>

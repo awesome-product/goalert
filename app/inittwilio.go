@@ -2,20 +2,18 @@ package app
 
 import (
 	"context"
-	"net/http"
 
-	"github.com/target/goalert/notification"
 	"github.com/target/goalert/notification/twilio"
 
 	"github.com/pkg/errors"
-	"go.opencensus.io/plugin/ochttp"
 )
 
 func (app *App) initTwilio(ctx context.Context) error {
 	app.twilioConfig = &twilio.Config{
 		BaseURL: app.cfg.TwilioBaseURL,
-		Client:  &http.Client{Transport: &ochttp.Transport{}},
 		CMStore: app.ContactMethodStore,
+		DB:      app.db,
+		Client:  app.httpClient,
 	}
 
 	var err error
@@ -23,13 +21,11 @@ func (app *App) initTwilio(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "init TwilioSMS")
 	}
-	app.notificationManager.RegisterSender(notification.DestTypeSMS, "Twilio-SMS", app.twilioSMS)
 
 	app.twilioVoice, err = twilio.NewVoice(ctx, app.db, app.twilioConfig)
 	if err != nil {
 		return errors.Wrap(err, "init TwilioVoice")
 	}
-	app.notificationManager.RegisterSender(notification.DestTypeVoice, "Twilio-Voice", app.twilioVoice)
 
 	return nil
 }

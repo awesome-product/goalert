@@ -1,6 +1,6 @@
 package notification
 
-//go:generate go run golang.org/x/tools/cmd/stringer -type Result
+//go:generate go tool stringer -type Result
 
 // Result specifies a response to a notification.
 type Result int
@@ -9,4 +9,5 @@ type Result int
 const (
 	ResultAcknowledge Result = iota
 	ResultResolve
+	ResultEscalate
 )

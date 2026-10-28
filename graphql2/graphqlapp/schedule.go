@@ -3,15 +3,18 @@ package graphqlapp
 import (
 	context "context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/target/goalert/assignment"
+	"github.com/target/goalert/gadb"
 	"github.com/target/goalert/graphql2"
-	"github.com/target/goalert/notificationchannel"
+	"github.com/target/goalert/label"
 	"github.com/target/goalert/oncall"
 	"github.com/target/goalert/permission"
 	"github.com/target/goalert/schedule"
@@ -22,9 +25,12 @@ import (
 	"github.com/target/goalert/validation/validate"
 )
 
-type Schedule App
-type TemporarySchedule App
-type OnCallNotificationRule App
+type (
+	Schedule                    App
+	TemporarySchedule           App
+	OnCallNotificationRule      App
+	OnCallNotificationRuleInput App
+)
 
 func (a *App) Schedule() graphql2.ScheduleResolver                   { return (*Schedule)(a) }
 func (a *App) TemporarySchedule() graphql2.TemporaryScheduleResolver { return (*TemporarySchedule)(a) }
@@ -32,21 +38,36 @@ func (a *App) OnCallNotificationRule() graphql2.OnCallNotificationRuleResolver {
 	return (*OnCallNotificationRule)(a)
 }
 
-func (a *OnCallNotificationRule) Target(ctx context.Context, raw *schedule.OnCallNotificationRule) (*assignment.RawTarget, error) {
-	ch, err := a.NCStore.FindOne(ctx, raw.ChannelID)
+func (a *App) OnCallNotificationRuleInput() graphql2.OnCallNotificationRuleInputResolver {
+	return (*OnCallNotificationRuleInput)(a)
+}
+
+func (a *OnCallNotificationRuleInput) Target(ctx context.Context, input *graphql2.OnCallNotificationRuleInput, tgt *assignment.RawTarget) error {
+	var err error
+	input.Dest, err = (*App)(a).CompatTargetToDest(ctx, tgt)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *OnCallNotificationRule) Dest(ctx context.Context, raw *schedule.OnCallNotificationRule) (*gadb.DestV1, error) {
+	dest, err := a.NCStore.FindDestByID(ctx, nil, raw.ChannelID)
 	if err != nil {
 		return nil, err
 	}
 
-	if ch.Type == notificationchannel.TypeSlack {
-		return &assignment.RawTarget{
-			Type: assignment.TargetTypeSlackChannel,
-			ID:   ch.Value,
-			Name: ch.Name,
-		}, nil
+	return &dest, nil
+}
+
+func (a *OnCallNotificationRule) Target(ctx context.Context, raw *schedule.OnCallNotificationRule) (*assignment.RawTarget, error) {
+	ch, err := (*App)(a).FindOneNC(ctx, raw.ChannelID)
+	if err != nil {
+		return nil, err
 	}
 
-	return &assignment.RawTarget{Type: assignment.TargetTypeNotificationChannel, ID: ch.ID}, nil
+	return &assignment.RawTarget{Type: assignment.TargetTypeNotificationChannel, ID: ch.ID.String(), Name: ch.Name}, nil
 }
 
 func (a *TemporarySchedule) Shifts(ctx context.Context, temp *schedule.TemporarySchedule) ([]oncall.Shift, error) {
@@ -64,14 +85,42 @@ func (a *TemporarySchedule) Shifts(ctx context.Context, temp *schedule.Temporary
 func (q *Query) Schedule(ctx context.Context, id string) (*schedule.Schedule, error) {
 	return (*App)(q).FindOneSchedule(ctx, id)
 }
-func (s *Schedule) Shifts(ctx context.Context, raw *schedule.Schedule, start, end time.Time) ([]oncall.Shift, error) {
+
+func (s *Schedule) Labels(ctx context.Context, raw *schedule.Schedule) ([]label.Label, error) {
+	return s.LabelStore.FindAllByTarget(ctx, s.DB, assignment.ScheduleTarget(raw.ID))
+}
+
+func (s *Schedule) Shifts(ctx context.Context, raw *schedule.Schedule, start, end time.Time, userIDs []string) ([]oncall.Shift, error) {
 	if end.Before(start) {
 		return nil, validation.NewFieldError("EndTime", "must be after StartTime")
 	}
 	if end.After(start.AddDate(0, 0, 50)) {
 		return nil, validation.NewFieldError("EndTime", "cannot be more than 50 days past StartTime")
 	}
-	return s.OnCallStore.HistoryBySchedule(ctx, raw.ID, start, end)
+
+	err := validate.ManyUUID("userID", userIDs, 50)
+	if err != nil {
+		return nil, err
+	}
+
+	shifts, err := s.OnCallStore.HistoryBySchedule(ctx, raw.ID, start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	// filter by slice of userIDs if given
+	if userIDs != nil {
+		var filteredShifts []oncall.Shift
+		for _, shift := range shifts {
+			if slices.Contains(userIDs, shift.UserID) {
+				filteredShifts = append(filteredShifts, shift)
+			}
+		}
+
+		return filteredShifts, nil
+	}
+
+	return shifts, nil
 }
 
 func (s *Schedule) TemporarySchedules(ctx context.Context, raw *schedule.Schedule) ([]schedule.TemporarySchedule, error) {
@@ -81,6 +130,7 @@ func (s *Schedule) TemporarySchedules(ctx context.Context, raw *schedule.Schedul
 	}
 	return s.ScheduleStore.TemporarySchedules(ctx, nil, id)
 }
+
 func (s *Schedule) OnCallNotificationRules(ctx context.Context, raw *schedule.Schedule) ([]schedule.OnCallNotificationRule, error) {
 	id, err := parseUUID("ScheduleID", raw.ID)
 	if err != nil {
@@ -126,6 +176,7 @@ func (s *Schedule) Targets(ctx context.Context, raw *schedule.Schedule) ([]graph
 
 	return result, nil
 }
+
 func (s *Schedule) AssignedTo(ctx context.Context, raw *schedule.Schedule) ([]assignment.RawTarget, error) {
 	pols, err := s.PolicyStore.FindAllPoliciesBySchedule(ctx, raw.ID)
 	if err != nil {
@@ -144,6 +195,7 @@ func (s *Schedule) AssignedTo(ctx context.Context, raw *schedule.Schedule) ([]as
 
 	return tgt, nil
 }
+
 func (m *Mutation) UpdateSchedule(ctx context.Context, input graphql2.UpdateScheduleInput) (ok bool, err error) {
 	var loc *time.Location
 	if input.TimeZone != nil {
@@ -154,6 +206,9 @@ func (m *Mutation) UpdateSchedule(ctx context.Context, input graphql2.UpdateSche
 	}
 	err = withContextTx(ctx, m.DB, func(ctx context.Context, tx *sql.Tx) error {
 		sched, err := m.ScheduleStore.FindOneForUpdate(ctx, tx, input.ID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return validation.NewFieldError("id", "not found")
+		}
 		if err != nil {
 			return err
 		}
@@ -225,7 +280,7 @@ func (m *Mutation) CreateSchedule(ctx context.Context, input graphql2.CreateSche
 			return err
 		}
 		if input.Favorite != nil && *input.Favorite {
-			err = m.FavoriteStore.SetTx(ctx, tx, permission.UserID(ctx), assignment.ScheduleTarget(sched.ID))
+			err = m.FavoriteStore.Set(ctx, tx, permission.UserID(ctx), assignment.ScheduleTarget(sched.ID))
 			if err != nil {
 				return err
 			}
@@ -259,6 +314,14 @@ func (m *Mutation) CreateSchedule(ctx context.Context, input graphql2.CreateSche
 			}
 		}
 
+		for i, lbl := range input.Labels {
+			lbl.Target = &assignment.RawTarget{Type: assignment.TargetTypeSchedule, ID: sched.ID}
+			_, err = m.SetLabel(ctx, lbl)
+			if err != nil {
+				return validation.AddPrefix("labels["+strconv.Itoa(i)+"].", err)
+			}
+		}
+
 		return nil
 	})
 
@@ -285,6 +348,7 @@ func (q *Query) Schedules(ctx context.Context, opts *graphql2.ScheduleSearchOpti
 		searchOpts.FavoritesFirst = *opts.FavoritesFirst
 	}
 	searchOpts.Omit = opts.Omit
+	searchOpts.Only = opts.Only
 	if opts.After != nil && *opts.After != "" {
 		err = search.ParseCursor(*opts.After, &searchOpts)
 		if err != nil {
@@ -323,6 +387,7 @@ func (q *Query) Schedules(ctx context.Context, opts *graphql2.ScheduleSearchOpti
 	conn.Nodes = scheds
 	return conn, err
 }
+
 func (s *Schedule) IsFavorite(ctx context.Context, raw *schedule.Schedule) (bool, error) {
 	return raw.IsUserFavorite(), nil
 }

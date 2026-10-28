@@ -70,6 +70,7 @@ func (r *Rule) scanFrom(s scanner) error {
 	}
 	return nil
 }
+
 func (r Rule) readFields() []interface{} {
 	f := []interface{}{
 		&r.ID,
@@ -95,9 +96,6 @@ func (r Rule) readFields() []interface{} {
 // became active (in the past).
 //
 // If the rule is NeverActive or AlwaysActive, zero time is returned.
-//
-// It may break when processing a timezone where daylight savings repeats or skips
-// ahead at midnight.
 func (r Rule) StartTime(t time.Time) time.Time {
 	if r.NeverActive() {
 		return time.Time{}
@@ -108,7 +106,7 @@ func (r Rule) StartTime(t time.Time) time.Time {
 	t = t.Truncate(time.Minute)
 
 	w := t.Weekday()
-	isTodayEnabled := r.WeekdayFilter.Day(w)
+	isTodayEnabled := r.Day(w)
 
 	if isTodayEnabled && r.Start == r.End {
 		return r.Start.FirstOfDay(r.WeekdayFilter.StartTime(t))
@@ -116,7 +114,7 @@ func (r Rule) StartTime(t time.Time) time.Time {
 
 	if r.Start < r.End {
 		if !isTodayEnabled {
-			return r.Start.FirstOfDay(r.WeekdayFilter.NextActive(t))
+			return r.Start.FirstOfDay(r.NextActive(t))
 		}
 
 		// same-day shift, was active today
@@ -127,13 +125,13 @@ func (r Rule) StartTime(t time.Time) time.Time {
 		}
 
 		// shift has ended for the day, find the next start
-		return r.Start.FirstOfDay(r.WeekdayFilter.NextActive(t))
+		return r.Start.FirstOfDay(r.NextActive(t))
 	}
 
 	end := r.End.LastOfDay(t)
-	if r.WeekdayFilter.Day(w-1) && t.Before(end) {
+	if r.Day(w-1) && t.Before(end) {
 		// yesterday's shift is still active
-		return r.Start.FirstOfDay(t.AddDate(0, 0, -1))
+		return r.Start.FirstOfDay(timeutil.AddDays(t, -1))
 	}
 
 	if isTodayEnabled {
@@ -142,7 +140,7 @@ func (r Rule) StartTime(t time.Time) time.Time {
 	}
 
 	// find the next start time
-	return r.Start.FirstOfDay(r.WeekdayFilter.NextActive(t))
+	return r.Start.FirstOfDay(r.NextActive(t))
 }
 
 // EndTime will return the next time the rule would be inactive.
@@ -161,18 +159,18 @@ func (r Rule) EndTime(t time.Time) time.Time {
 	}
 	if r.Start > r.End {
 		// always the day after the start
-		return r.End.LastOfDay(start.AddDate(0, 0, 1))
+		return r.End.LastOfDay(timeutil.AddDays(start, 1))
 	}
 
 	// 24-hour rule, end time of the next inactive day
-	return r.End.LastOfDay(r.WeekdayFilter.NextInactive(start))
+	return r.End.LastOfDay(r.NextInactive(start))
 }
 
 // NeverActive returns true if the rule will never be active.
-func (r Rule) NeverActive() bool { return r.WeekdayFilter.IsNever() }
+func (r Rule) NeverActive() bool { return r.IsNever() }
 
 // AlwaysActive will return true if the rule will always be active.
-func (r Rule) AlwaysActive() bool { return r.WeekdayFilter.IsAlways() && r.Start == r.End }
+func (r Rule) AlwaysActive() bool { return r.IsAlways() && r.Start == r.End }
 
 // IsActive determines if the rule is active in the given moment in time, in the location of t.
 func (r Rule) IsActive(t time.Time) bool {
@@ -184,6 +182,40 @@ func (r Rule) IsActive(t time.Time) bool {
 	}
 
 	return !r.StartTime(t).After(t)
+}
+
+// NextChange returns the next instant after t at which IsActive would change
+// value: EndTime(t) if the rule is active at t, otherwise StartTime(t).
+//
+// If the rule is NeverActive or AlwaysActive it never changes, so the zero
+// time is returned.
+//
+// Post-condition: result.IsZero() || result.After(t).
+//
+// IsActive evaluates t truncated to the minute, so t may carry seconds; the
+// returned boundary is always a whole minute strictly after the original t
+// (e.g. 07:59:30 -> 08:00 and 08:00:30 -> the shift end, for an 08:00 start).
+//
+// Guard: in zones whose DST transition occurs at midnight, the weekday math
+// in timeutil (see the StartTime doc comment) can produce StartTime/EndTime
+// values that are not after t. Rather than return a stale instant, the zero
+// time is returned in that case.
+func (r Rule) NextChange(t time.Time) time.Time {
+	if r.NeverActive() || r.AlwaysActive() {
+		return time.Time{}
+	}
+
+	var next time.Time
+	if r.IsActive(t) {
+		next = r.EndTime(t)
+	} else {
+		next = r.StartTime(t)
+	}
+	if !next.After(t) {
+		return time.Time{}
+	}
+
+	return next
 }
 
 // String returns a human-readable string describing the rule

@@ -1,28 +1,24 @@
-import React, { useState } from 'react'
-import { gql, useQuery } from '@apollo/client'
-import FlatList from '../lists/FlatList'
-import {
-  Button,
-  Card,
-  CardHeader,
-  Grid,
-  IconButton,
-  makeStyles,
-} from '@material-ui/core'
-
-import { isWidthUp } from '@material-ui/core/withWidth'
+import React, { useState, ReactNode, Suspense } from 'react'
+import { gql, useQuery } from 'urql'
+import { Button, Card, CardHeader, Grid, IconButton } from '@mui/material'
+import makeStyles from '@mui/styles/makeStyles'
+import { Theme } from '@mui/material/styles'
+import { Add } from '@mui/icons-material'
 import { sortContactMethods } from './util'
 import OtherActions from '../util/OtherActions'
 import UserContactMethodDeleteDialog from './UserContactMethodDeleteDialog'
-import UserContactMethodEditDialog from './UserContactMethodEditDialog'
 import { Warning } from '../icons'
 import UserContactMethodVerificationDialog from './UserContactMethodVerificationDialog'
-import useWidth from '../util/useWidth'
-import Spinner from '../loading/components/Spinner'
+import { useIsWidthDown } from '../util/useWidth'
 import { GenericError, ObjectNotFound } from '../error-pages'
 import SendTestDialog from './SendTestDialog'
 import { styles as globalStyles } from '../styles/materialStyles'
 import { UserContactMethod } from '../../schema'
+import { useSessionInfo, useContactMethodTypes } from '../util/RequireConfig'
+import UserContactMethodEditDialog from './UserContactMethodEditDialog'
+import UserContactMethodCreateDialog from './UserContactMethodCreateDialog'
+import CompList from '../lists/CompList'
+import { CompListItemText } from '../lists/CompListItems'
 
 const query = gql`
   query cmList($id: ID!) {
@@ -31,10 +27,24 @@ const query = gql`
       contactMethods {
         id
         name
-        type
-        value
-        formattedValue
+        dest {
+          type
+          args
+          displayInfo {
+            ... on DestinationDisplayInfo {
+              text
+              iconURL
+              iconAltText
+              linkURL
+            }
+            ... on DestinationDisplayInfoError {
+              error
+            }
+          }
+        }
         disabled
+        pending
+        private
       }
     }
   }
@@ -43,6 +53,8 @@ const query = gql`
 interface ListItemAction {
   label: string
   onClick: () => void
+  disabled?: boolean
+  tooltip?: string
 }
 
 interface UserContactMethodListProps {
@@ -50,28 +62,34 @@ interface UserContactMethodListProps {
   readOnly?: boolean
 }
 
-const useStyles = makeStyles((theme) => ({
+const useStyles = makeStyles((theme: Theme) => ({
   cardHeader: globalStyles(theme).cardHeader,
 }))
 
 export default function UserContactMethodList(
   props: UserContactMethodListProps,
-): JSX.Element {
+): ReactNode {
   const classes = useStyles()
-  const width = useWidth()
+  const mobile = useIsWidthDown('md')
+
+  const [showAddDialog, setShowAddDialog] = useState(false)
   const [showVerifyDialogByID, setShowVerifyDialogByID] = useState('')
   const [showEditDialogByID, setShowEditDialogByID] = useState('')
   const [showDeleteDialogByID, setShowDeleteDialogByID] = useState('')
   const [showSendTestByID, setShowSendTestByID] = useState('')
+  const destinationTypes = useContactMethodTypes()
 
-  const { loading, error, data } = useQuery(query, {
+  const [{ error, data }] = useQuery({
+    query,
     variables: {
       id: props.userID,
     },
   })
 
-  if (loading && !data) return <Spinner />
-  if (data && !data.user) return <ObjectNotFound type='user' />
+  const { userID: currentUserID } = useSessionInfo()
+  const isCurrentUser = props.userID === currentUserID
+
+  if (!data?.user) return <ObjectNotFound type='user' />
   if (error) return <GenericError error={error.message} />
 
   const contactMethods = data.user.contactMethods
@@ -87,8 +105,8 @@ export default function UserContactMethodList(
         data-cy='cm-disabled'
         aria-label='Reactivate contact method'
         onClick={() => setShowVerifyDialogByID(cm.id)}
-        color='primary'
         disabled={props.readOnly}
+        size='large'
       >
         <Warning message='Contact method disabled' />
       </IconButton>
@@ -97,22 +115,38 @@ export default function UserContactMethodList(
 
   function getActionMenuItems(cm: UserContactMethod): ListItemAction[] {
     const actions = [
-      { label: 'Edit', onClick: () => setShowEditDialogByID(cm.id) },
+      {
+        label: 'Edit',
+        onClick: () => setShowEditDialogByID(cm.id),
+        disabled: false,
+        tooltip: '',
+      },
       {
         label: 'Delete',
         onClick: () => setShowDeleteDialogByID(cm.id),
+        disabled: false,
+        tooltip: '',
       },
     ]
 
+    // disable send test and reactivate if not current user
     if (!cm.disabled) {
       actions.push({
         label: 'Send Test',
         onClick: () => setShowSendTestByID(cm.id),
+        disabled: !isCurrentUser,
+        tooltip: !isCurrentUser
+          ? 'Send Test only available for your own contact methods'
+          : '',
       })
     } else {
       actions.push({
         label: 'Reactivate',
         onClick: () => setShowVerifyDialogByID(cm.id),
+        disabled: !isCurrentUser,
+        tooltip: !isCurrentUser
+          ? 'Reactivate only available for your own contact methods'
+          : '',
       })
     }
     return actions
@@ -121,13 +155,12 @@ export default function UserContactMethodList(
   function getSecondaryAction(cm: UserContactMethod): JSX.Element {
     return (
       <Grid container spacing={2} alignItems='center' wrap='nowrap'>
-        {cm.disabled && !props.readOnly && isWidthUp('md', width) && (
+        {cm.disabled && !props.readOnly && !mobile && isCurrentUser && (
           <Grid item>
             <Button
               aria-label='Reactivate contact method'
               onClick={() => setShowVerifyDialogByID(cm.id)}
               variant='contained'
-              color='primary'
             >
               Reactivate
             </Button>
@@ -142,6 +175,21 @@ export default function UserContactMethodList(
     )
   }
 
+  function getSubText(cm: UserContactMethod): string {
+    let cmText
+    if ('error' in cm.dest.displayInfo) {
+      cmText = `ERROR: ${cm.dest.displayInfo.error}`
+    } else {
+      cmText = cm.dest.displayInfo.text
+    }
+
+    if (cm.pending) {
+      cmText += ` - this contact method will be automatically deleted if not verified`
+    }
+
+    return cmText
+  }
+
   return (
     <Grid item xs={12}>
       <Card>
@@ -149,41 +197,73 @@ export default function UserContactMethodList(
           className={classes.cardHeader}
           titleTypographyProps={{ component: 'h2', variant: 'h5' }}
           title='Contact Methods'
+          action={
+            !mobile ? (
+              <Button
+                title='Create Contact Method'
+                variant='contained'
+                onClick={() => setShowAddDialog(true)}
+                startIcon={<Add />}
+              >
+                Create Method
+              </Button>
+            ) : null
+          }
         />
-        <FlatList
-          data-cy='contact-methods'
-          items={sortContactMethods(contactMethods).map((cm) => ({
-            title: `${cm.name} (${cm.type})${cm.disabled ? ' - Disabled' : ''}`,
-            subText: cm.formattedValue,
-            secondaryAction: getSecondaryAction(cm),
-            icon: getIcon(cm),
-          }))}
-          emptyMessage='No contact methods'
-        />
-        {showVerifyDialogByID && (
-          <UserContactMethodVerificationDialog
-            contactMethodID={showVerifyDialogByID}
-            onClose={() => setShowVerifyDialogByID('')}
-          />
-        )}
-        {showEditDialogByID && (
-          <UserContactMethodEditDialog
-            contactMethodID={showEditDialogByID}
-            onClose={() => setShowEditDialogByID('')}
-          />
-        )}
-        {showDeleteDialogByID && (
-          <UserContactMethodDeleteDialog
-            contactMethodID={showDeleteDialogByID}
-            onClose={() => setShowDeleteDialogByID('')}
-          />
-        )}
-        {showSendTestByID && (
-          <SendTestDialog
-            messageID={showSendTestByID}
-            onClose={() => setShowSendTestByID('')}
-          />
-        )}
+        <CompList data-cy='contact-methods' emptyMessage='No contact methods'>
+          {sortContactMethods(contactMethods).map((cm) => {
+            const destType = destinationTypes.find(
+              (d) => d.type === cm.dest.type,
+            )
+
+            const label = destType?.name || 'Unknown Type'
+
+            return (
+              <CompListItemText
+                key={cm.id}
+                title={`${cm.name} (${label})${cm.disabled ? ' - Disabled' : ''}${cm.private ? ' (PRIVATE)' : ''}`}
+                subText={getSubText(cm)}
+                action={getSecondaryAction(cm)}
+                icon={getIcon(cm)}
+              />
+            )
+          })}
+        </CompList>
+        <Suspense>
+          {showAddDialog && (
+            <UserContactMethodCreateDialog
+              userID={props.userID}
+              onClose={(contactMethodID = '') => {
+                setShowAddDialog(false)
+                setShowVerifyDialogByID(contactMethodID)
+              }}
+            />
+          )}
+          {showVerifyDialogByID && (
+            <UserContactMethodVerificationDialog
+              contactMethodID={showVerifyDialogByID}
+              onClose={() => setShowVerifyDialogByID('')}
+            />
+          )}
+          {showEditDialogByID && (
+            <UserContactMethodEditDialog
+              contactMethodID={showEditDialogByID}
+              onClose={() => setShowEditDialogByID('')}
+            />
+          )}
+          {showDeleteDialogByID && (
+            <UserContactMethodDeleteDialog
+              contactMethodID={showDeleteDialogByID}
+              onClose={() => setShowDeleteDialogByID('')}
+            />
+          )}
+          {showSendTestByID && (
+            <SendTestDialog
+              contactMethodID={showSendTestByID}
+              onClose={() => setShowSendTestByID('')}
+            />
+          )}
+        </Suspense>
       </Card>
     </Grid>
   )

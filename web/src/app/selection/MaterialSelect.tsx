@@ -3,19 +3,25 @@ import React, {
   useState,
   ReactNode,
   ReactElement,
-  ChangeEvent,
+  SyntheticEvent,
 } from 'react'
 import {
   TextField,
-  makeStyles,
   MenuItem,
   ListItemIcon,
-  Typography,
   Paper,
   Chip,
   InputProps,
-} from '@material-ui/core'
-import { Alert, Autocomplete } from '@material-ui/lab'
+  Alert,
+  Autocomplete,
+  List,
+  ListItem,
+  ListItemText,
+  createFilterOptions,
+  FilterOptionsState,
+} from '@mui/material'
+import makeStyles from '@mui/styles/makeStyles'
+import { Check } from '@mui/icons-material'
 
 const useStyles = makeStyles({
   listItemIcon: {
@@ -34,6 +40,13 @@ const useStyles = makeStyles({
   padding0: {
     padding: 0,
   },
+  list: {
+    width: '100%',
+    display: 'flex',
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 0,
+  },
 })
 
 interface AutocompleteInputProps extends InputProps {
@@ -42,12 +55,14 @@ interface AutocompleteInputProps extends InputProps {
 
 interface SelectOption {
   icon?: ReactElement
+  subText?: string
   isCreate?: boolean
   label: string
   value: string
 }
 
 interface CommonSelectProps {
+  fullWidth?: boolean
   disabled?: boolean
   error?: boolean
   isLoading?: boolean
@@ -56,14 +71,19 @@ interface CommonSelectProps {
   noOptionsError?: Error
   name?: string
   required?: boolean
+  formatInputOnChange?: (value: string) => string
   onInputChange?: (value: string) => void
   options: SelectOption[]
   placeholder?: string
+  clientSideFilter?: boolean
+  disableCloseOnSelect?: boolean
+  optionsLimit?: number
+  helperText?: ReactNode
 }
 
 interface SingleSelectProps {
   multiple: false
-  value: SelectOption
+  value: SelectOption | null
   onChange: (value: SelectOption | null) => void
 }
 
@@ -78,6 +98,7 @@ export default function MaterialSelect(
 ): JSX.Element {
   const classes = useStyles()
   const {
+    fullWidth,
     disabled,
     error,
     isLoading,
@@ -87,12 +108,24 @@ export default function MaterialSelect(
     noOptionsText,
     noOptionsError,
     onChange,
+    formatInputOnChange = (val) => val,
     onInputChange = () => {},
     options: _options,
     placeholder,
     required,
     value,
+    disableCloseOnSelect,
   } = props
+
+  // handle AutoComplete expecting current value to be present within options array
+  let options = _options.slice()
+  const optVals = options.map((o) => o.value)
+  if (value && !multiple && !optVals.includes(value.value)) {
+    options = options.concat(value)
+  }
+  if (value && multiple) {
+    options = options.concat(value)
+  }
 
   // getInputLabel will return the label of the current value.
   //
@@ -105,30 +138,16 @@ export default function MaterialSelect(
   const [inputValue, _setInputValue] = useState(getInputLabel())
 
   const setInputValue = (input: string): void => {
-    _setInputValue(input)
-    onInputChange(input)
+    const formattedInput = formatInputOnChange(input)
+    _setInputValue(formattedInput)
+    onInputChange(formattedInput)
   }
-
-  const multi = multiple ? { multiple: true, filterSelectedOptions: true } : {}
 
   useEffect(() => {
     if (!focus) setInputValue(getInputLabel())
     if (multiple) return
     if (!value) setInputValue('')
   }, [value, multiple, focus])
-
-  // merge selected values with options to avoid annoying mui warnings
-  // https://github.com/mui-org/material-ui/issues/18514
-  let options = _options
-  if (value && Array.isArray(value)) {
-    options = [...options, ...value]
-  } else if (
-    value &&
-    !Array.isArray(value) &&
-    options.every((opt) => opt.value !== value.value)
-  ) {
-    options = [value, ...options]
-  }
 
   const customCSS: Record<string, string> = {
     option: classes.padding0,
@@ -139,17 +158,45 @@ export default function MaterialSelect(
     customCSS.noOptions = classes.padding0
   }
 
+  function isSelected(val: string): boolean {
+    if (!value) return false
+
+    if (Array.isArray(value)) {
+      return value.some((opt) => opt.value === val)
+    }
+
+    return val === value.value
+  }
+
+  let filterOptions: (
+    options: SelectOption[],
+    state: FilterOptionsState<SelectOption>,
+  ) => SelectOption[] = (o) => o
+  if (props.clientSideFilter) {
+    filterOptions = createFilterOptions<SelectOption>()
+    if (props.optionsLimit) {
+      const base = filterOptions
+      filterOptions = (o, s) => base(o, s).slice(0, props.optionsLimit)
+    }
+  }
+
   return (
     <Autocomplete
       data-cy='material-select'
       data-cy-ready={!isLoading}
       classes={customCSS}
-      {...multi}
+      fullWidth={fullWidth}
+      multiple={multiple}
+      filterSelectedOptions={multiple && !disableCloseOnSelect}
       value={value}
       inputValue={inputValue}
       disableClearable={required}
       disabled={disabled}
-      getOptionSelected={(opt, val) => opt.value === val.value}
+      disableCloseOnSelect={disableCloseOnSelect}
+      filterOptions={props.clientSideFilter ? filterOptions : (o) => o}
+      isOptionEqualToValue={(opt: SelectOption, val: SelectOption) =>
+        opt.value === val.value
+      }
       noOptionsText={
         noOptionsError ? (
           <Alert severity='error'>{noOptionsError.message}</Alert>
@@ -158,12 +205,12 @@ export default function MaterialSelect(
         )
       }
       onChange={(
-        event: ChangeEvent<Record<string, unknown>>,
+        event: SyntheticEvent<Element, Event>,
         selected: SelectOption | SelectOption[] | null,
       ) => {
-        if (selected) {
+        if (selected && !disableCloseOnSelect) {
           if (Array.isArray(selected)) {
-            setInputValue('')
+            setInputValue('') // clear input so user can keep typing to select another item
           } else {
             setInputValue(selected.isCreate ? selected.value : selected.label)
           }
@@ -205,16 +252,34 @@ export default function MaterialSelect(
               const newInputVal: string = target.value
               setInputValue(newInputVal)
             }}
+            helperText={props.helperText}
             error={error}
           />
         )
       }}
-      renderOption={({ label, icon }) => (
-        <MenuItem component='span' className={classes.menuItem}>
-          <Typography noWrap>{label}</Typography>
-          {icon && (
-            <ListItemIcon className={classes.listItemIcon}>{icon}</ListItemIcon>
-          )}
+      renderOption={(props, { label, subText, icon, value }) => (
+        <MenuItem
+          {...props}
+          component='span'
+          className={classes.menuItem}
+          selected={isSelected(value)}
+          data-cy='search-select-item'
+        >
+          <List className={classes.list}>
+            <ListItem>
+              <ListItemText primary={label} secondary={subText || null} />
+            </ListItem>
+            {icon && (
+              <ListItemIcon className={classes.listItemIcon}>
+                {icon}
+              </ListItemIcon>
+            )}
+            {disableCloseOnSelect && isSelected(value) && (
+              <ListItemIcon className={classes.listItemIcon}>
+                <Check color='info' />
+              </ListItemIcon>
+            )}
+          </List>
         </MenuItem>
       )}
       PaperComponent={(params) => (
@@ -223,10 +288,10 @@ export default function MaterialSelect(
       renderTags={(value, getTagProps) =>
         value.map((option, index) => (
           <Chip
+            {...getTagProps({ index })}
             key={index.toString()}
             data-cy='multi-value'
             label={option.label}
-            {...getTagProps({ index })}
           />
         ))
       }

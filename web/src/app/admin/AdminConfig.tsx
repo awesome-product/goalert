@@ -1,15 +1,16 @@
 import React, { useState } from 'react'
-import { useQuery, gql } from '@apollo/client'
-import Button from '@material-ui/core/Button'
-import ButtonGroup from '@material-ui/core/ButtonGroup'
-import Divider from '@material-ui/core/Divider'
-import Grid from '@material-ui/core/Grid'
-import Typography from '@material-ui/core/Typography'
-import { makeStyles } from '@material-ui/core/styles'
+import { useQuery, gql } from 'urql'
+import Button from '@mui/material/Button'
+import ButtonGroup from '@mui/material/ButtonGroup'
+import Divider from '@mui/material/Divider'
+import Grid from '@mui/material/Grid'
+import Typography from '@mui/material/Typography'
+import makeStyles from '@mui/styles/makeStyles'
+import { Theme } from '@mui/material/styles'
 import _, { startCase, isEmpty, uniq, chain } from 'lodash'
 import AdminSection from './AdminSection'
 import AdminDialog from './AdminDialog'
-import ExpandMoreIcon from '@material-ui/icons/ExpandMore'
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import { Form } from '../forms'
 import {
   InputAdornment,
@@ -18,11 +19,12 @@ import {
   AccordionSummary,
   AccordionDetails,
   Chip,
-} from '@material-ui/core'
+} from '@mui/material'
 import CopyText from '../util/CopyText'
 import Spinner from '../loading/components/Spinner'
 import { GenericError } from '../error-pages'
 import { ConfigValue, ConfigHint } from '../../schema'
+import SlackActions from './SlackActions'
 
 const query = gql`
   query getConfig {
@@ -32,6 +34,7 @@ const query = gql`
       password
       type
       value
+      deprecated
     }
     configHints {
       id
@@ -39,15 +42,11 @@ const query = gql`
     }
   }
 `
-const mutation = gql`
-  mutation ($input: [ConfigValueInput!]) {
-    setConfig(input: $input)
-  }
-`
 
-const useStyles = makeStyles((theme) => ({
+const useStyles = makeStyles((theme: Theme) => ({
   accordionDetails: {
     padding: 0,
+    display: 'block',
   },
   form: {
     width: '100%',
@@ -82,19 +81,19 @@ function formatHeading(s = ''): string {
     .replace(/R Ls\b/, 'RLs') // fix usages of `URLs`
 }
 
-export default function AdminConfig(): JSX.Element {
+export default function AdminConfig(): React.JSX.Element {
   const classes = useStyles()
   const [confirm, setConfirm] = useState(false)
   const [values, setValues] = useState({})
   const [section, setSection] = useState(false as false | string)
 
-  const { data, loading, error } = useQuery(query)
+  const [{ data, fetching, error }] = useQuery({ query })
 
   if (error) {
     return <GenericError error={error.message} />
   }
 
-  if (loading && !data) {
+  if (fetching && !data) {
     return <Spinner />
   }
 
@@ -136,8 +135,8 @@ export default function AdminConfig(): JSX.Element {
 
   return (
     <Grid container spacing={2}>
-      <Grid item xs={12} container justify='flex-end'>
-        <ButtonGroup color='primary' variant='outlined'>
+      <Grid item xs={12} container justifyContent='flex-end'>
+        <ButtonGroup variant='outlined'>
           <Button
             data-cy='reset'
             disabled={isEmpty(values)}
@@ -157,9 +156,7 @@ export default function AdminConfig(): JSX.Element {
 
       {confirm && (
         <AdminDialog
-          mutation={mutation}
-          values={configValues}
-          fieldValues={values}
+          value={values}
           onClose={() => setConfirm(false)}
           onComplete={() => {
             setValues({})
@@ -227,27 +224,29 @@ export default function AdminConfig(): JSX.Element {
                       password: f.password,
                       type: f.type,
                       value: f.value,
+                      deprecated: f.deprecated,
                     }))}
                 />
-                {hintGroups[groupID] &&
-                  hintGroups[groupID].map((h: ConfigHint) => (
-                    <TextField
-                      key={h.id}
-                      label={hintName(h.id)}
-                      value={h.value}
-                      variant='filled'
-                      margin='none'
-                      InputProps={{
-                        endAdornment: (
-                          <InputAdornment position='end'>
-                            <CopyText value={h.value} placement='left' />
-                          </InputAdornment>
-                        ),
-                      }}
-                      fullWidth
-                    />
-                  ))}
               </Form>
+              {hintGroups[groupID] &&
+                hintGroups[groupID].map((h: ConfigHint) => (
+                  <TextField
+                    key={h.id}
+                    label={hintName(h.id)}
+                    value={h.value}
+                    variant='filled'
+                    margin='none'
+                    InputProps={{
+                      endAdornment: (
+                        <InputAdornment position='end'>
+                          <CopyText value={h.value} placement='left' asURL />
+                        </InputAdornment>
+                      ),
+                    }}
+                    fullWidth
+                  />
+                ))}
+              {groupID === 'Slack' && <SlackActions />}
             </AccordionDetails>
           </Accordion>
         ))}
